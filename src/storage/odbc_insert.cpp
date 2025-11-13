@@ -18,13 +18,13 @@
 
 namespace duckdb {
 
-MySQLInsert::MySQLInsert(PhysicalPlan &physical_plan, LogicalOperator &op, TableCatalogEntry &table,
+ODBCInsert::ODBCInsert(PhysicalPlan &physical_plan, LogicalOperator &op, TableCatalogEntry &table,
                          physical_index_vector_t<idx_t> column_index_map_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), table(&table), schema(nullptr),
       column_index_map(std::move(column_index_map_p)) {
 }
 
-MySQLInsert::MySQLInsert(PhysicalPlan &physical_plan, LogicalOperator &op, SchemaCatalogEntry &schema,
+ODBCInsert::ODBCInsert(PhysicalPlan &physical_plan, LogicalOperator &op, SchemaCatalogEntry &schema,
                          unique_ptr<BoundCreateTableInfo> info)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, op.types, 1), table(nullptr), schema(&schema),
       info(std::move(info)) {
@@ -33,22 +33,22 @@ MySQLInsert::MySQLInsert(PhysicalPlan &physical_plan, LogicalOperator &op, Schem
 //===--------------------------------------------------------------------===//
 // States
 //===--------------------------------------------------------------------===//
-class MySQLInsertGlobalState : public GlobalSinkState {
+class ODBCInsertGlobalState : public GlobalSinkState {
 public:
-	explicit MySQLInsertGlobalState(ClientContext &context, MySQLTableEntry &table,
+	explicit ODBCInsertGlobalState(ClientContext &context, ODBCTableEntry &table,
 	                                const vector<LogicalType> &varchar_types)
 	    : table(table), insert_count(0) {
 		varchar_chunk.Initialize(context, varchar_types);
 	}
 
-	MySQLTableEntry &table;
+	ODBCTableEntry &table;
 	DataChunk varchar_chunk;
 	idx_t insert_count;
 	string base_insert_query;
 	string insert_values;
 };
 
-vector<string> GetInsertColumns(const MySQLInsert &insert, MySQLTableEntry &entry) {
+vector<string> GetInsertColumns(const ODBCInsert &insert, ODBCTableEntry &entry) {
 	vector<string> column_names;
 	auto &columns = entry.GetColumns();
 	idx_t column_count;
@@ -74,12 +74,12 @@ vector<string> GetInsertColumns(const MySQLInsert &insert, MySQLTableEntry &entr
 	return column_names;
 }
 
-string GetBaseInsertQuery(const MySQLTableEntry &table, const vector<string> &column_names) {
+string GetBaseInsertQuery(const ODBCTableEntry &table, const vector<string> &column_names) {
 	string query;
 	query += "INSERT INTO ";
-	query += MySQLUtils::WriteIdentifier(table.schema.name);
+	query += ODBCUtils::WriteIdentifier(table.schema.name);
 	query += ".";
-	query += MySQLUtils::WriteIdentifier(table.name);
+	query += ODBCUtils::WriteIdentifier(table.name);
 	query += " ";
 	if (!column_names.empty()) {
 		query += "(";
@@ -87,7 +87,7 @@ string GetBaseInsertQuery(const MySQLTableEntry &table, const vector<string> &co
 			if (c > 0) {
 				query += ", ";
 			}
-			query += MySQLUtils::WriteIdentifier(column_names[c]);
+			query += ODBCUtils::WriteIdentifier(column_names[c]);
 		}
 		query += ")";
 	}
@@ -95,14 +95,14 @@ string GetBaseInsertQuery(const MySQLTableEntry &table, const vector<string> &co
 	return query;
 }
 
-unique_ptr<GlobalSinkState> MySQLInsert::GetGlobalSinkState(ClientContext &context) const {
-	MySQLTableEntry *insert_table;
+unique_ptr<GlobalSinkState> ODBCInsert::GetGlobalSinkState(ClientContext &context) const {
+	ODBCTableEntry *insert_table;
 	if (!table) {
 		auto &schema_ref = *schema.get_mutable();
 		insert_table =
-		    &schema_ref.CreateTable(schema_ref.GetCatalogTransaction(context), *info)->Cast<MySQLTableEntry>();
+		    &schema_ref.CreateTable(schema_ref.GetCatalogTransaction(context), *info)->Cast<ODBCTableEntry>();
 	} else {
-		insert_table = &table.get_mutable()->Cast<MySQLTableEntry>();
+		insert_table = &table.get_mutable()->Cast<ODBCTableEntry>();
 	}
 	auto insert_columns = GetInsertColumns(*this, *insert_table);
 	vector<LogicalType> insert_types;
@@ -111,7 +111,7 @@ unique_ptr<GlobalSinkState> MySQLInsert::GetGlobalSinkState(ClientContext &conte
 	for (idx_t c = 0; c < insert_column_count; c++) {
 		insert_types.push_back(LogicalType::VARCHAR);
 	}
-	auto result = make_uniq<MySQLInsertGlobalState>(context, *insert_table, insert_types);
+	auto result = make_uniq<ODBCInsertGlobalState>(context, *insert_table, insert_types);
 	result->base_insert_query = GetBaseInsertQuery(*insert_table, insert_columns);
 	return std::move(result);
 }
@@ -119,7 +119,7 @@ unique_ptr<GlobalSinkState> MySQLInsert::GetGlobalSinkState(ClientContext &conte
 //===--------------------------------------------------------------------===//
 // Sink
 //===--------------------------------------------------------------------===//
-static void MySQLCastBlob(const Vector &input, Vector &result, idx_t count) {
+static void ODBCCastBlob(const Vector &input, Vector &result, idx_t count) {
 	static constexpr const char *HEX_TABLE = "0123456789ABCDEF";
 	auto input_data = FlatVector::GetData<string_t>(input);
 	auto result_data = FlatVector::GetData<string_t>(result);
@@ -142,11 +142,11 @@ static void MySQLCastBlob(const Vector &input, Vector &result, idx_t count) {
 	}
 }
 
-SinkResultType MySQLInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
+SinkResultType ODBCInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	static constexpr const idx_t INSERT_FLUSH_SIZE = 8000;
 
-	auto &gstate = input.global_state.Cast<MySQLInsertGlobalState>();
-	auto &transaction = MySQLTransaction::Get(context.client, gstate.table.catalog);
+	auto &gstate = input.global_state.Cast<ODBCInsertGlobalState>();
+	auto &transaction = ODBCTransaction::Get(context.client, gstate.table.catalog);
 	auto &con = transaction.GetConnection();
 	// cast to varchar
 	D_ASSERT(chunk.ColumnCount() == gstate.varchar_chunk.ColumnCount());
@@ -155,7 +155,7 @@ SinkResultType MySQLInsert::Sink(ExecutionContext &context, DataChunk &chunk, Op
 	for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
 		switch (chunk.data[c].GetType().id()) {
 		case LogicalTypeId::BLOB:
-			MySQLCastBlob(chunk.data[c], gstate.varchar_chunk.data[c], chunk.size());
+			ODBCCastBlob(chunk.data[c], gstate.varchar_chunk.data[c], chunk.size());
 			break;
 		case LogicalTypeId::TIMESTAMP_TZ: {
 			Vector timestamp_vector(LogicalType::TIMESTAMP);
@@ -210,7 +210,7 @@ SinkResultType MySQLInsert::Sink(ExecutionContext &context, DataChunk &chunk, Op
 			} else {
 				auto data = FlatVector::GetData<string_t>(gstate.varchar_chunk.data[c]);
 				if (add_quotes[c]) {
-					gstate.insert_values += MySQLUtils::WriteLiteral(data[r].GetString());
+					gstate.insert_values += ODBCUtils::WriteLiteral(data[r].GetString());
 				} else {
 					gstate.insert_values += data[r].GetString();
 				}
@@ -231,12 +231,12 @@ SinkResultType MySQLInsert::Sink(ExecutionContext &context, DataChunk &chunk, Op
 //===--------------------------------------------------------------------===//
 // Finalize
 //===--------------------------------------------------------------------===//
-SinkFinalizeType MySQLInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+SinkFinalizeType ODBCInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                        OperatorSinkFinalizeInput &input) const {
-	auto &gstate = input.global_state.Cast<MySQLInsertGlobalState>();
+	auto &gstate = input.global_state.Cast<ODBCInsertGlobalState>();
 	if (!gstate.insert_values.empty()) {
 		// perform the final insert
-		auto &transaction = MySQLTransaction::Get(context, gstate.table.catalog);
+		auto &transaction = ODBCTransaction::Get(context, gstate.table.catalog);
 		auto &con = transaction.GetConnection();
 		con.Execute(gstate.base_insert_query + gstate.insert_values);
 	}
@@ -246,8 +246,8 @@ SinkFinalizeType MySQLInsert::Finalize(Pipeline &pipeline, Event &event, ClientC
 //===--------------------------------------------------------------------===//
 // GetData
 //===--------------------------------------------------------------------===//
-SourceResultType MySQLInsert::GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const {
-	auto &insert_gstate = sink_state->Cast<MySQLInsertGlobalState>();
+SourceResultType ODBCInsert::GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const {
+	auto &insert_gstate = sink_state->Cast<ODBCInsertGlobalState>();
 	chunk.SetCardinality(1);
 	chunk.SetValue(0, 0, Value::BIGINT(insert_gstate.insert_count));
 
@@ -257,11 +257,11 @@ SourceResultType MySQLInsert::GetData(ExecutionContext &context, DataChunk &chun
 //===--------------------------------------------------------------------===//
 // Helpers
 //===--------------------------------------------------------------------===//
-string MySQLInsert::GetName() const {
+string ODBCInsert::GetName() const {
 	return table ? "MYSQL_INSERT" : "MYSQL_CREATE_TABLE_AS";
 }
 
-InsertionOrderPreservingMap<string> MySQLInsert::ParamsToString() const {
+InsertionOrderPreservingMap<string> ODBCInsert::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
 	result["Table Name"] = table ? table->name : info->Base().table;
 	return result;
@@ -270,13 +270,13 @@ InsertionOrderPreservingMap<string> MySQLInsert::ParamsToString() const {
 //===--------------------------------------------------------------------===//
 // Plan
 //===--------------------------------------------------------------------===//
-PhysicalOperator &AddCastToMySQLTypes(ClientContext &context, PhysicalPlanGenerator &planner, PhysicalOperator &plan) {
+PhysicalOperator &AddCastToODBCTypes(ClientContext &context, PhysicalPlanGenerator &planner, PhysicalOperator &plan) {
 	// check if we need to cast anything
 	bool require_cast = false;
-	MySQLTypeConfig type_config(context);
+	ODBCTypeConfig type_config(context);
 	auto &child_types = plan.GetTypes();
 	for (auto &type : child_types) {
-		auto odbc_type = MySQLTypes::ToMySQLType(type_config, type);
+		auto odbc_type = ODBCTypes::ToODBCType(type_config, type);
 		if (odbc_type != type) {
 			require_cast = true;
 			break;
@@ -293,7 +293,7 @@ PhysicalOperator &AddCastToMySQLTypes(ClientContext &context, PhysicalPlanGenera
 		unique_ptr<Expression> expr;
 		expr = make_uniq<BoundReferenceExpression>(type, i);
 
-		auto odbc_type = MySQLTypes::ToMySQLType(type_config, type);
+		auto odbc_type = ODBCTypes::ToODBCType(type_config, type);
 		if (odbc_type != type) {
 			// add a cast
 			expr = BoundCastExpression::AddCastToType(context, std::move(expr), odbc_type);
@@ -308,28 +308,28 @@ PhysicalOperator &AddCastToMySQLTypes(ClientContext &context, PhysicalPlanGenera
 	return proj;
 }
 
-PhysicalOperator &MySQLCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+PhysicalOperator &ODBCCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
                                            optional_ptr<PhysicalOperator> plan) {
 	if (op.return_chunk) {
-		throw BinderException("RETURNING clause not yet supported for insertion into MySQL table");
+		throw BinderException("RETURNING clause not yet supported for insertion into ODBC table");
 	}
 	if (op.on_conflict_info.action_type != OnConflictAction::THROW) {
-		throw BinderException("ON CONFLICT clause not yet supported for insertion into MySQL table");
+		throw BinderException("ON CONFLICT clause not yet supported for insertion into ODBC table");
 	}
-	MySQLCatalog::MaterializeMySQLScans(*plan);
+	ODBCCatalog::MaterializeODBCScans(*plan);
 
 	D_ASSERT(plan);
-	auto &inner_plan = AddCastToMySQLTypes(context, planner, *plan);
-	auto &insert = planner.Make<MySQLInsert>(op, op.table, op.column_index_map);
+	auto &inner_plan = AddCastToODBCTypes(context, planner, *plan);
+	auto &insert = planner.Make<ODBCInsert>(op, op.table, op.column_index_map);
 	insert.children.push_back(inner_plan);
 	return insert;
 }
 
-PhysicalOperator &MySQLCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
+PhysicalOperator &ODBCCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                   LogicalCreateTable &op, PhysicalOperator &plan) {
-	MySQLCatalog::MaterializeMySQLScans(plan);
-	auto &inner_plan = AddCastToMySQLTypes(context, planner, plan);
-	auto &insert = planner.Make<MySQLInsert>(op, op.schema, std::move(op.info));
+	ODBCCatalog::MaterializeODBCScans(plan);
+	auto &inner_plan = AddCastToODBCTypes(context, planner, plan);
+	auto &insert = planner.Make<ODBCInsert>(op, op.schema, std::move(op.info));
 	insert.children.push_back(inner_plan);
 	return insert;
 }

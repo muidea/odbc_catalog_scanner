@@ -12,31 +12,31 @@
 #include "odbc_connection.hpp"
 
 namespace duckdb {
-class MySQLCatalog;
-class MySQLSchemaEntry;
-class MySQLTableEntry;
+class ODBCCatalog;
+class ODBCSchemaEntry;
+class ODBCTableEntry;
 
-enum class MySQLTransactionState { TRANSACTION_NOT_YET_STARTED, TRANSACTION_STARTED, TRANSACTION_FINISHED };
+enum class ODBCTransactionState { TRANSACTION_NOT_YET_STARTED, TRANSACTION_STARTED, TRANSACTION_FINISHED };
 
-class MySQLTransaction : public Transaction {
+class ODBCTransaction : public Transaction {
 public:
-	MySQLTransaction(MySQLCatalog &odbc_catalog, TransactionManager &manager, ClientContext &context);
-	~MySQLTransaction() override;
+	ODBCTransaction(ODBCCatalog &odbc_catalog, TransactionManager &manager, ClientContext &context);
+	~ODBCTransaction() override;
 
 	void Start();
 	void Commit();
 	void Rollback();
 
-	MySQLConnection &GetConnection();
-	unique_ptr<MySQLResult> Query(const string &query);
-	static MySQLTransaction &Get(ClientContext &context, Catalog &catalog);
+	ODBCConnection &GetConnection();
+	unique_ptr<ODBCResult> Query(const string &query);
+	static ODBCTransaction &Get(ClientContext &context, Catalog &catalog);
 	AccessMode GetAccessMode() const {
 		return access_mode;
 	}
 
 private:
-	MySQLConnection connection;
-	MySQLTransactionState transaction_state;
+	ODBCConnection connection;
+	ODBCTransactionState transaction_state;
 	AccessMode access_mode;
 };
 

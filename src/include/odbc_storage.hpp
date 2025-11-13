@@ -12,9 +12,9 @@
 
 namespace duckdb {
 
-class MySQLStorageExtension : public StorageExtension {
+class ODBCStorageExtension : public StorageExtension {
 public:
-	MySQLStorageExtension();
+	ODBCStorageExtension();
 };
 
 } // namespace duckdb

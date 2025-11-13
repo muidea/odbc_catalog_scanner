@@ -13,11 +13,11 @@
 #include "storage/odbc_index_set.hpp"
 
 namespace duckdb {
-class MySQLTransaction;
+class ODBCTransaction;
 
-class MySQLSchemaEntry : public SchemaCatalogEntry {
+class ODBCSchemaEntry : public SchemaCatalogEntry {
 public:
-	MySQLSchemaEntry(Catalog &catalog, CreateSchemaInfo &info);
+	ODBCSchemaEntry(Catalog &catalog, CreateSchemaInfo &info);
 
 public:
 	optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) override;
@@ -41,18 +41,18 @@ public:
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
 
 private:
-	void AlterTable(MySQLTransaction &transaction, RenameTableInfo &info);
-	void AlterTable(MySQLTransaction &transaction, RenameColumnInfo &info);
-	void AlterTable(MySQLTransaction &transaction, AddColumnInfo &info);
-	void AlterTable(MySQLTransaction &transaction, RemoveColumnInfo &info);
+	void AlterTable(ODBCTransaction &transaction, RenameTableInfo &info);
+	void AlterTable(ODBCTransaction &transaction, RenameColumnInfo &info);
+	void AlterTable(ODBCTransaction &transaction, AddColumnInfo &info);
+	void AlterTable(ODBCTransaction &transaction, RemoveColumnInfo &info);
 
 	void TryDropEntry(ClientContext &context, CatalogType catalog_type, const string &name);
 
-	MySQLCatalogSet &GetCatalogSet(CatalogType type);
+	ODBCCatalogSet &GetCatalogSet(CatalogType type);
 
 private:
-	MySQLTableSet tables;
-	MySQLIndexSet indexes;
+	ODBCTableSet tables;
+	ODBCIndexSet indexes;
 };
 
 } // namespace duckdb

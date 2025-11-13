@@ -14,9 +14,9 @@
 
 namespace duckdb {
 
-class MySQLTransactionManager : public TransactionManager {
+class ODBCTransactionManager : public TransactionManager {
 public:
-	MySQLTransactionManager(AttachedDatabase &db_p, MySQLCatalog &odbc_catalog);
+	ODBCTransactionManager(AttachedDatabase &db_p, ODBCCatalog &odbc_catalog);
 
 	Transaction &StartTransaction(ClientContext &context) override;
 	ErrorData CommitTransaction(ClientContext &context, Transaction &transaction) override;
@@ -25,9 +25,9 @@ public:
 	void Checkpoint(ClientContext &context, bool force = false) override;
 
 private:
-	MySQLCatalog &odbc_catalog;
+	ODBCCatalog &odbc_catalog;
 	mutex transaction_lock;
-	reference_map_t<Transaction, unique_ptr<MySQLTransaction>> transactions;
+	reference_map_t<Transaction, unique_ptr<ODBCTransaction>> transactions;
 };
 
 } // namespace duckdb

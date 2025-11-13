@@ -13,35 +13,35 @@
 
 namespace duckdb {
 
-struct MySQLTypeData {
+struct ODBCTypeData {
 	string type_name;
 	string column_type;
 	int64_t precision;
 	int64_t scale;
 };
 
-enum class MySQLTypeAnnotation { STANDARD, CAST_TO_VARCHAR, NUMERIC_AS_DOUBLE, CTID, JSONB, FIXED_LENGTH_CHAR };
+enum class ODBCTypeAnnotation { STANDARD, CAST_TO_VARCHAR, NUMERIC_AS_DOUBLE, CTID, JSONB, FIXED_LENGTH_CHAR };
 
-struct MySQLType {
+struct ODBCType {
 	idx_t oid = 0;
-	MySQLTypeAnnotation info = MySQLTypeAnnotation::STANDARD;
-	vector<MySQLType> children;
+	ODBCTypeAnnotation info = ODBCTypeAnnotation::STANDARD;
+	vector<ODBCType> children;
 };
 
-struct MySQLTypeConfig {
+struct ODBCTypeConfig {
 	bool bit1_as_boolean = false;
 	bool tinyint1_as_boolean = false;
 	bool time_as_time = false;
 
-	MySQLTypeConfig();
-	MySQLTypeConfig(ClientContext &context);
+	ODBCTypeConfig();
+	ODBCTypeConfig(ClientContext &context);
 };
 
-class MySQLTypes {
+class ODBCTypes {
 public:
-	static LogicalType ToMySQLType(const MySQLTypeConfig &type_config, const LogicalType &input);
-	static LogicalType TypeToLogicalType(const MySQLTypeConfig &type_config, const MySQLTypeData &input);
-	static LogicalType FieldToLogicalType(const MySQLTypeConfig &type_config, MYSQL_FIELD *field);
+	static LogicalType ToODBCType(const ODBCTypeConfig &type_config, const LogicalType &input);
+	static LogicalType TypeToLogicalType(const ODBCTypeConfig &type_config, const ODBCTypeData &input);
+	static LogicalType FieldToLogicalType(const ODBCTypeConfig &type_config, MYSQL_FIELD *field);
 	static string TypeToString(const LogicalType &input);
 };
 

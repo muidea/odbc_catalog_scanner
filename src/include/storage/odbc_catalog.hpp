@@ -14,12 +14,12 @@
 #include "storage/odbc_schema_set.hpp"
 
 namespace duckdb {
-class MySQLSchemaEntry;
+class ODBCSchemaEntry;
 
-class MySQLCatalog : public Catalog {
+class ODBCCatalog : public Catalog {
 public:
-	explicit MySQLCatalog(AttachedDatabase &db_p, string connection_string, string attach_path, AccessMode access_mode);
-	~MySQLCatalog();
+	explicit ODBCCatalog(AttachedDatabase &db_p, string connection_string, string attach_path, AccessMode access_mode);
+	~ODBCCatalog();
 
 	string connection_string;
 	string attach_path;
@@ -54,21 +54,21 @@ public:
 
 	DatabaseSize GetDatabaseSize(ClientContext &context) override;
 
-	//! Whether or not this is an in-memory MySQL database
+	//! Whether or not this is an in-memory ODBC database
 	bool InMemory() override;
 	string GetDBPath() override;
 
 	void ClearCache();
 
-	static void MaterializeMySQLScans(PhysicalOperator &op);
-	static bool IsMySQLScan(const string &name);
-	static bool IsMySQLQuery(const string &name);
+	static void MaterializeODBCScans(PhysicalOperator &op);
+	static bool IsODBCScan(const string &name);
+	static bool IsODBCQuery(const string &name);
 
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 
 private:
-	MySQLSchemaSet schemas;
+	ODBCSchemaSet schemas;
 	string default_schema;
 };
 

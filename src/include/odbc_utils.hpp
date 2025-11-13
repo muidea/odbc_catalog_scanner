@@ -12,10 +12,10 @@
 #include "odbc.h"
 
 namespace duckdb {
-class MySQLSchemaEntry;
-class MySQLTransaction;
+class ODBCSchemaEntry;
+class ODBCTransaction;
 
-struct MySQLConnectionParameters {
+struct ODBCConnectionParameters {
 	string host;
 	string user;
 	string passwd;
@@ -33,13 +33,13 @@ struct MySQLConnectionParameters {
 	string ssl_key;
 };
 
-enum class MySQLResultStreaming { UNINITIALIZED, ALLOW_STREAMING, FORCE_MATERIALIZATION };
+enum class ODBCResultStreaming { UNINITIALIZED, ALLOW_STREAMING, FORCE_MATERIALIZATION };
 
-enum class MySQLConnectorInterface { UNINITIALIZED, BASIC, PREPARED_STATEMENT };
+enum class ODBCConnectorInterface { UNINITIALIZED, BASIC, PREPARED_STATEMENT };
 
-class MySQLUtils {
+class ODBCUtils {
 public:
-	static std::tuple<MySQLConnectionParameters, unordered_set<string>> ParseConnectionParameters(const string &dsn);
+	static std::tuple<ODBCConnectionParameters, unordered_set<string>> ParseConnectionParameters(const string &dsn);
 	static MYSQL *Connect(const string &dsn);
 
 	static string WriteIdentifier(const string &identifier);
@@ -49,15 +49,15 @@ public:
 	static string TransformConstant(const Value &val);
 };
 
-using MySQLStatementPtr = duckdb::unique_ptr<MYSQL_STMT, void (*)(MYSQL_STMT *)>;
+using ODBCStatementPtr = duckdb::unique_ptr<MYSQL_STMT, void (*)(MYSQL_STMT *)>;
 
-inline void MySQLStatementDelete(MYSQL_STMT *stmt) {
+inline void ODBCStatementDelete(MYSQL_STMT *stmt) {
 	odbc_stmt_close(stmt);
 }
 
-using MySQLResultPtr = duckdb::unique_ptr<MYSQL_RES, void (*)(MYSQL_RES *)>;
+using ODBCResultPtr = duckdb::unique_ptr<MYSQL_RES, void (*)(MYSQL_RES *)>;
 
-inline void MySQLResultDelete(MYSQL_RES *res) {
+inline void ODBCResultDelete(MYSQL_RES *res) {
 	odbc_free_result(res);
 }
 

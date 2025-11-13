@@ -12,10 +12,10 @@
 #include "odbc_utils.hpp"
 
 namespace duckdb {
-class MySQLConnection;
-struct OwnedMySQLConnection;
+class ODBCConnection;
+struct OwnedODBCConnection;
 
-struct MySQLField {
+struct ODBCField {
 	string name;
 	enum_field_types odbc_type;
 	LogicalType duckdb_type;
@@ -25,19 +25,19 @@ struct MySQLField {
 	bool bind_is_null = false;
 	bool bind_error = false;
 
-	MySQLField(MYSQL_FIELD *mf, LogicalType duckdb_type_p, const MySQLTypeConfig &type_config);
+	ODBCField(MYSQL_FIELD *mf, LogicalType duckdb_type_p, const ODBCTypeConfig &type_config);
 
 	void ResetBind();
 };
 
-struct MySQLBind {
+struct ODBCBind {
 
-	MySQLBind(const LogicalType &ltype);
+	ODBCBind(const LogicalType &ltype);
 };
 
-class MySQLResult {
+class ODBCResult {
 public:
-	MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, MySQLTypeConfig type_config_p,
+	ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBCTypeConfig type_config_p,
 	            idx_t affected_rows_p);
 
 	string GetString(idx_t col);
@@ -48,15 +48,15 @@ public:
 	DataChunk &NextChunk();
 	bool Next();
 	idx_t AffectedRows();
-	const vector<MySQLField> &Fields();
+	const vector<ODBCField> &Fields();
 
 private:
 	string query;
-	MySQLStatementPtr stmt;
-	MySQLTypeConfig type_config;
+	ODBCStatementPtr stmt;
+	ODBCTypeConfig type_config;
 	idx_t affected_rows = static_cast<idx_t>(-1);
 
-	vector<MySQLField> fields;
+	vector<ODBCField> fields;
 	vector<MYSQL_BIND> binds;
 
 	DataChunk data_chunk;

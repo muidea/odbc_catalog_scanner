@@ -6,7 +6,7 @@
 
 namespace duckdb {
 
-MySQLCreateIndex::MySQLCreateIndex(PhysicalPlan &physical_plan, unique_ptr<CreateIndexInfo> info,
+ODBCCreateIndex::ODBCCreateIndex(PhysicalPlan &physical_plan, unique_ptr<CreateIndexInfo> info,
                                    TableCatalogEntry &table)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, 1), info(std::move(info)),
       table(table) {
@@ -15,7 +15,7 @@ MySQLCreateIndex::MySQLCreateIndex(PhysicalPlan &physical_plan, unique_ptr<Creat
 //===--------------------------------------------------------------------===//
 // Source
 //===--------------------------------------------------------------------===//
-SourceResultType MySQLCreateIndex::GetData(ExecutionContext &context, DataChunk &chunk,
+SourceResultType ODBCCreateIndex::GetData(ExecutionContext &context, DataChunk &chunk,
                                            OperatorSourceInput &input) const {
 	auto &catalog = table.catalog;
 	if (info->catalog == INVALID_CATALOG && info->schema == catalog.GetName()) {
@@ -30,9 +30,9 @@ SourceResultType MySQLCreateIndex::GetData(ExecutionContext &context, DataChunk 
 //===--------------------------------------------------------------------===//
 // Logical Operator
 //===--------------------------------------------------------------------===//
-class LogicalMySQLCreateIndex : public LogicalExtensionOperator {
+class LogicalODBCCreateIndex : public LogicalExtensionOperator {
 public:
-	LogicalMySQLCreateIndex(unique_ptr<CreateIndexInfo> info_p, TableCatalogEntry &table)
+	LogicalODBCCreateIndex(unique_ptr<CreateIndexInfo> info_p, TableCatalogEntry &table)
 	    : info(std::move(info_p)), table(table) {
 	}
 
@@ -40,11 +40,11 @@ public:
 	TableCatalogEntry &table;
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
-		return planner.Make<MySQLCreateIndex>(std::move(info), table);
+		return planner.Make<ODBCCreateIndex>(std::move(info), table);
 	}
 
 	void Serialize(Serializer &serializer) const override {
-		throw InternalException("Cannot serialize MySQL Create index");
+		throw InternalException("Cannot serialize ODBC Create index");
 	}
 
 	void ResolveTypes() override {
@@ -52,9 +52,9 @@ public:
 	}
 };
 
-unique_ptr<LogicalOperator> MySQLCatalog::BindCreateIndex(Binder &binder, CreateStatement &stmt,
+unique_ptr<LogicalOperator> ODBCCatalog::BindCreateIndex(Binder &binder, CreateStatement &stmt,
                                                           TableCatalogEntry &table, unique_ptr<LogicalOperator> plan) {
-	return make_uniq<LogicalMySQLCreateIndex>(unique_ptr_cast<CreateInfo, CreateIndexInfo>(std::move(stmt.info)),
+	return make_uniq<LogicalODBCCreateIndex>(unique_ptr_cast<CreateInfo, CreateIndexInfo>(std::move(stmt.info)),
 	                                          table);
 }
 

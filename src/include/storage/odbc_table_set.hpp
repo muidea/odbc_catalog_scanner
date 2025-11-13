@@ -13,18 +13,18 @@
 
 namespace duckdb {
 struct CreateTableInfo;
-class MySQLConnection;
-class MySQLResult;
-class MySQLSchemaEntry;
+class ODBCConnection;
+class ODBCResult;
+class ODBCSchemaEntry;
 
-class MySQLTableSet : public MySQLInSchemaSet {
+class ODBCTableSet : public ODBCInSchemaSet {
 public:
-	explicit MySQLTableSet(MySQLSchemaEntry &schema);
+	explicit ODBCTableSet(ODBCSchemaEntry &schema);
 
 public:
 	optional_ptr<CatalogEntry> CreateTable(ClientContext &context, BoundCreateTableInfo &info);
 
-	static unique_ptr<MySQLTableInfo> GetTableInfo(ClientContext &context, MySQLSchemaEntry &schema,
+	static unique_ptr<ODBCTableInfo> GetTableInfo(ClientContext &context, ODBCSchemaEntry &schema,
 	                                               const string &table_name);
 	optional_ptr<CatalogEntry> RefreshTable(ClientContext &context, const string &table_name);
 
@@ -38,7 +38,7 @@ protected:
 	void AlterTable(ClientContext &context, AddColumnInfo &info);
 	void AlterTable(ClientContext &context, RemoveColumnInfo &info);
 
-	static void AddColumn(ClientContext &context, MySQLResult &result, MySQLTableInfo &table_info,
+	static void AddColumn(ClientContext &context, ODBCResult &result, ODBCTableInfo &table_info,
 	                      idx_t column_offset = 0);
 };
 

@@ -14,7 +14,7 @@
 
 namespace duckdb {
 
-class MySQLTextWriter {
+class ODBCTextWriter {
 public:
 	void WriteNull() {
 		stream.WriteData(const_data_ptr_cast("\b"), 1);

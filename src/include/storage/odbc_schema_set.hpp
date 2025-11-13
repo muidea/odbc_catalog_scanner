@@ -14,9 +14,9 @@
 namespace duckdb {
 struct CreateSchemaInfo;
 
-class MySQLSchemaSet : public MySQLCatalogSet {
+class ODBCSchemaSet : public ODBCCatalogSet {
 public:
-	explicit MySQLSchemaSet(Catalog &catalog);
+	explicit ODBCSchemaSet(Catalog &catalog);
 
 public:
 	optional_ptr<CatalogEntry> CreateSchema(ClientContext &context, CreateSchemaInfo &info);

@@ -13,9 +13,9 @@
 namespace duckdb {
 class TableCatalogEntry;
 
-class MySQLExecuteQuery : public PhysicalOperator {
+class ODBCExecuteQuery : public PhysicalOperator {
 public:
-	MySQLExecuteQuery(PhysicalPlan &physical_plan, LogicalOperator &op, string op_name, TableCatalogEntry &table,
+	ODBCExecuteQuery(PhysicalPlan &physical_plan, LogicalOperator &op, string op_name, TableCatalogEntry &table,
 	                  string query);
 
 	//! The table to delete from

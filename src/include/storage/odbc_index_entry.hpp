@@ -12,9 +12,9 @@
 
 namespace duckdb {
 
-class MySQLIndexEntry : public IndexCatalogEntry {
+class ODBCIndexEntry : public IndexCatalogEntry {
 public:
-	MySQLIndexEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateIndexInfo &info, string table_name);
+	ODBCIndexEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateIndexInfo &info, string table_name);
 
 	string table_name;
 

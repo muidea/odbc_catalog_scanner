@@ -67,26 +67,26 @@ static bool TableIsInternal(const SchemaCatalogEntry &schema, const string &name
 	return system_tables.find(name) != system_tables.end();
 }
 
-MySQLTableEntry::MySQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
+ODBCTableEntry::ODBCTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
     : TableCatalogEntry(catalog, schema, info) {
 	this->internal = TableIsInternal(schema, name);
 }
 
-MySQLTableEntry::MySQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, MySQLTableInfo &info)
+ODBCTableEntry::ODBCTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, ODBCTableInfo &info)
     : TableCatalogEntry(catalog, schema, *info.create_info) {
 	this->internal = TableIsInternal(schema, name);
 }
 
-unique_ptr<BaseStatistics> MySQLTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
+unique_ptr<BaseStatistics> ODBCTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
 	return nullptr;
 }
 
-void MySQLTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &, LogicalProjection &, LogicalUpdate &,
+void ODBCTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &, LogicalProjection &, LogicalUpdate &,
                                             ClientContext &) {
 }
 
-TableFunction MySQLTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
-	auto result = make_uniq<MySQLBindData>(*this);
+TableFunction ODBCTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
+	auto result = make_uniq<ODBCBindData>(*this);
 	for (auto &col : columns.Logical()) {
 		result->types.push_back(col.GetType());
 		result->names.push_back(col.GetName());
@@ -94,7 +94,7 @@ TableFunction MySQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 
 	bind_data = std::move(result);
 
-	auto function = MySQLScanFunction();
+	auto function = ODBCScanFunction();
 	Value filter_pushdown;
 	if (context.TryGetCurrentSetting("odbc_experimental_filter_pushdown", filter_pushdown)) {
 		function.filter_pushdown = BooleanValue::Get(filter_pushdown);
@@ -102,8 +102,8 @@ TableFunction MySQLTableEntry::GetScanFunction(ClientContext &context, unique_pt
 	return function;
 }
 
-TableStorageInfo MySQLTableEntry::GetStorageInfo(ClientContext &context) {
-	auto &transaction = Transaction::Get(context, catalog).Cast<MySQLTransaction>();
+TableStorageInfo ODBCTableEntry::GetStorageInfo(ClientContext &context) {
+	auto &transaction = Transaction::Get(context, catalog).Cast<ODBCTransaction>();
 	auto &db = transaction.GetConnection();
 	TableStorageInfo result;
 	result.cardinality = 0;

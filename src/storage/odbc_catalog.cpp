@@ -15,20 +15,20 @@
 
 namespace duckdb {
 
-MySQLCatalog::MySQLCatalog(AttachedDatabase &db_p, string connection_string_p, string attach_path_p,
+ODBCCatalog::ODBCCatalog(AttachedDatabase &db_p, string connection_string_p, string attach_path_p,
                            AccessMode access_mode)
     : Catalog(db_p), connection_string(std::move(connection_string_p)), attach_path(std::move(attach_path_p)),
       access_mode(access_mode), schemas(*this) {
-	MySQLConnectionParameters connection_params;
+	ODBCConnectionParameters connection_params;
 	unordered_set<string> unused;
-	std::tie(connection_params, unused) = MySQLUtils::ParseConnectionParameters(connection_string);
+	std::tie(connection_params, unused) = ODBCUtils::ParseConnectionParameters(connection_string);
 	default_schema = connection_params.db;
 	// try to connect
-	MySQLTypeConfig type_config;
-	auto connection = MySQLConnection::Open(type_config, connection_string);
+	ODBCTypeConfig type_config;
+	auto connection = ODBCConnection::Open(type_config, connection_string);
 }
 
-MySQLCatalog::~MySQLCatalog() = default;
+ODBCCatalog::~ODBCCatalog() = default;
 
 string EscapeConnectionString(const string &input) {
 	string result = "\"";
@@ -359,7 +359,7 @@ void TryConvertURI(string &dsn) {
 	}
 }
 
-string MySQLCatalog::GetConnectionString(ClientContext &context, const string &attach_path, string secret_name) {
+string ODBCCatalog::GetConnectionString(ClientContext &context, const string &attach_path, string secret_name) {
 	// if no secret is specified we default to the unnamed odbc secret, if it
 	// exists
 	bool explicit_secret = !secret_name.empty();
@@ -382,9 +382,9 @@ string MySQLCatalog::GetConnectionString(ClientContext &context, const string &a
 
 		// Parse the original connection string to find which parameters are already
 		// set
-		MySQLConnectionParameters unused;
+		ODBCConnectionParameters unused;
 		unordered_set<string> existing_params;
-		std::tie(unused, existing_params) = MySQLUtils::ParseConnectionParameters(connection_string);
+		std::tie(unused, existing_params) = ODBCUtils::ParseConnectionParameters(connection_string);
 
 		// Build a new connection string with parameters from the secret that don't
 		// already exist in the original connection string
@@ -421,10 +421,10 @@ string MySQLCatalog::GetConnectionString(ClientContext &context, const string &a
 	return connection_string;
 }
 
-void MySQLCatalog::Initialize(bool load_builtin) {
+void ODBCCatalog::Initialize(bool load_builtin) {
 }
 
-optional_ptr<CatalogEntry> MySQLCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
+optional_ptr<CatalogEntry> ODBCCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
 	if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
 		DropInfo try_drop;
 		try_drop.type = CatalogType::SCHEMA_ENTRY;
@@ -436,15 +436,15 @@ optional_ptr<CatalogEntry> MySQLCatalog::CreateSchema(CatalogTransaction transac
 	return schemas.CreateSchema(transaction.GetContext(), info);
 }
 
-void MySQLCatalog::DropSchema(ClientContext &context, DropInfo &info) {
+void ODBCCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	return schemas.DropEntry(context, info);
 }
 
-void MySQLCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
-	schemas.Scan(context, [&](CatalogEntry &schema) { callback(schema.Cast<MySQLSchemaEntry>()); });
+void ODBCCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
+	schemas.Scan(context, [&](CatalogEntry &schema) { callback(schema.Cast<ODBCSchemaEntry>()); });
 }
 
-optional_ptr<SchemaCatalogEntry> MySQLCatalog::LookupSchema(CatalogTransaction transaction,
+optional_ptr<SchemaCatalogEntry> ODBCCatalog::LookupSchema(CatalogTransaction transaction,
                                                             const EntryLookupInfo &schema_lookup,
                                                             OnEntryNotFound if_not_found) {
 	auto schema_name = schema_lookup.GetEntryName();
@@ -462,51 +462,51 @@ optional_ptr<SchemaCatalogEntry> MySQLCatalog::LookupSchema(CatalogTransaction t
 	return reinterpret_cast<SchemaCatalogEntry *>(entry.get());
 }
 
-bool MySQLCatalog::InMemory() {
+bool ODBCCatalog::InMemory() {
 	return false;
 }
 
-string MySQLCatalog::GetDBPath() {
+string ODBCCatalog::GetDBPath() {
 	return attach_path;
 }
 
-bool MySQLCatalog::IsMySQLScan(const string &name) {
+bool ODBCCatalog::IsODBCScan(const string &name) {
 	return name == "odbc_scan";
 }
 
-bool MySQLCatalog::IsMySQLQuery(const string &name) {
+bool ODBCCatalog::IsODBCQuery(const string &name) {
 	return name == "odbc_query";
 }
 
-void MySQLCatalog::MaterializeMySQLScans(PhysicalOperator &op) {
+void ODBCCatalog::MaterializeODBCScans(PhysicalOperator &op) {
 	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
 		auto &table_scan = op.Cast<PhysicalTableScan>();
-		if (MySQLCatalog::IsMySQLScan(table_scan.function.name)) {
-			auto &bind_data = table_scan.bind_data->Cast<MySQLBindData>();
-			bind_data.streaming = MySQLResultStreaming::FORCE_MATERIALIZATION;
+		if (ODBCCatalog::IsODBCScan(table_scan.function.name)) {
+			auto &bind_data = table_scan.bind_data->Cast<ODBCBindData>();
+			bind_data.streaming = ODBCResultStreaming::FORCE_MATERIALIZATION;
 		}
-		if (MySQLCatalog::IsMySQLQuery(table_scan.function.name)) {
-			auto &bind_data = table_scan.bind_data->Cast<MySQLQueryBindData>();
-			bind_data.streaming = MySQLResultStreaming::FORCE_MATERIALIZATION;
+		if (ODBCCatalog::IsODBCQuery(table_scan.function.name)) {
+			auto &bind_data = table_scan.bind_data->Cast<ODBCQueryBindData>();
+			bind_data.streaming = ODBCResultStreaming::FORCE_MATERIALIZATION;
 		}
 	}
 	for (auto &child : op.children) {
-		MaterializeMySQLScans(child);
+		MaterializeODBCScans(child);
 	}
 }
 
-DatabaseSize MySQLCatalog::GetDatabaseSize(ClientContext &context) {
+DatabaseSize ODBCCatalog::GetDatabaseSize(ClientContext &context) {
 	if (default_schema.empty()) {
 		throw InvalidInputException("Attempting to fetch the database size - but no database was provided "
 		                            "in the connection string");
 	}
-	auto &postgres_transaction = MySQLTransaction::Get(context, *this);
+	auto &postgres_transaction = ODBCTransaction::Get(context, *this);
 	auto query = StringUtil::Replace(R"(
 SELECT SUM(data_length + index_length)
 FROM information_schema.tables
 WHERE table_schema = ${SCHEMA_NAME};
 )",
-	                                 "${SCHEMA_NAME}", MySQLUtils::WriteLiteral(default_schema));
+	                                 "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(default_schema));
 	auto result = postgres_transaction.Query(query);
 	DatabaseSize size;
 	size.free_blocks = 0;
@@ -515,13 +515,13 @@ WHERE table_schema = ${SCHEMA_NAME};
 	size.wal_size = 0;
 	size.block_size = 0;
 	if (!result->Next()) {
-		throw InternalException("MySQLCatalog::GetDatabaseSize - No row returned!?");
+		throw InternalException("ODBCCatalog::GetDatabaseSize - No row returned!?");
 	}
 	size.bytes = result->IsNull(0) ? 0 : result->GetInt64(0);
 	return size;
 }
 
-void MySQLCatalog::ClearCache() {
+void ODBCCatalog::ClearCache() {
 	schemas.ClearEntries();
 }
 

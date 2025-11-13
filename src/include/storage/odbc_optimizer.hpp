@@ -11,7 +11,7 @@
 #include "duckdb/main/config.hpp"
 
 namespace duckdb {
-class MySQLOptimizer {
+class ODBCOptimizer {
 public:
 	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
 };

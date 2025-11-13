@@ -14,12 +14,12 @@
 
 namespace duckdb {
 struct DropInfo;
-class MySQLSchemaEntry;
-class MySQLTransaction;
+class ODBCSchemaEntry;
+class ODBCTransaction;
 
-class MySQLCatalogSet {
+class ODBCCatalogSet {
 public:
-	MySQLCatalogSet(Catalog &catalog);
+	ODBCCatalogSet(Catalog &catalog);
 
 	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const string &name);
 	virtual void DropEntry(ClientContext &context, DropInfo &info);
@@ -41,14 +41,14 @@ private:
 	bool is_loaded;
 };
 
-class MySQLInSchemaSet : public MySQLCatalogSet {
+class ODBCInSchemaSet : public ODBCCatalogSet {
 public:
-	MySQLInSchemaSet(MySQLSchemaEntry &schema);
+	ODBCInSchemaSet(ODBCSchemaEntry &schema);
 
 	optional_ptr<CatalogEntry> CreateEntry(unique_ptr<CatalogEntry> entry) override;
 
 protected:
-	MySQLSchemaEntry &schema;
+	ODBCSchemaEntry &schema;
 };
 
 } // namespace duckdb

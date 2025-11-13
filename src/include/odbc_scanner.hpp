@@ -15,68 +15,68 @@
 #include "odbc_utils.hpp"
 
 namespace duckdb {
-class MySQLTableEntry;
-class MySQLTransaction;
+class ODBCTableEntry;
+class ODBCTransaction;
 
-struct MySQLBindData : public FunctionData {
-	explicit MySQLBindData(MySQLTableEntry &table) : table(table) {
+struct ODBCBindData : public FunctionData {
+	explicit ODBCBindData(ODBCTableEntry &table) : table(table) {
 	}
 
-	MySQLTableEntry &table;
-	vector<MySQLType> odbc_types;
+	ODBCTableEntry &table;
+	vector<ODBCType> odbc_types;
 	vector<string> names;
 	vector<LogicalType> types;
 	string limit;
-	MySQLResultStreaming streaming = MySQLResultStreaming::UNINITIALIZED;
+	ODBCResultStreaming streaming = ODBCResultStreaming::UNINITIALIZED;
 
 public:
 	unique_ptr<FunctionData> Copy() const override {
-		throw NotImplementedException("MySQLBindData copy not supported");
+		throw NotImplementedException("ODBCBindData copy not supported");
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		return false;
 	}
 };
 
-struct MySQLQueryBindData : public FunctionData {
-	MySQLQueryBindData(Catalog &catalog, unique_ptr<MySQLResult> result_p, string query_p)
+struct ODBCQueryBindData : public FunctionData {
+	ODBCQueryBindData(Catalog &catalog, unique_ptr<ODBCResult> result_p, string query_p)
 	    : catalog(catalog), result(std::move(result_p)), query(std::move(query_p)) {
 	}
 
 	Catalog &catalog;
-	unique_ptr<MySQLResult> result;
+	unique_ptr<ODBCResult> result;
 	string query;
-	MySQLResultStreaming streaming = MySQLResultStreaming::UNINITIALIZED;
+	ODBCResultStreaming streaming = ODBCResultStreaming::UNINITIALIZED;
 
 public:
 	unique_ptr<FunctionData> Copy() const override {
-		throw NotImplementedException("MySQLBindData copy not supported");
+		throw NotImplementedException("ODBCBindData copy not supported");
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		return false;
 	}
 };
 
-class MySQLScanFunction : public TableFunction {
+class ODBCScanFunction : public TableFunction {
 public:
-	MySQLScanFunction();
+	ODBCScanFunction();
 };
 
-class MySQLQueryFunction : public TableFunction {
+class ODBCQueryFunction : public TableFunction {
 public:
-	MySQLQueryFunction();
+	ODBCQueryFunction();
 };
 
-class MySQLClearCacheFunction : public TableFunction {
+class ODBCClearCacheFunction : public TableFunction {
 public:
-	MySQLClearCacheFunction();
+	ODBCClearCacheFunction();
 
 	static void ClearCacheOnSetting(ClientContext &context, SetScope scope, Value &parameter);
 };
 
-class MySQLExecuteFunction : public TableFunction {
+class ODBCExecuteFunction : public TableFunction {
 public:
-	MySQLExecuteFunction();
+	ODBCExecuteFunction();
 };
 
 } // namespace duckdb

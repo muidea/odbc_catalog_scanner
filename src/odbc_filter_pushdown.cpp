@@ -5,7 +5,7 @@
 
 namespace duckdb {
 
-string MySQLFilterPushdown::CreateExpression(string &column_name, vector<unique_ptr<TableFilter>> &filters, string op) {
+string ODBCFilterPushdown::CreateExpression(string &column_name, vector<unique_ptr<TableFilter>> &filters, string op) {
 	vector<string> filter_entries;
 	for (auto &filter : filters) {
 		auto new_filter = TransformFilter(column_name, *filter);
@@ -20,7 +20,7 @@ string MySQLFilterPushdown::CreateExpression(string &column_name, vector<unique_
 	return "(" + StringUtil::Join(filter_entries, " " + op + " ") + ")";
 }
 
-string MySQLFilterPushdown::TransformComparison(ExpressionType type) {
+string ODBCFilterPushdown::TransformComparison(ExpressionType type) {
 	switch (type) {
 	case ExpressionType::COMPARE_EQUAL:
 		return "=";
@@ -39,7 +39,7 @@ string MySQLFilterPushdown::TransformComparison(ExpressionType type) {
 	}
 }
 
-string MySQLFilterPushdown::TransformFilter(string &column_name, TableFilter &filter) {
+string ODBCFilterPushdown::TransformFilter(string &column_name, TableFilter &filter) {
 	switch (filter.filter_type) {
 	case TableFilterType::IS_NULL:
 		return column_name + " IS NULL";
@@ -55,7 +55,7 @@ string MySQLFilterPushdown::TransformFilter(string &column_name, TableFilter &fi
 	}
 	case TableFilterType::CONSTANT_COMPARISON: {
 		auto &constant_filter = filter.Cast<ConstantFilter>();
-		auto constant_string = MySQLUtils::TransformConstant(constant_filter.constant);
+		auto constant_string = ODBCUtils::TransformConstant(constant_filter.constant);
 		auto operator_string = TransformComparison(constant_filter.comparison_type);
 		return StringUtil::Format("%s %s %s", column_name, operator_string, constant_string);
 	}
@@ -73,7 +73,7 @@ string MySQLFilterPushdown::TransformFilter(string &column_name, TableFilter &fi
 			if (!in_list.empty()) {
 				in_list += ", ";
 			}
-			in_list += MySQLUtils::TransformConstant(val);
+			in_list += ODBCUtils::TransformConstant(val);
 		}
 		return column_name + " IN (" + in_list + ")";
 	}
@@ -82,7 +82,7 @@ string MySQLFilterPushdown::TransformFilter(string &column_name, TableFilter &fi
 	}
 }
 
-string MySQLFilterPushdown::TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
+string ODBCFilterPushdown::TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
                                              const vector<string> &names) {
 	if (!filters || filters->filters.empty()) {
 		// no filters
@@ -90,7 +90,7 @@ string MySQLFilterPushdown::TransformFilters(const vector<column_t> &column_ids,
 	}
 	string result;
 	for (auto &entry : filters->filters) {
-		auto column_name = MySQLUtils::WriteIdentifier(names[column_ids[entry.first]]);
+		auto column_name = ODBCUtils::WriteIdentifier(names[column_ids[entry.first]]);
 		auto &filter = *entry.second;
 		auto new_filter = TransformFilter(column_name, filter);
 		if (new_filter.empty()) {

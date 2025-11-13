@@ -10,18 +10,18 @@
 
 namespace duckdb {
 
-struct MySQLExecuteBindData : public TableFunctionData {
-	explicit MySQLExecuteBindData(MySQLCatalog &odbc_catalog, string query_p, vector<Value> params_p)
+struct ODBCExecuteBindData : public TableFunctionData {
+	explicit ODBCExecuteBindData(ODBCCatalog &odbc_catalog, string query_p, vector<Value> params_p)
 	    : odbc_catalog(odbc_catalog), query(std::move(query_p)), params(std::move(params_p)) {
 	}
 
 	bool finished = false;
-	MySQLCatalog &odbc_catalog;
+	ODBCCatalog &odbc_catalog;
 	string query;
 	vector<Value> params;
 };
 
-static duckdb::unique_ptr<FunctionData> MySQLExecuteBind(ClientContext &context, TableFunctionBindInput &input,
+static duckdb::unique_ptr<FunctionData> ODBCExecuteBind(ClientContext &context, TableFunctionBindInput &input,
                                                          vector<LogicalType> &return_types, vector<string> &names) {
 	return_types.emplace_back(LogicalType::BOOLEAN);
 	names.emplace_back("Success");
@@ -35,9 +35,9 @@ static duckdb::unique_ptr<FunctionData> MySQLExecuteBind(ClientContext &context,
 	}
 	auto &catalog = db->GetCatalog();
 	if (catalog.GetCatalogType() != "odbc") {
-		throw BinderException("Attached database \"%s\" does not refer to a MySQL database", db_name);
+		throw BinderException("Attached database \"%s\" does not refer to a ODBC database", db_name);
 	}
-	auto &odbc_catalog = catalog.Cast<MySQLCatalog>();
+	auto &odbc_catalog = catalog.Cast<ODBCCatalog>();
 	vector<Value> params;
 	auto params_it = input.named_parameters.find("params");
 	if (params_it != input.named_parameters.end()) {
@@ -50,15 +50,15 @@ static duckdb::unique_ptr<FunctionData> MySQLExecuteBind(ClientContext &context,
 		}
 		params = StructValue::GetChildren(struct_val);
 	}
-	return make_uniq<MySQLExecuteBindData>(odbc_catalog, input.inputs[1].GetValue<string>(), std::move(params));
+	return make_uniq<ODBCExecuteBindData>(odbc_catalog, input.inputs[1].GetValue<string>(), std::move(params));
 }
 
-static void MySQLExecuteFunc(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-	auto &data = data_p.bind_data->CastNoConst<MySQLExecuteBindData>();
+static void ODBCExecuteFunc(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.bind_data->CastNoConst<ODBCExecuteBindData>();
 	if (data.finished) {
 		return;
 	}
-	auto &transaction = Transaction::Get(context, data.odbc_catalog).Cast<MySQLTransaction>();
+	auto &transaction = Transaction::Get(context, data.odbc_catalog).Cast<ODBCTransaction>();
 	if (transaction.GetAccessMode() == AccessMode::READ_ONLY) {
 		throw PermissionException("odbc_execute cannot be run in a read-only connection");
 	}
@@ -66,8 +66,8 @@ static void MySQLExecuteFunc(ClientContext &context, TableFunctionInput &data_p,
 	data.finished = true;
 }
 
-MySQLExecuteFunction::MySQLExecuteFunction()
-    : TableFunction("odbc_execute", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MySQLExecuteFunc, MySQLExecuteBind) {
+ODBCExecuteFunction::ODBCExecuteFunction()
+    : TableFunction("odbc_execute", {LogicalType::VARCHAR, LogicalType::VARCHAR}, ODBCExecuteFunc, ODBCExecuteBind) {
 	named_parameters["params"] = LogicalType::ANY;
 }
 

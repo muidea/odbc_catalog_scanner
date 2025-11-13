@@ -14,7 +14,7 @@
 
 namespace duckdb {
 
-class MySQLFilterPushdown {
+class ODBCFilterPushdown {
 public:
 	static string TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
 	                               const vector<string> &names);

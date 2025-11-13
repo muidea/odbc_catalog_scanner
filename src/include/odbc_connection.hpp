@@ -16,19 +16,19 @@
 #include "odbc_utils.hpp"
 
 namespace duckdb {
-class MySQLBinaryWriter;
-class MySQLTextWriter;
-struct MySQLBinaryReader;
-class MySQLSchemaEntry;
-class MySQLTableEntry;
-class MySQLStatement;
-class MySQLResult;
+class ODBCBinaryWriter;
+class ODBCTextWriter;
+struct ODBCBinaryReader;
+class ODBCSchemaEntry;
+class ODBCTableEntry;
+class ODBCStatement;
+class ODBCResult;
 struct IndexInfo;
 
-struct OwnedMySQLConnection {
-	explicit OwnedMySQLConnection(MYSQL *conn = nullptr) : connection(conn) {
+struct OwnedODBCConnection {
+	explicit OwnedODBCConnection(MYSQL *conn = nullptr) : connection(conn) {
 	}
-	~OwnedMySQLConnection() {
+	~OwnedODBCConnection() {
 		if (!connection) {
 			return;
 		}
@@ -39,31 +39,31 @@ struct OwnedMySQLConnection {
 	MYSQL *connection;
 };
 
-class MySQLConnection {
+class ODBCConnection {
 public:
-	explicit MySQLConnection(shared_ptr<OwnedMySQLConnection> connection, const std::string &dsn_p,
-	                         MySQLTypeConfig type_config_p);
-	~MySQLConnection();
+	explicit ODBCConnection(shared_ptr<OwnedODBCConnection> connection, const std::string &dsn_p,
+	                         ODBCTypeConfig type_config_p);
+	~ODBCConnection();
 	// disable copy constructors
-	MySQLConnection(const MySQLConnection &other) = delete;
-	MySQLConnection &operator=(const MySQLConnection &) = delete;
+	ODBCConnection(const ODBCConnection &other) = delete;
+	ODBCConnection &operator=(const ODBCConnection &) = delete;
 	//! enable move constructors
-	MySQLConnection(MySQLConnection &&other) noexcept;
-	MySQLConnection &operator=(MySQLConnection &&) noexcept;
+	ODBCConnection(ODBCConnection &&other) noexcept;
+	ODBCConnection &operator=(ODBCConnection &&) noexcept;
 
 public:
-	static MySQLConnection Open(MySQLTypeConfig type_config, const string &connection_string);
+	static ODBCConnection Open(ODBCTypeConfig type_config, const string &connection_string);
 	void Execute(const string &query);
 	void Execute(const string &query, vector<Value> params);
-	unique_ptr<MySQLResult> Query(const string &query, MySQLResultStreaming streaming);
-	unique_ptr<MySQLResult> Query(const string &query, vector<Value> params, MySQLResultStreaming streaming);
+	unique_ptr<ODBCResult> Query(const string &query, ODBCResultStreaming streaming);
+	unique_ptr<ODBCResult> Query(const string &query, vector<Value> params, ODBCResultStreaming streaming);
 
 	vector<IndexInfo> GetIndexInfo(const string &table_name);
 
 	bool IsOpen();
 	void Close();
 
-	shared_ptr<OwnedMySQLConnection> GetConnection() {
+	shared_ptr<OwnedODBCConnection> GetConnection() {
 		return connection;
 	}
 	string GetDSN() {
@@ -72,7 +72,7 @@ public:
 
 	MYSQL *GetConn() {
 		if (!connection || !connection->connection) {
-			throw InternalException("MySQLConnection::GetConn - no connection available");
+			throw InternalException("ODBCConnection::GetConn - no connection available");
 		}
 		return connection->connection;
 	}
@@ -81,14 +81,14 @@ public:
 	static bool DebugPrintQueries();
 
 private:
-	unique_ptr<MySQLResult> QueryInternal(const string &query, vector<Value> params, MySQLResultStreaming streaming,
-	                                      MySQLConnectorInterface con_interface);
-	idx_t MySQLExecute(MYSQL_STMT *stmt, const string &query, vector<Value> params, bool streaming);
+	unique_ptr<ODBCResult> QueryInternal(const string &query, vector<Value> params, ODBCResultStreaming streaming,
+	                                      ODBCConnectorInterface con_interface);
+	idx_t ODBCExecute(MYSQL_STMT *stmt, const string &query, vector<Value> params, bool streaming);
 
 	mutex query_lock;
-	shared_ptr<OwnedMySQLConnection> connection;
+	shared_ptr<OwnedODBCConnection> connection;
 	string dsn;
-	MySQLTypeConfig type_config;
+	ODBCTypeConfig type_config;
 };
 
 } // namespace duckdb

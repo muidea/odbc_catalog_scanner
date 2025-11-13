@@ -12,29 +12,29 @@
 
 namespace duckdb {
 
-struct MySQLGlobalState;
+struct ODBCGlobalState;
 
-struct MySQLLocalState : public LocalTableFunctionState {};
+struct ODBCLocalState : public LocalTableFunctionState {};
 
-struct MySQLGlobalState : public GlobalTableFunctionState {
-	explicit MySQLGlobalState(unique_ptr<MySQLResult> result_p) : result(std::move(result_p)) {
+struct ODBCGlobalState : public GlobalTableFunctionState {
+	explicit ODBCGlobalState(unique_ptr<ODBCResult> result_p) : result(std::move(result_p)) {
 	}
 
-	unique_ptr<MySQLResult> result;
+	unique_ptr<ODBCResult> result;
 
 	idx_t MaxThreads() const override {
 		return 1;
 	}
 };
 
-static unique_ptr<FunctionData> MySQLBind(ClientContext &context, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> ODBCBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
-	throw InternalException("MySQLBind");
+	throw InternalException("ODBCBind");
 }
 
-static unique_ptr<GlobalTableFunctionState> MySQLInitGlobalState(ClientContext &context,
+static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &context,
                                                                  TableFunctionInitInput &input) {
-	auto &bind_data = input.bind_data->Cast<MySQLBindData>();
+	auto &bind_data = input.bind_data->Cast<ODBCBindData>();
 	// generate the SELECT statement
 	string select;
 	select += "SELECT ";
@@ -47,14 +47,14 @@ static unique_ptr<GlobalTableFunctionState> MySQLInitGlobalState(ClientContext &
 		} else {
 			auto &col = bind_data.table.GetColumn(LogicalIndex(input.column_ids[c]));
 			auto col_name = col.GetName();
-			select += MySQLUtils::WriteIdentifier(col_name);
+			select += ODBCUtils::WriteIdentifier(col_name);
 		}
 	}
 	select += " FROM ";
-	select += MySQLUtils::WriteIdentifier(bind_data.table.schema.name);
+	select += ODBCUtils::WriteIdentifier(bind_data.table.schema.name);
 	select += ".";
-	select += MySQLUtils::WriteIdentifier(bind_data.table.name);
-	string filter_string = MySQLFilterPushdown::TransformFilters(input.column_ids, input.filters, bind_data.names);
+	select += ODBCUtils::WriteIdentifier(bind_data.table.name);
+	string filter_string = ODBCFilterPushdown::TransformFilters(input.column_ids, input.filters, bind_data.names);
 	if (!filter_string.empty()) {
 		select += " WHERE " + filter_string;
 	}
@@ -62,21 +62,21 @@ static unique_ptr<GlobalTableFunctionState> MySQLInitGlobalState(ClientContext &
 		select += bind_data.limit;
 	}
 	// run the query
-	auto &transaction = MySQLTransaction::Get(context, bind_data.table.catalog);
+	auto &transaction = ODBCTransaction::Get(context, bind_data.table.catalog);
 	auto &con = transaction.GetConnection();
 	auto query_result = con.Query(select, bind_data.streaming);
-	auto result = make_uniq<MySQLGlobalState>(std::move(query_result));
+	auto result = make_uniq<ODBCGlobalState>(std::move(query_result));
 
 	return std::move(result);
 }
 
-static unique_ptr<LocalTableFunctionState> MySQLInitLocalState(ExecutionContext &context, TableFunctionInitInput &input,
+static unique_ptr<LocalTableFunctionState> ODBCInitLocalState(ExecutionContext &context, TableFunctionInitInput &input,
                                                                GlobalTableFunctionState *global_state) {
-	return make_uniq<MySQLLocalState>();
+	return make_uniq<ODBCLocalState>();
 }
 
-static void MySQLScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &gstate = data.global_state->Cast<MySQLGlobalState>();
+static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &gstate = data.global_state->Cast<ODBCGlobalState>();
 	DataChunk &res_chunk = gstate.result->NextChunk();
 	D_ASSERT(output.ColumnCount() == res_chunk.ColumnCount());
 	string error;
@@ -122,43 +122,43 @@ static void MySQLScan(ClientContext &context, TableFunctionInput &data, DataChun
 	output.SetCardinality(res_chunk.size());
 }
 
-static InsertionOrderPreservingMap<string> MySQLScanToString(TableFunctionToStringInput &input) {
+static InsertionOrderPreservingMap<string> ODBCScanToString(TableFunctionToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
-	auto &bind_data = input.bind_data->Cast<MySQLBindData>();
+	auto &bind_data = input.bind_data->Cast<ODBCBindData>();
 	result["Table"] = bind_data.table.name;
 	return result;
 }
 
-static void MySQLScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
+static void ODBCScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
                                const TableFunction &function) {
-	throw NotImplementedException("MySQLScanSerialize");
+	throw NotImplementedException("ODBCScanSerialize");
 }
 
-static unique_ptr<FunctionData> MySQLScanDeserialize(Deserializer &deserializer, TableFunction &function) {
-	throw NotImplementedException("MySQLScanDeserialize");
+static unique_ptr<FunctionData> ODBCScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+	throw NotImplementedException("ODBCScanDeserialize");
 }
 
-static BindInfo MySQLGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
-	auto &bind_data = bind_data_p->Cast<MySQLBindData>();
+static BindInfo ODBCGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<ODBCBindData>();
 	BindInfo info(ScanType::EXTERNAL);
 	info.table = bind_data.table;
 	return info;
 }
 
-MySQLScanFunction::MySQLScanFunction()
-    : TableFunction("odbc_scan", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, MySQLScan,
-                    MySQLBind, MySQLInitGlobalState, MySQLInitLocalState) {
-	to_string = MySQLScanToString;
-	serialize = MySQLScanSerialize;
-	deserialize = MySQLScanDeserialize;
-	get_bind_info = MySQLGetBindInfo;
+ODBCScanFunction::ODBCScanFunction()
+    : TableFunction("odbc_scan", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ODBCScan,
+                    ODBCBind, ODBCInitGlobalState, ODBCInitLocalState) {
+	to_string = ODBCScanToString;
+	serialize = ODBCScanSerialize;
+	deserialize = ODBCScanDeserialize;
+	get_bind_info = ODBCGetBindInfo;
 	projection_pushdown = true;
 }
 
 //===--------------------------------------------------------------------===//
-// MySQL Query
+// ODBC Query
 //===--------------------------------------------------------------------===//
-static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> ODBCQueryBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
 		throw BinderException("Parameters to odbc_query cannot be NULL");
@@ -173,9 +173,9 @@ static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunc
 	}
 	auto &catalog = db->GetCatalog();
 	if (catalog.GetCatalogType() != "odbc") {
-		throw BinderException("Attached database \"%s\" does not refer to a MySQL database", db_name);
+		throw BinderException("Attached database \"%s\" does not refer to a ODBC database", db_name);
 	}
-	auto &transaction = MySQLTransaction::Get(context, catalog);
+	auto &transaction = ODBCTransaction::Get(context, catalog);
 	auto sql = input.inputs[1].GetValue<string>();
 
 	vector<Value> params;
@@ -192,7 +192,7 @@ static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunc
 	}
 
 	auto result =
-	    transaction.GetConnection().Query(sql, std::move(params), MySQLResultStreaming::FORCE_MATERIALIZATION);
+	    transaction.GetConnection().Query(sql, std::move(params), ODBCResultStreaming::FORCE_MATERIALIZATION);
 	for (auto &field : result->Fields()) {
 		names.push_back(field.name);
 		return_types.push_back(field.duckdb_type);
@@ -200,28 +200,28 @@ static unique_ptr<FunctionData> MySQLQueryBind(ClientContext &context, TableFunc
 	if (return_types.empty()) {
 		throw InvalidInputException("Failed to fetch return types for query '%s'", sql);
 	}
-	return make_uniq<MySQLQueryBindData>(catalog, std::move(result), std::move(sql));
+	return make_uniq<ODBCQueryBindData>(catalog, std::move(result), std::move(sql));
 }
 
-static unique_ptr<GlobalTableFunctionState> MySQLQueryInitGlobalState(ClientContext &context,
+static unique_ptr<GlobalTableFunctionState> ODBCQueryInitGlobalState(ClientContext &context,
                                                                       TableFunctionInitInput &input) {
-	auto &bind_data = input.bind_data->CastNoConst<MySQLQueryBindData>();
-	unique_ptr<MySQLResult> odbc_result;
+	auto &bind_data = input.bind_data->CastNoConst<ODBCQueryBindData>();
+	unique_ptr<ODBCResult> odbc_result;
 	if (bind_data.result) {
 		odbc_result = std::move(bind_data.result);
 	} else {
-		auto &transaction = MySQLTransaction::Get(context, bind_data.catalog);
-		odbc_result = transaction.GetConnection().Query(bind_data.query, MySQLResultStreaming::FORCE_MATERIALIZATION);
+		auto &transaction = ODBCTransaction::Get(context, bind_data.catalog);
+		odbc_result = transaction.GetConnection().Query(bind_data.query, ODBCResultStreaming::FORCE_MATERIALIZATION);
 	}
 
-	return make_uniq<MySQLGlobalState>(std::move(odbc_result));
+	return make_uniq<ODBCGlobalState>(std::move(odbc_result));
 }
 
-MySQLQueryFunction::MySQLQueryFunction()
-    : TableFunction("odbc_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, MySQLScan, MySQLQueryBind,
-                    MySQLQueryInitGlobalState, MySQLInitLocalState) {
-	serialize = MySQLScanSerialize;
-	deserialize = MySQLScanDeserialize;
+ODBCQueryFunction::ODBCQueryFunction()
+    : TableFunction("odbc_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, ODBCScan, ODBCQueryBind,
+                    ODBCQueryInitGlobalState, ODBCInitLocalState) {
+	serialize = ODBCScanSerialize;
+	deserialize = ODBCScanDeserialize;
 	named_parameters["params"] = LogicalType::ANY;
 }
 

@@ -12,11 +12,11 @@
 #include "storage/odbc_index_entry.hpp"
 
 namespace duckdb {
-class MySQLSchemaEntry;
+class ODBCSchemaEntry;
 
-class MySQLIndexSet : public MySQLInSchemaSet {
+class ODBCIndexSet : public ODBCInSchemaSet {
 public:
-	MySQLIndexSet(MySQLSchemaEntry &schema);
+	ODBCIndexSet(ODBCSchemaEntry &schema);
 
 	void DropEntry(ClientContext &context, DropInfo &info) override;
 

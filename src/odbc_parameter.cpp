@@ -68,7 +68,7 @@ static void FillTimestampBuffer(Value &value, vector<char> &bind_buffer) {
 	std::memcpy(bind_buffer.data(), &mt, sizeof(MYSQL_TIME));
 }
 
-MySQLParameter::MySQLParameter(const string &query, Value value_p) : value(std::move(value_p)) {
+ODBCParameter::ODBCParameter(const string &query, Value value_p) : value(std::move(value_p)) {
 	if (value.IsNull()) {
 		return;
 	}
@@ -142,11 +142,11 @@ MySQLParameter::MySQLParameter(const string &query, Value value_p) : value(std::
 		// use string ref from the value
 		break;
 	default:
-		throw IOException("Unsupported parameters type: \"%s\", MySQL query \"%s\"", value.type(), query.c_str());
+		throw IOException("Unsupported parameters type: \"%s\", ODBC query \"%s\"", value.type(), query.c_str());
 	}
 }
 
-MYSQL_BIND MySQLParameter::CreateBind() {
+MYSQL_BIND ODBCParameter::CreateBind() {
 	MYSQL_BIND bind;
 	std::memset(&bind, '\0', sizeof(MYSQL_BIND));
 

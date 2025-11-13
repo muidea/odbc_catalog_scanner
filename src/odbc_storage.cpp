@@ -7,12 +7,12 @@
 
 namespace duckdb {
 
-static unique_ptr<Catalog> MySQLAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
+static unique_ptr<Catalog> ODBCAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                        AttachedDatabase &db, const string &name, AttachInfo &info,
                                        AttachOptions &attach_options) {
 	auto &config = DBConfig::GetConfig(context);
 	if (!config.options.enable_external_access) {
-		throw PermissionException("Attaching MySQL databases is disabled through configuration");
+		throw PermissionException("Attaching ODBC databases is disabled through configuration");
 	}
 	// check if we have a secret provided
 	string secret_name;
@@ -21,25 +21,25 @@ static unique_ptr<Catalog> MySQLAttach(optional_ptr<StorageExtensionInfo> storag
 		if (lower_name == "secret") {
 			secret_name = entry.second.ToString();
 		} else {
-			throw BinderException("Unrecognized option for MySQL attach: %s", entry.first);
+			throw BinderException("Unrecognized option for ODBC attach: %s", entry.first);
 		}
 	}
 
 	string attach_path = info.path;
-	auto connection_string = MySQLCatalog::GetConnectionString(context, attach_path, secret_name);
-	return make_uniq<MySQLCatalog>(db, std::move(connection_string), std::move(attach_path),
+	auto connection_string = ODBCCatalog::GetConnectionString(context, attach_path, secret_name);
+	return make_uniq<ODBCCatalog>(db, std::move(connection_string), std::move(attach_path),
 	                               attach_options.access_mode);
 }
 
-static unique_ptr<TransactionManager> MySQLCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
+static unique_ptr<TransactionManager> ODBCCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
                                                                     AttachedDatabase &db, Catalog &catalog) {
-	auto &odbc_catalog = catalog.Cast<MySQLCatalog>();
-	return make_uniq<MySQLTransactionManager>(db, odbc_catalog);
+	auto &odbc_catalog = catalog.Cast<ODBCCatalog>();
+	return make_uniq<ODBCTransactionManager>(db, odbc_catalog);
 }
 
-MySQLStorageExtension::MySQLStorageExtension() {
-	attach = MySQLAttach;
-	create_transaction_manager = MySQLCreateTransactionManager;
+ODBCStorageExtension::ODBCStorageExtension() {
+	attach = ODBCAttach;
+	create_transaction_manager = ODBCCreateTransactionManager;
 }
 
 } // namespace duckdb

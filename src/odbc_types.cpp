@@ -10,16 +10,16 @@ static bool GetBoolOption(ClientContext &context, const std::string &opt_name) {
 	return false;
 }
 
-MySQLTypeConfig::MySQLTypeConfig() {
+ODBCTypeConfig::ODBCTypeConfig() {
 }
 
-MySQLTypeConfig::MySQLTypeConfig(ClientContext &context)
+ODBCTypeConfig::ODBCTypeConfig(ClientContext &context)
     : bit1_as_boolean(GetBoolOption(context, "odbc_bit1_as_boolean")),
       tinyint1_as_boolean(GetBoolOption(context, "odbc_tinyint1_as_boolean")),
       time_as_time(GetBoolOption(context, "odbc_time_as_time")) {
 }
 
-LogicalType MySQLTypes::TypeToLogicalType(const MySQLTypeConfig &type_config, const MySQLTypeData &type_info) {
+LogicalType ODBCTypes::TypeToLogicalType(const ODBCTypeConfig &type_config, const ODBCTypeData &type_info) {
 	if (type_info.type_name == "tinyint") {
 		if (type_info.column_type == "tinyint(1)" && type_config.tinyint1_as_boolean) {
 			return LogicalType::BOOLEAN;
@@ -54,11 +54,11 @@ LogicalType MySQLTypes::TypeToLogicalType(const MySQLTypeConfig &type_config, co
 	} else if (type_info.type_name == "date") {
 		return LogicalType::DATE;
 	} else if (type_info.type_name == "time") {
-		// we convert time to VARCHAR by default because TIME in MySQL is more like an
+		// we convert time to VARCHAR by default because TIME in ODBC is more like an
 		// interval and can store ranges between -838:00:00 to 838:00:00
 		return type_config.time_as_time ? LogicalType::TIME : LogicalType::VARCHAR;
 	} else if (type_info.type_name == "timestamp") {
-		// in MySQL, "timestamp" columns are timezone aware while "datetime" columns
+		// in ODBC, "timestamp" columns are timezone aware while "datetime" columns
 		// are not
 		return LogicalType::TIMESTAMP_TZ;
 	} else if (type_info.type_name == "year") {
@@ -101,8 +101,8 @@ LogicalType MySQLTypes::TypeToLogicalType(const MySQLTypeConfig &type_config, co
 	return LogicalType::VARCHAR;
 }
 
-LogicalType MySQLTypes::FieldToLogicalType(const MySQLTypeConfig &type_config, MYSQL_FIELD *field) {
-	MySQLTypeData type_data;
+LogicalType ODBCTypes::FieldToLogicalType(const ODBCTypeConfig &type_config, MYSQL_FIELD *field) {
+	ODBCTypeData type_data;
 	switch (field->type) {
 	case MYSQL_TYPE_TINY:
 		type_data.type_name = "tinyint";
@@ -181,10 +181,10 @@ LogicalType MySQLTypes::FieldToLogicalType(const MySQLTypeConfig &type_config, M
 	if (field->flags & UNSIGNED_FLAG && field->flags & NUM_FLAG) {
 		type_data.column_type += " unsigned";
 	}
-	return MySQLTypes::TypeToLogicalType(type_config, type_data);
+	return ODBCTypes::TypeToLogicalType(type_config, type_data);
 }
 
-LogicalType MySQLTypes::ToMySQLType(const MySQLTypeConfig &type_config, const LogicalType &input) {
+LogicalType ODBCTypes::ToODBCType(const ODBCTypeConfig &type_config, const LogicalType &input) {
 	switch (input.id()) {
 	case LogicalTypeId::BOOLEAN:
 	case LogicalTypeId::SMALLINT:
@@ -207,11 +207,11 @@ LogicalType MySQLTypes::ToMySQLType(const MySQLTypeConfig &type_config, const Lo
 	case LogicalTypeId::TIME:
 		return type_config.time_as_time ? LogicalType::TIME : LogicalType::VARCHAR;
 	case LogicalTypeId::LIST:
-		throw NotImplementedException("MySQL does not support arrays - unsupported type \"%s\"", input.ToString());
+		throw NotImplementedException("ODBC does not support arrays - unsupported type \"%s\"", input.ToString());
 	case LogicalTypeId::STRUCT:
 	case LogicalTypeId::MAP:
 	case LogicalTypeId::UNION:
-		throw NotImplementedException("MySQL does not support composite types - unsupported type \"%s\"",
+		throw NotImplementedException("ODBC does not support composite types - unsupported type \"%s\"",
 		                              input.ToString());
 	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::TIMESTAMP_MS:
@@ -224,7 +224,7 @@ LogicalType MySQLTypes::ToMySQLType(const MySQLTypeConfig &type_config, const Lo
 	}
 }
 
-string MySQLTypes::TypeToString(const LogicalType &input) {
+string ODBCTypes::TypeToString(const LogicalType &input) {
 	switch (input.id()) {
 	case LogicalType::VARCHAR:
 		return "TEXT";

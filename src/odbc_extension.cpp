@@ -15,11 +15,11 @@
 
 using namespace duckdb;
 
-static void SetMySQLDebugQueryPrint(ClientContext &context, SetScope scope, Value &parameter) {
-	MySQLConnection::DebugSetPrintQueries(BooleanValue::Get(parameter));
+static void SetODBCDebugQueryPrint(ClientContext &context, SetScope scope, Value &parameter) {
+	ODBCConnection::DebugSetPrintQueries(BooleanValue::Get(parameter));
 }
 
-unique_ptr<BaseSecret> CreateMySQLSecretFunction(ClientContext &, CreateSecretInput &input) {
+unique_ptr<BaseSecret> CreateODBCSecretFunction(ClientContext &, CreateSecretInput &input) {
 	// apply any overridden settings
 	vector<string> prefix_paths;
 	auto result = make_uniq<KeyValueSecret>(prefix_paths, "odbc", "config", input.name);
@@ -57,7 +57,7 @@ unique_ptr<BaseSecret> CreateMySQLSecretFunction(ClientContext &, CreateSecretIn
 		} else if (lower_name == "ssl_key") {
 			result->secret_map["ssl_key"] = named_param.second.ToString();
 		} else {
-			throw InternalException("Unknown named parameter passed to CreateMySQLSecretFunction: " + lower_name);
+			throw InternalException("Unknown named parameter passed to CreateODBCSecretFunction: " + lower_name);
 		}
 	}
 
@@ -66,7 +66,7 @@ unique_ptr<BaseSecret> CreateMySQLSecretFunction(ClientContext &, CreateSecretIn
 	return std::move(result);
 }
 
-void SetMySQLSecretParameters(CreateSecretFunction &function) {
+void SetODBCSecretParameters(CreateSecretFunction &function) {
 	function.named_parameters["host"] = LogicalType::VARCHAR;
 	function.named_parameters["port"] = LogicalType::VARCHAR;
 	function.named_parameters["password"] = LogicalType::VARCHAR;
@@ -85,13 +85,13 @@ void SetMySQLSecretParameters(CreateSecretFunction &function) {
 
 static void LoadInternal(ExtensionLoader &loader) {
 	odbc_library_init(0, NULL, NULL);
-	MySQLClearCacheFunction clear_cache_func;
+	ODBCClearCacheFunction clear_cache_func;
 	loader.RegisterFunction(clear_cache_func);
 
-	MySQLExecuteFunction execute_function;
+	ODBCExecuteFunction execute_function;
 	loader.RegisterFunction(execute_function);
 
-	MySQLQueryFunction query_function;
+	ODBCQueryFunction query_function;
 	loader.RegisterFunction(query_function);
 
 	SecretType secret_type;
@@ -101,34 +101,34 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterSecretType(secret_type);
 
-	CreateSecretFunction odbc_secret_function = {"odbc", "config", CreateMySQLSecretFunction};
-	SetMySQLSecretParameters(odbc_secret_function);
+	CreateSecretFunction odbc_secret_function = {"odbc", "config", CreateODBCSecretFunction};
+	SetODBCSecretParameters(odbc_secret_function);
 	loader.RegisterFunction(odbc_secret_function);
 
 	auto &db = loader.GetDatabaseInstance();
 
 	auto &config = DBConfig::GetConfig(db);
-	config.storage_extensions["odbc_scanner"] = make_uniq<MySQLStorageExtension>();
+	config.storage_extensions["odbc_scanner"] = make_uniq<ODBCStorageExtension>();
 
 	config.AddExtensionOption("odbc_experimental_filter_pushdown",
 	                          "Whether or not to use filter pushdown (currently experimental)", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(true));
-	config.AddExtensionOption("odbc_debug_show_queries", "DEBUG SETTING: print all queries sent to MySQL to stdout",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetMySQLDebugQueryPrint);
+	config.AddExtensionOption("odbc_debug_show_queries", "DEBUG SETTING: print all queries sent to ODBC to stdout",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetODBCDebugQueryPrint);
 	config.AddExtensionOption("odbc_tinyint1_as_boolean", "Whether or not to convert TINYINT(1) columns to BOOLEAN",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), MySQLClearCacheFunction::ClearCacheOnSetting);
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), ODBCClearCacheFunction::ClearCacheOnSetting);
 	config.AddExtensionOption("odbc_bit1_as_boolean", "Whether or not to convert BIT(1) columns to BOOLEAN",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), MySQLClearCacheFunction::ClearCacheOnSetting);
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), ODBCClearCacheFunction::ClearCacheOnSetting);
 	config.AddExtensionOption("odbc_session_time_zone",
 	                          "Value to use as a session time zone for newly opened"
-	                          " connections to MySQL server",
-	                          LogicalType::VARCHAR, Value(""), MySQLClearCacheFunction::ClearCacheOnSetting);
-	config.AddExtensionOption("odbc_time_as_time", "Whether or not to convert MySQL's TIME columns to DuckDB's TIME",
+	                          " connections to ODBC server",
+	                          LogicalType::VARCHAR, Value(""), ODBCClearCacheFunction::ClearCacheOnSetting);
+	config.AddExtensionOption("odbc_time_as_time", "Whether or not to convert ODBC's TIME columns to DuckDB's TIME",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false),
-	                          MySQLClearCacheFunction::ClearCacheOnSetting);
+	                          ODBCClearCacheFunction::ClearCacheOnSetting);
 
 	OptimizerExtension odbc_optimizer;
-	odbc_optimizer.optimize_function = MySQLOptimizer::Optimize;
+	odbc_optimizer.optimize_function = ODBCOptimizer::Optimize;
 	config.optimizer_extensions.push_back(std::move(odbc_optimizer));
 }
 

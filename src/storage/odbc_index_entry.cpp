@@ -3,16 +3,16 @@
 
 namespace duckdb {
 
-MySQLIndexEntry::MySQLIndexEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateIndexInfo &info,
+ODBCIndexEntry::ODBCIndexEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateIndexInfo &info,
                                  string table_name_p)
     : IndexCatalogEntry(catalog, schema, info), table_name(std::move(table_name_p)) {
 }
 
-string MySQLIndexEntry::GetSchemaName() const {
+string ODBCIndexEntry::GetSchemaName() const {
 	return schema.name;
 }
 
-string MySQLIndexEntry::GetTableName() const {
+string ODBCIndexEntry::GetTableName() const {
 	return table_name;
 }
 

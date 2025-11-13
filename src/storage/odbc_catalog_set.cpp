@@ -5,10 +5,10 @@
 
 namespace duckdb {
 
-MySQLCatalogSet::MySQLCatalogSet(Catalog &catalog) : catalog(catalog), is_loaded(false) {
+ODBCCatalogSet::ODBCCatalogSet(Catalog &catalog) : catalog(catalog), is_loaded(false) {
 }
 
-optional_ptr<CatalogEntry> MySQLCatalogSet::GetEntry(ClientContext &context, const string &name) {
+optional_ptr<CatalogEntry> ODBCCatalogSet::GetEntry(ClientContext &context, const string &name) {
 	if (!is_loaded) {
 		is_loaded = true;
 		LoadEntries(context);
@@ -21,31 +21,31 @@ optional_ptr<CatalogEntry> MySQLCatalogSet::GetEntry(ClientContext &context, con
 	return entry->second.get();
 }
 
-void MySQLCatalogSet::DropEntry(ClientContext &context, DropInfo &info) {
+void ODBCCatalogSet::DropEntry(ClientContext &context, DropInfo &info) {
 	string drop_query = "DROP ";
 	drop_query += CatalogTypeToString(info.type) + " ";
 	if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 		drop_query += " IF EXISTS ";
 	}
-	drop_query += MySQLUtils::WriteIdentifier(info.name);
+	drop_query += ODBCUtils::WriteIdentifier(info.name);
 	if (info.type != CatalogType::SCHEMA_ENTRY) {
 		if (info.cascade) {
 			drop_query += " CASCADE";
 		}
 	}
-	auto &transaction = MySQLTransaction::Get(context, catalog);
+	auto &transaction = ODBCTransaction::Get(context, catalog);
 	transaction.Query(drop_query);
 
 	// erase the entry from the catalog set
 	EraseEntryInternal(info.name);
 }
 
-void MySQLCatalogSet::EraseEntryInternal(const string &name) {
+void ODBCCatalogSet::EraseEntryInternal(const string &name) {
 	lock_guard<mutex> l(entry_lock);
 	entries.erase(name);
 }
 
-void MySQLCatalogSet::Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
+void ODBCCatalogSet::Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
 	if (!is_loaded) {
 		is_loaded = true;
 		LoadEntries(context);
@@ -56,29 +56,29 @@ void MySQLCatalogSet::Scan(ClientContext &context, const std::function<void(Cata
 	}
 }
 
-optional_ptr<CatalogEntry> MySQLCatalogSet::CreateEntry(unique_ptr<CatalogEntry> entry) {
+optional_ptr<CatalogEntry> ODBCCatalogSet::CreateEntry(unique_ptr<CatalogEntry> entry) {
 	lock_guard<mutex> l(entry_lock);
 	auto result = entry.get();
 	if (result->name.empty()) {
-		throw InternalException("MySQLCatalogSet::CreateEntry called with empty name");
+		throw InternalException("ODBCCatalogSet::CreateEntry called with empty name");
 	}
 	entries.insert(make_pair(result->name, std::move(entry)));
 	return result;
 }
 
-void MySQLCatalogSet::ClearEntries() {
+void ODBCCatalogSet::ClearEntries() {
 	entries.clear();
 	is_loaded = false;
 }
 
-MySQLInSchemaSet::MySQLInSchemaSet(MySQLSchemaEntry &schema) : MySQLCatalogSet(schema.ParentCatalog()), schema(schema) {
+ODBCInSchemaSet::ODBCInSchemaSet(ODBCSchemaEntry &schema) : ODBCCatalogSet(schema.ParentCatalog()), schema(schema) {
 }
 
-optional_ptr<CatalogEntry> MySQLInSchemaSet::CreateEntry(unique_ptr<CatalogEntry> entry) {
+optional_ptr<CatalogEntry> ODBCInSchemaSet::CreateEntry(unique_ptr<CatalogEntry> entry) {
 	if (!entry->internal) {
 		entry->internal = schema.internal;
 	}
-	return MySQLCatalogSet::CreateEntry(std::move(entry));
+	return ODBCCatalogSet::CreateEntry(std::move(entry));
 }
 
 } // namespace duckdb

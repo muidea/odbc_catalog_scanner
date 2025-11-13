@@ -10,9 +10,9 @@
 
 namespace duckdb {
 
-MySQLTransaction::MySQLTransaction(MySQLCatalog &odbc_catalog, TransactionManager &manager, ClientContext &context)
+ODBCTransaction::ODBCTransaction(ODBCCatalog &odbc_catalog, TransactionManager &manager, ClientContext &context)
     : Transaction(manager, context),
-      connection(MySQLConnection::Open(MySQLTypeConfig(context), odbc_catalog.connection_string)),
+      connection(ODBCConnection::Open(ODBCTypeConfig(context), odbc_catalog.connection_string)),
       access_mode(odbc_catalog.access_mode) {
 	string time_zone;
 	{
@@ -26,27 +26,27 @@ MySQLTransaction::MySQLTransaction(MySQLCatalog &odbc_catalog, TransactionManage
 	}
 }
 
-MySQLTransaction::~MySQLTransaction() = default;
+ODBCTransaction::~ODBCTransaction() = default;
 
-void MySQLTransaction::Start() {
-	transaction_state = MySQLTransactionState::TRANSACTION_NOT_YET_STARTED;
+void ODBCTransaction::Start() {
+	transaction_state = ODBCTransactionState::TRANSACTION_NOT_YET_STARTED;
 }
-void MySQLTransaction::Commit() {
-	if (transaction_state == MySQLTransactionState::TRANSACTION_STARTED) {
-		transaction_state = MySQLTransactionState::TRANSACTION_FINISHED;
+void ODBCTransaction::Commit() {
+	if (transaction_state == ODBCTransactionState::TRANSACTION_STARTED) {
+		transaction_state = ODBCTransactionState::TRANSACTION_FINISHED;
 		connection.Execute("COMMIT");
 	}
 }
-void MySQLTransaction::Rollback() {
-	if (transaction_state == MySQLTransactionState::TRANSACTION_STARTED) {
-		transaction_state = MySQLTransactionState::TRANSACTION_FINISHED;
+void ODBCTransaction::Rollback() {
+	if (transaction_state == ODBCTransactionState::TRANSACTION_STARTED) {
+		transaction_state = ODBCTransactionState::TRANSACTION_FINISHED;
 		connection.Execute("ROLLBACK");
 	}
 }
 
-MySQLConnection &MySQLTransaction::GetConnection() {
-	if (transaction_state == MySQLTransactionState::TRANSACTION_NOT_YET_STARTED) {
-		transaction_state = MySQLTransactionState::TRANSACTION_STARTED;
+ODBCConnection &ODBCTransaction::GetConnection() {
+	if (transaction_state == ODBCTransactionState::TRANSACTION_NOT_YET_STARTED) {
+		transaction_state = ODBCTransactionState::TRANSACTION_STARTED;
 		string query = "START TRANSACTION";
 		if (access_mode == AccessMode::READ_ONLY) {
 			query += " READ ONLY";
@@ -56,21 +56,21 @@ MySQLConnection &MySQLTransaction::GetConnection() {
 	return connection;
 }
 
-unique_ptr<MySQLResult> MySQLTransaction::Query(const string &query) {
-	if (transaction_state == MySQLTransactionState::TRANSACTION_NOT_YET_STARTED) {
-		transaction_state = MySQLTransactionState::TRANSACTION_STARTED;
+unique_ptr<ODBCResult> ODBCTransaction::Query(const string &query) {
+	if (transaction_state == ODBCTransactionState::TRANSACTION_NOT_YET_STARTED) {
+		transaction_state = ODBCTransactionState::TRANSACTION_STARTED;
 		string transaction_start = "START TRANSACTION";
 		if (access_mode == AccessMode::READ_ONLY) {
 			transaction_start += " READ ONLY";
 		}
 		connection.Execute(transaction_start);
-		return connection.Query(query, MySQLResultStreaming::FORCE_MATERIALIZATION);
+		return connection.Query(query, ODBCResultStreaming::FORCE_MATERIALIZATION);
 	}
-	return connection.Query(query, MySQLResultStreaming::FORCE_MATERIALIZATION);
+	return connection.Query(query, ODBCResultStreaming::FORCE_MATERIALIZATION);
 }
 
-MySQLTransaction &MySQLTransaction::Get(ClientContext &context, Catalog &catalog) {
-	return Transaction::Get(context, catalog).Cast<MySQLTransaction>();
+ODBCTransaction &ODBCTransaction::Get(ClientContext &context, Catalog &catalog) {
+	return Transaction::Get(context, catalog).Cast<ODBCTransaction>();
 }
 
 } // namespace duckdb

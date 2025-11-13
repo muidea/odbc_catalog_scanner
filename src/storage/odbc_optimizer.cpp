@@ -6,33 +6,33 @@
 
 namespace duckdb {
 
-struct MySQLOperators {
-	reference_map_t<MySQLCatalog, vector<reference<LogicalGet>>> scans;
+struct ODBCOperators {
+	reference_map_t<ODBCCatalog, vector<reference<LogicalGet>>> scans;
 };
 
-void GatherMySQLScans(LogicalOperator &op, MySQLOperators &result) {
+void GatherODBCScans(LogicalOperator &op, ODBCOperators &result) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
 		auto &table_scan = get.function;
-		if (MySQLCatalog::IsMySQLScan(table_scan.name)) {
+		if (ODBCCatalog::IsODBCScan(table_scan.name)) {
 			// odbc table scan - add to the catalog
-			auto &bind_data = get.bind_data->Cast<MySQLBindData>();
-			auto &catalog = bind_data.table.ParentCatalog().Cast<MySQLCatalog>();
+			auto &bind_data = get.bind_data->Cast<ODBCBindData>();
+			auto &catalog = bind_data.table.ParentCatalog().Cast<ODBCCatalog>();
 			result.scans[catalog].push_back(get);
 		}
-		if (MySQLCatalog::IsMySQLQuery(table_scan.name)) {
-			auto &bind_data = get.bind_data->Cast<MySQLQueryBindData>();
-			auto &catalog = bind_data.catalog.Cast<MySQLCatalog>();
+		if (ODBCCatalog::IsODBCQuery(table_scan.name)) {
+			auto &bind_data = get.bind_data->Cast<ODBCQueryBindData>();
+			auto &catalog = bind_data.catalog.Cast<ODBCCatalog>();
 			result.scans[catalog].push_back(get);
 		}
 	}
 	// recurse into children
 	for (auto &child : op.children) {
-		GatherMySQLScans(*child, result);
+		GatherODBCScans(*child, result);
 	}
 }
 
-void OptimizeMySQLScan(unique_ptr<LogicalOperator> &op) {
+void OptimizeODBCScan(unique_ptr<LogicalOperator> &op) {
 	if (op->type == LogicalOperatorType::LOGICAL_LIMIT) {
 		auto &limit = op->Cast<LogicalLimit>();
 		reference<LogicalOperator> child = *op->children[0];
@@ -43,7 +43,7 @@ void OptimizeMySQLScan(unique_ptr<LogicalOperator> &op) {
 			return;
 		}
 		auto &get = child.get().Cast<LogicalGet>();
-		if (!MySQLCatalog::IsMySQLScan(get.function.name)) {
+		if (!ODBCCatalog::IsODBCScan(get.function.name)) {
 			return;
 		}
 		switch (limit.limit_val.Type()) {
@@ -62,7 +62,7 @@ void OptimizeMySQLScan(unique_ptr<LogicalOperator> &op) {
 			// not a constant or unset offset
 			return;
 		}
-		auto &bind_data = get.bind_data->Cast<MySQLBindData>();
+		auto &bind_data = get.bind_data->Cast<ODBCBindData>();
 		if (limit.limit_val.Type() != LimitNodeType::UNSET) {
 			bind_data.limit += " LIMIT " + to_string(limit.limit_val.GetConstantValue());
 		}
@@ -75,40 +75,40 @@ void OptimizeMySQLScan(unique_ptr<LogicalOperator> &op) {
 	}
 	// recurse into children
 	for (auto &child : op->children) {
-		OptimizeMySQLScan(child);
+		OptimizeODBCScan(child);
 	}
 }
 
-void MySQLOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-	MySQLOperators operators;
-	GatherMySQLScans(*plan, operators);
+void ODBCOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+	ODBCOperators operators;
+	GatherODBCScans(*plan, operators);
 	for (auto &entry : operators.scans) {
-		MySQLResultStreaming result_streaming = MySQLResultStreaming::FORCE_MATERIALIZATION;
+		ODBCResultStreaming result_streaming = ODBCResultStreaming::FORCE_MATERIALIZATION;
 		if (entry.second.size() == 1) {
 			// if we have exactly one scan for a given catalog we can stream it
-			result_streaming = MySQLResultStreaming::ALLOW_STREAMING;
+			result_streaming = ODBCResultStreaming::ALLOW_STREAMING;
 		}
 		for (auto &logical_get : entry.second) {
 			auto &get = logical_get.get();
-			if (MySQLCatalog::IsMySQLScan(get.function.name)) {
+			if (ODBCCatalog::IsODBCScan(get.function.name)) {
 				// odbc table scan - add to the catalog
-				auto &bind_data = get.bind_data->Cast<MySQLBindData>();
-				if (bind_data.streaming == MySQLResultStreaming::UNINITIALIZED ||
-				    result_streaming == MySQLResultStreaming::FORCE_MATERIALIZATION) {
+				auto &bind_data = get.bind_data->Cast<ODBCBindData>();
+				if (bind_data.streaming == ODBCResultStreaming::UNINITIALIZED ||
+				    result_streaming == ODBCResultStreaming::FORCE_MATERIALIZATION) {
 					bind_data.streaming = result_streaming;
 				}
 			}
-			if (MySQLCatalog::IsMySQLQuery(get.function.name)) {
-				auto &bind_data = get.bind_data->Cast<MySQLQueryBindData>();
-				if (bind_data.streaming == MySQLResultStreaming::UNINITIALIZED ||
-				    result_streaming == MySQLResultStreaming::FORCE_MATERIALIZATION) {
+			if (ODBCCatalog::IsODBCQuery(get.function.name)) {
+				auto &bind_data = get.bind_data->Cast<ODBCQueryBindData>();
+				if (bind_data.streaming == ODBCResultStreaming::UNINITIALIZED ||
+				    result_streaming == ODBCResultStreaming::FORCE_MATERIALIZATION) {
 					bind_data.streaming = result_streaming;
 				}
 			}
 		}
 	}
 
-	OptimizeMySQLScan(plan);
+	OptimizeODBCScan(plan);
 }
 
 } // namespace duckdb

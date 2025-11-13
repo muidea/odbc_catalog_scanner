@@ -3,12 +3,12 @@
 
 namespace duckdb {
 
-MySQLTransactionManager::MySQLTransactionManager(AttachedDatabase &db_p, MySQLCatalog &odbc_catalog)
+ODBCTransactionManager::ODBCTransactionManager(AttachedDatabase &db_p, ODBCCatalog &odbc_catalog)
     : TransactionManager(db_p), odbc_catalog(odbc_catalog) {
 }
 
-Transaction &MySQLTransactionManager::StartTransaction(ClientContext &context) {
-	auto transaction = make_uniq<MySQLTransaction>(odbc_catalog, *this, context);
+Transaction &ODBCTransactionManager::StartTransaction(ClientContext &context) {
+	auto transaction = make_uniq<ODBCTransaction>(odbc_catalog, *this, context);
 	transaction->Start();
 	auto &result = *transaction;
 	lock_guard<mutex> l(transaction_lock);
@@ -16,16 +16,16 @@ Transaction &MySQLTransactionManager::StartTransaction(ClientContext &context) {
 	return result;
 }
 
-ErrorData MySQLTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
-	auto &odbc_transaction = transaction.Cast<MySQLTransaction>();
+ErrorData ODBCTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
+	auto &odbc_transaction = transaction.Cast<ODBCTransaction>();
 	odbc_transaction.Commit();
 	lock_guard<mutex> l(transaction_lock);
 	transactions.erase(transaction);
 	return ErrorData();
 }
 
-void MySQLTransactionManager::RollbackTransaction(Transaction &transaction) {
-	auto &odbc_transaction = transaction.Cast<MySQLTransaction>();
+void ODBCTransactionManager::RollbackTransaction(Transaction &transaction) {
+	auto &odbc_transaction = transaction.Cast<ODBCTransaction>();
 	try {
 		odbc_transaction.Rollback();
 	} catch (...) {
@@ -34,8 +34,8 @@ void MySQLTransactionManager::RollbackTransaction(Transaction &transaction) {
 	transactions.erase(transaction);
 }
 
-void MySQLTransactionManager::Checkpoint(ClientContext &context, bool force) {
-	auto &transaction = MySQLTransaction::Get(context, db.GetCatalog());
+void ODBCTransactionManager::Checkpoint(ClientContext &context, bool force) {
+	auto &transaction = ODBCTransaction::Get(context, db.GetCatalog());
 	auto &db = transaction.GetConnection();
 	db.Execute("CHECKPOINT");
 }

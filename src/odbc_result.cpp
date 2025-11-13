@@ -8,7 +8,7 @@ namespace duckdb {
 
 static const size_t DEFAULT_BIND_BUFFER_SIZE = 64;
 
-static size_t GetBufferSize(enum_field_types type, size_t max_len, const MySQLTypeConfig &type_config) {
+static size_t GetBufferSize(enum_field_types type, size_t max_len, const ODBCTypeConfig &type_config) {
 	switch (type) {
 	case MYSQL_TYPE_TINY:
 		return sizeof(int8_t);
@@ -33,48 +33,48 @@ static size_t GetBufferSize(enum_field_types type, size_t max_len, const MySQLTy
 	}
 }
 
-MySQLField::MySQLField(MYSQL_FIELD *mf, LogicalType duckdb_type_p, const MySQLTypeConfig &type_config)
+ODBCField::ODBCField(MYSQL_FIELD *mf, LogicalType duckdb_type_p, const ODBCTypeConfig &type_config)
     : name(mf->name), odbc_type(mf->type), duckdb_type(std::move(duckdb_type_p)) {
 	size_t buf_size = GetBufferSize(mf->type, mf->max_length, type_config);
 	bind_buffer.resize(buf_size);
 }
 
-void MySQLField::ResetBind() {
+void ODBCField::ResetBind() {
 	this->bind_is_null = false;
 	this->bind_length = 0;
 	this->bind_error = false;
 }
 
-static vector<MySQLField> ReadFields(const std::string &query, MYSQL_STMT *stmt, const MySQLTypeConfig &type_config) {
-	vector<MySQLField> fields;
+static vector<ODBCField> ReadFields(const std::string &query, MYSQL_STMT *stmt, const ODBCTypeConfig &type_config) {
+	vector<ODBCField> fields;
 	idx_t field_count = odbc_stmt_field_count(stmt);
 	if (field_count == 0) {
 		return fields;
 	}
 
-	auto rsmd = MySQLResultPtr(odbc_stmt_result_metadata(stmt), MySQLResultDelete);
+	auto rsmd = ODBCResultPtr(odbc_stmt_result_metadata(stmt), ODBCResultDelete);
 	if (!rsmd) {
-		throw IOException("Failed to fetch result metadata for MySQL query \"%s\": %s\n", query.c_str(),
+		throw IOException("Failed to fetch result metadata for ODBC query \"%s\": %s\n", query.c_str(),
 		                  odbc_stmt_error(stmt));
 	}
 
 	MYSQL_FIELD *mfields = odbc_fetch_fields(rsmd.get());
 	if (!mfields) {
-		throw IOException("Failed to fetch result fields for MySQL query \"%s\": %s\n", query.c_str(),
+		throw IOException("Failed to fetch result fields for ODBC query \"%s\": %s\n", query.c_str(),
 		                  odbc_stmt_error(stmt));
 	}
 	fields.reserve(field_count);
 	for (size_t i = 0; i < field_count; i++) {
 		auto &mf = mfields[i];
-		LogicalType ltype = MySQLTypes::FieldToLogicalType(type_config, &mf);
-		MySQLField msf(&mf, std::move(ltype), type_config);
+		LogicalType ltype = ODBCTypes::FieldToLogicalType(type_config, &mf);
+		ODBCField msf(&mf, std::move(ltype), type_config);
 		fields.emplace_back(std::move(msf));
 	}
 
 	return fields;
 }
 
-static vector<MYSQL_BIND> InitBinds(vector<MySQLField> &fields) {
+static vector<MYSQL_BIND> InitBinds(vector<ODBCField> &fields) {
 	vector<MYSQL_BIND> binds;
 
 	for (auto &f : fields) {
@@ -92,10 +92,10 @@ static vector<MYSQL_BIND> InitBinds(vector<MySQLField> &fields) {
 	return binds;
 }
 
-static vector<LogicalType> CreateChunkTypes(vector<MySQLField> &fields, const MySQLTypeConfig &type_config) {
+static vector<LogicalType> CreateChunkTypes(vector<ODBCField> &fields, const ODBCTypeConfig &type_config) {
 	vector<LogicalType> ltypes;
 	for (idx_t c = 0; c < fields.size(); c++) {
-		MySQLField &f = fields[c];
+		ODBCField &f = fields[c];
 		LogicalType &lt = f.duckdb_type;
 		switch (lt.id()) {
 		case LogicalTypeId::BOOLEAN:
@@ -136,7 +136,7 @@ static vector<LogicalType> CreateChunkTypes(vector<MySQLField> &fields, const My
 	return ltypes;
 }
 
-MySQLResult::MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, MySQLTypeConfig type_config_p,
+ODBCResult::ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBCTypeConfig type_config_p,
                          idx_t affected_rows_p)
     : query(query_p), stmt(std::move(stmt_p)), type_config(std::move(type_config_p)), affected_rows(affected_rows_p) {
 	if (affected_rows != static_cast<idx_t>(-1)) {
@@ -147,7 +147,7 @@ MySQLResult::MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, M
 
 	int res_bind = odbc_stmt_bind_result(stmt.get(), binds.data());
 	if (res_bind != 0) {
-		throw IOException("Failed to bind result set for MySQL query \"%s\": %s\n", query.c_str(),
+		throw IOException("Failed to bind result set for ODBC query \"%s\": %s\n", query.c_str(),
 		                  odbc_stmt_error(stmt.get()));
 	}
 
@@ -155,9 +155,9 @@ MySQLResult::MySQLResult(const std::string &query_p, MySQLStatementPtr stmt_p, M
 	this->data_chunk.Initialize(Allocator::DefaultAllocator(), ltypes);
 }
 
-void MySQLResult::HandleTruncatedData() {
+void ODBCResult::HandleTruncatedData() {
 	for (size_t i = 0; i < fields.size(); i++) {
-		MySQLField &f = fields[i];
+		ODBCField &f = fields[i];
 		MYSQL_BIND &b = binds[i];
 
 		if (!f.bind_error || f.bind_buffer.size() >= f.bind_length) {
@@ -173,7 +173,7 @@ void MySQLResult::HandleTruncatedData() {
 		int res_fetch =
 		    odbc_stmt_fetch_column(stmt.get(), &b, static_cast<unsigned int>(i), static_cast<unsigned long>(offset));
 		if (res_fetch != 0) {
-			throw IOException("Failed to re-fetch result field \"%s\" for MySQL query \"%s\": %s\n", f.name.c_str(),
+			throw IOException("Failed to re-fetch result field \"%s\" for ODBC query \"%s\": %s\n", f.name.c_str(),
 			                  query.c_str(), odbc_stmt_error(stmt.get()));
 		}
 
@@ -182,13 +182,13 @@ void MySQLResult::HandleTruncatedData() {
 
 		int res_bind = odbc_stmt_bind_result(stmt.get(), binds.data());
 		if (res_bind != 0) {
-			throw IOException("Failed to re-bind result set for MySQL query \"%s\": %s\n", query.c_str(),
+			throw IOException("Failed to re-bind result set for ODBC query \"%s\": %s\n", query.c_str(),
 			                  odbc_stmt_error(stmt.get()));
 		}
 	}
 }
 
-DataChunk &MySQLResult::NextChunk() {
+DataChunk &ODBCResult::NextChunk() {
 	this->data_chunk.Reset();
 	this->row_idx = 0;
 
@@ -205,7 +205,7 @@ DataChunk &MySQLResult::NextChunk() {
 	return this->data_chunk;
 }
 
-bool MySQLResult::FetchNext() {
+bool ODBCResult::FetchNext() {
 	for (auto &f : fields) {
 #ifdef DEBUG
 		std::memset(f.bind_buffer.data(), '\0', f.bind_buffer.size());
@@ -216,7 +216,7 @@ bool MySQLResult::FetchNext() {
 	int res = odbc_stmt_fetch(stmt.get());
 
 	if (res == 1) {
-		throw IOException("Failed to fetch result row for MySQL query \"%s\": %s\n", query.c_str(),
+		throw IOException("Failed to fetch result row for ODBC query \"%s\": %s\n", query.c_str(),
 		                  odbc_stmt_error(stmt.get()));
 	}
 
@@ -225,7 +225,7 @@ bool MySQLResult::FetchNext() {
 	return res != MYSQL_NO_DATA;
 }
 
-bool MySQLResult::Next() {
+bool ODBCResult::Next() {
 	if (row_idx < data_chunk.size() - 1) {
 		row_idx += 1;
 		return true;
@@ -235,35 +235,35 @@ bool MySQLResult::Next() {
 	return data_chunk.size() > 0;
 }
 
-void MySQLResult::CheckColumnIdx(idx_t col) {
+void ODBCResult::CheckColumnIdx(idx_t col) {
 	if (col >= data_chunk.ColumnCount()) {
-		throw IOException("Column: %zu out of range of field count: %zu, MySQL query \"%s\"\n", col,
+		throw IOException("Column: %zu out of range of field count: %zu, ODBC query \"%s\"\n", col,
 		                  data_chunk.ColumnCount(), query.c_str());
 	}
 }
 
-void MySQLResult::CheckNotNull(idx_t col) {
+void ODBCResult::CheckNotNull(idx_t col) {
 	if (IsNull(col)) {
-		throw InternalException("Get called for a NULL value, column: %zu, MySQL query \"%s\"\n", col, query.c_str());
+		throw InternalException("Get called for a NULL value, column: %zu, ODBC query \"%s\"\n", col, query.c_str());
 	}
 }
 
-string MySQLResult::GetString(idx_t col) {
+string ODBCResult::GetString(idx_t col) {
 	CheckNotNull(col);
-	MySQLField &f = fields[col];
+	ODBCField &f = fields[col];
 	if (f.duckdb_type.id() == LogicalTypeId::VARCHAR || f.duckdb_type.id() == LogicalTypeId::BLOB) {
 		Vector &vec = data_chunk.data[col];
 		string_t *data = FlatVector::GetData<string_t>(vec);
 		string_t &st = data[row_idx];
 		return string(st.GetData(), st.GetSize());
 	}
-	throw InternalException("Get called for a String type, actual type: \"%s\", column: %zu, MySQL query \"%s\"\n",
+	throw InternalException("Get called for a String type, actual type: \"%s\", column: %zu, ODBC query \"%s\"\n",
 	                        f.duckdb_type.ToString(), col, query.c_str());
 }
 
-int32_t MySQLResult::GetInt32(idx_t col) {
+int32_t ODBCResult::GetInt32(idx_t col) {
 	CheckNotNull(col);
-	MySQLField &f = fields[col];
+	ODBCField &f = fields[col];
 	Vector &vec = data_chunk.data[col];
 	if (f.duckdb_type.id() == LogicalTypeId::INTEGER) {
 		int32_t *data = FlatVector::GetData<int32_t>(vec);
@@ -272,13 +272,13 @@ int32_t MySQLResult::GetInt32(idx_t col) {
 		uint32_t *data = FlatVector::GetData<uint32_t>(vec);
 		return static_cast<int32_t>(data[row_idx]);
 	}
-	throw InternalException("Get called for an Int32 type, actual type: \"%s\", column: %zu, MySQL query \"%s\"\n",
+	throw InternalException("Get called for an Int32 type, actual type: \"%s\", column: %zu, ODBC query \"%s\"\n",
 	                        f.duckdb_type.ToString(), col, query.c_str());
 }
 
-int64_t MySQLResult::GetInt64(idx_t col) {
+int64_t ODBCResult::GetInt64(idx_t col) {
 	CheckNotNull(col);
-	MySQLField &f = fields[col];
+	ODBCField &f = fields[col];
 	Vector &vec = data_chunk.data[col];
 	if (f.duckdb_type.id() == LogicalTypeId::BIGINT) {
 		int64_t *data = FlatVector::GetData<int64_t>(vec);
@@ -296,32 +296,32 @@ int64_t MySQLResult::GetInt64(idx_t col) {
 			return atoll(st.GetData());
 		}
 	}
-	throw InternalException("Get called for an Int64 type, actual type: \"%s\", column: %zu, MySQL query \"%s\"\n",
+	throw InternalException("Get called for an Int64 type, actual type: \"%s\", column: %zu, ODBC query \"%s\"\n",
 	                        f.duckdb_type.ToString(), col, query.c_str());
 }
 
-bool MySQLResult::IsNull(idx_t col) {
+bool ODBCResult::IsNull(idx_t col) {
 	CheckColumnIdx(col);
 	Vector &vec = data_chunk.data[col];
 	return FlatVector::IsNull(vec, row_idx);
 }
 
-idx_t MySQLResult::AffectedRows() {
+idx_t ODBCResult::AffectedRows() {
 	if (affected_rows == idx_t(-1)) {
-		throw InternalException("MySQLResult::AffectedRows called for result "
+		throw InternalException("ODBCResult::AffectedRows called for result "
 		                        "that didn't affect any rows, query \"%s\"\n",
 		                        query.c_str());
 	}
 	return affected_rows;
 }
 
-const vector<MySQLField> &MySQLResult::Fields() {
+const vector<ODBCField> &ODBCResult::Fields() {
 	return fields;
 }
 
-// MySQL TIME values may range from '-838:59:59' to '838:59:59'
+// ODBC TIME values may range from '-838:59:59' to '838:59:59'
 // This conversion is slow, 'odbc_time_as_time' flag should be set to avoid it.
-static void WriteTimeAsString(MySQLField &f, Vector &vec, idx_t row) {
+static void WriteTimeAsString(ODBCField &f, Vector &vec, idx_t row) {
 	MYSQL_TIME *mt = reinterpret_cast<MYSQL_TIME *>(f.bind_buffer.data());
 	if (mt->hour == 0 && mt->minute == 0 && mt->second == 0) {
 		FlatVector::SetNull(vec, row, true);
@@ -342,7 +342,7 @@ static void WriteTimeAsString(MySQLField &f, Vector &vec, idx_t row) {
 	data[row] = StringVector::AddStringOrBlob(vec, std::move(st));
 }
 
-static void WriteString(MySQLField &f, Vector &vec, idx_t row) {
+static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
 	if (f.odbc_type == MYSQL_TYPE_TIME) {
 		WriteTimeAsString(f, vec, row);
 		return;
@@ -354,7 +354,7 @@ static void WriteString(MySQLField &f, Vector &vec, idx_t row) {
 	data[row] = StringVector::AddStringOrBlob(vec, std::move(st));
 }
 
-static void WriteBool(MySQLField &f, Vector &vec, idx_t row) {
+static void WriteBool(ODBCField &f, Vector &vec, idx_t row) {
 	D_ASSERT(f.bind_buffer.size() >= sizeof(int8_t));
 	auto data = FlatVector::GetData<bool>(vec);
 	if (f.odbc_type == MYSQL_TYPE_TINY) {
@@ -363,7 +363,7 @@ static void WriteBool(MySQLField &f, Vector &vec, idx_t row) {
 		return;
 	}
 	if (f.bind_length == 0) {
-		throw BinderException("Failed to cast MySQL boolean - expected 1 byte "
+		throw BinderException("Failed to cast ODBC boolean - expected 1 byte "
 		                      "element but got element of size %d\n* SET "
 		                      "odbc_tinyint1_as_boolean=false to disable "
 		                      "loading TINYINT(1) columns as booleans\n* SET "
@@ -386,14 +386,14 @@ static void WriteBool(MySQLField &f, Vector &vec, idx_t row) {
 }
 
 template <typename NUM_TYPE>
-static void WriteNumber(MySQLField &f, Vector &vec, idx_t row) {
+static void WriteNumber(ODBCField &f, Vector &vec, idx_t row) {
 	D_ASSERT(f.bind_buffer.size() >= sizeof(NUM_TYPE));
 	NUM_TYPE num = *reinterpret_cast<NUM_TYPE *>(f.bind_buffer.data());
 	auto data = FlatVector::GetData<NUM_TYPE>(vec);
 	data[row] = num;
 }
 
-static void WriteDateTime(MySQLField &f, Vector &vec, idx_t row) {
+static void WriteDateTime(ODBCField &f, Vector &vec, idx_t row) {
 	D_ASSERT(f.bind_buffer.size() >= sizeof(MYSQL_TIME));
 	MYSQL_TIME *mt = reinterpret_cast<MYSQL_TIME *>(f.bind_buffer.data());
 	if ((mt->year == 0 && mt->month == 0 && mt->day == 0 && mt->hour == 0 && mt->minute == 0 && mt->second == 0 &&
@@ -444,9 +444,9 @@ static void WriteDateTime(MySQLField &f, Vector &vec, idx_t row) {
 	}
 }
 
-void MySQLResult::WriteToChunk(idx_t row) {
+void ODBCResult::WriteToChunk(idx_t row) {
 	for (idx_t col = 0; col < data_chunk.ColumnCount(); col++) {
-		MySQLField &f = fields[col];
+		ODBCField &f = fields[col];
 		Vector &vec = data_chunk.data[col];
 
 		if (f.bind_is_null) {

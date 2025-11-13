@@ -85,8 +85,8 @@ uint32_t ParsePort(const string &value) {
 	return uint32_t(port_val);
 }
 
-std::tuple<MySQLConnectionParameters, unordered_set<string>> MySQLUtils::ParseConnectionParameters(const string &dsn) {
-	MySQLConnectionParameters result;
+std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConnectionParameters(const string &dsn) {
+	ODBCConnectionParameters result;
 
 	unordered_set<string> set_options;
 	// parse options
@@ -235,24 +235,24 @@ std::tuple<MySQLConnectionParameters, unordered_set<string>> MySQLUtils::ParseCo
 	return std::make_tuple(result, set_options);
 }
 
-void SetMySQLOption(MYSQL *odbc, enum odbc_option option, const string &value) {
+void SetODBCOption(MYSQL *odbc, enum odbc_option option, const string &value) {
 	if (value.empty()) {
 		return;
 	}
 	int rc = odbc_options(odbc, option, value.c_str());
 	if (rc != 0) {
-		throw InternalException("Failed to set MySQL option");
+		throw InternalException("Failed to set ODBC option");
 	}
 }
 
-MYSQL *MySQLUtils::Connect(const string &dsn) {
+MYSQL *ODBCUtils::Connect(const string &dsn) {
 	MYSQL *odbc = odbc_init(NULL);
 	if (!odbc) {
 		throw IOException("Failure in odbc_init");
 	}
 	MYSQL *result;
 
-	MySQLConnectionParameters config;
+	ODBCConnectionParameters config;
 	unordered_set<string> unused;
 	std::tie(config, unused) = ParseConnectionParameters(dsn);
 
@@ -260,13 +260,13 @@ MYSQL *MySQLUtils::Connect(const string &dsn) {
 	if (config.ssl_mode != SSL_MODE_PREFERRED) {
 		odbc_options(odbc, MYSQL_OPT_SSL_MODE, &config.ssl_mode);
 	}
-	SetMySQLOption(odbc, MYSQL_OPT_SSL_CA, config.ssl_ca);
-	SetMySQLOption(odbc, MYSQL_OPT_SSL_CAPATH, config.ssl_ca_path);
-	SetMySQLOption(odbc, MYSQL_OPT_SSL_CERT, config.ssl_cert);
-	SetMySQLOption(odbc, MYSQL_OPT_SSL_CIPHER, config.ssl_cipher);
-	SetMySQLOption(odbc, MYSQL_OPT_SSL_CRL, config.ssl_crl);
-	SetMySQLOption(odbc, MYSQL_OPT_SSL_CRLPATH, config.ssl_crl_path);
-	SetMySQLOption(odbc, MYSQL_OPT_SSL_KEY, config.ssl_key);
+	SetODBCOption(odbc, MYSQL_OPT_SSL_CA, config.ssl_ca);
+	SetODBCOption(odbc, MYSQL_OPT_SSL_CAPATH, config.ssl_ca_path);
+	SetODBCOption(odbc, MYSQL_OPT_SSL_CERT, config.ssl_cert);
+	SetODBCOption(odbc, MYSQL_OPT_SSL_CIPHER, config.ssl_cipher);
+	SetODBCOption(odbc, MYSQL_OPT_SSL_CRL, config.ssl_crl);
+	SetODBCOption(odbc, MYSQL_OPT_SSL_CRLPATH, config.ssl_crl_path);
+	SetODBCOption(odbc, MYSQL_OPT_SSL_KEY, config.ssl_key);
 
 	// get connection options
 	const char *host = config.host.empty() ? nullptr : config.host.c_str();
@@ -284,25 +284,25 @@ MYSQL *MySQLUtils::Connect(const string &dsn) {
 			    odbc_real_connect(odbc, "127.0.0.1", user, passwd, db, config.port, unix_socket, config.client_flag);
 
 			if (!result) {
-				throw IOException("Failed to connect to MySQL database with parameters "
+				throw IOException("Failed to connect to ODBC database with parameters "
 				                  "\"%s\": %s. First attempted host: %s. "
 				                  "Retry with 127.0.0.1 also failed.",
 				                  dsn, odbc_error(odbc), attempted_host.c_str());
 			}
 		} else {
-			throw IOException("Failed to connect to MySQL database with parameters "
+			throw IOException("Failed to connect to ODBC database with parameters "
 			                  "\"%s\": %s. Attempted host: %s",
 			                  dsn, original_error.c_str(), attempted_host.c_str());
 		}
 	}
 	if (odbc_set_character_set(odbc, "utf8mb4") != 0) {
-		throw IOException("Failed to set MySQL character set");
+		throw IOException("Failed to set ODBC character set");
 	}
 	D_ASSERT(odbc == result);
 	return result;
 }
 
-string MySQLUtils::EscapeQuotes(const string &text, char quote) {
+string ODBCUtils::EscapeQuotes(const string &text, char quote) {
 	string result;
 	for (auto c : text) {
 		if (c == quote) {
@@ -317,21 +317,21 @@ string MySQLUtils::EscapeQuotes(const string &text, char quote) {
 	return result;
 }
 
-string MySQLUtils::WriteQuoted(const string &text, char quote) {
+string ODBCUtils::WriteQuoted(const string &text, char quote) {
 	// 1. Escapes all occurences of 'quote' by escaping them with a backslash
 	// 2. Adds quotes around the string
 	return string(1, quote) + EscapeQuotes(text, quote) + string(1, quote);
 }
 
-string MySQLUtils::WriteIdentifier(const string &identifier) {
-	return MySQLUtils::WriteQuoted(identifier, '`');
+string ODBCUtils::WriteIdentifier(const string &identifier) {
+	return ODBCUtils::WriteQuoted(identifier, '`');
 }
 
-string MySQLUtils::WriteLiteral(const string &identifier) {
-	return MySQLUtils::WriteQuoted(identifier, '\'');
+string ODBCUtils::WriteLiteral(const string &identifier) {
+	return ODBCUtils::WriteQuoted(identifier, '\'');
 }
 
-static string TransformBlobToMySQL(const string &val) {
+static string TransformBlobToODBC(const string &val) {
 	char const HEX_DIGITS[] = "0123456789ABCDEF";
 
 	string result = "x'";
@@ -344,12 +344,12 @@ static string TransformBlobToMySQL(const string &val) {
 	return result;
 }
 
-string MySQLUtils::TransformConstant(const Value &val) {
+string ODBCUtils::TransformConstant(const Value &val) {
 	if (val.type().IsNumeric() || val.type().id() == LogicalTypeId::BOOLEAN) {
 		return val.ToSQLString();
 	}
 	if (val.type().id() == LogicalTypeId::BLOB) {
-		return TransformBlobToMySQL(StringValue::Get(val));
+		return TransformBlobToODBC(StringValue::Get(val));
 	}
 	if (val.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
 		return val.DefaultCastAs(LogicalType::TIMESTAMP).DefaultCastAs(LogicalType::VARCHAR).ToSQLString();

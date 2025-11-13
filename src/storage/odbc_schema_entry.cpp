@@ -13,18 +13,18 @@
 
 namespace duckdb {
 
-MySQLSchemaEntry::MySQLSchemaEntry(Catalog &catalog, CreateSchemaInfo &info)
+ODBCSchemaEntry::ODBCSchemaEntry(Catalog &catalog, CreateSchemaInfo &info)
     : SchemaCatalogEntry(catalog, info), tables(*this), indexes(*this) {
 }
 
-MySQLTransaction &GetMySQLTransaction(CatalogTransaction transaction) {
+ODBCTransaction &GetODBCTransaction(CatalogTransaction transaction) {
 	if (!transaction.transaction) {
 		throw InternalException("No transaction!?");
 	}
-	return transaction.transaction->Cast<MySQLTransaction>();
+	return transaction.transaction->Cast<ODBCTransaction>();
 }
 
-void MySQLSchemaEntry::TryDropEntry(ClientContext &context, CatalogType catalog_type, const string &name) {
+void ODBCSchemaEntry::TryDropEntry(ClientContext &context, CatalogType catalog_type, const string &name) {
 	DropInfo info;
 	info.type = catalog_type;
 	info.name = name;
@@ -33,7 +33,7 @@ void MySQLSchemaEntry::TryDropEntry(ClientContext &context, CatalogType catalog_
 	DropEntry(context, info);
 }
 
-optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
+optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
 	auto &base_info = info.Base();
 	auto table_name = base_info.table;
 	if (base_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
@@ -43,36 +43,36 @@ optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateTable(CatalogTransaction tran
 	return tables.CreateTable(transaction.GetContext(), info);
 }
 
-optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) {
-	throw BinderException("MySQL databases do not support creating functions");
+optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateFunction(CatalogTransaction transaction, CreateFunctionInfo &info) {
+	throw BinderException("ODBC databases do not support creating functions");
 }
 
-void MySQLUnqualifyColumnRef(ParsedExpression &expr) {
+void ODBCUnqualifyColumnRef(ParsedExpression &expr) {
 	if (expr.type == ExpressionType::COLUMN_REF) {
 		auto &colref = expr.Cast<ColumnRefExpression>();
 		auto name = std::move(colref.column_names.back());
 		colref.column_names = {std::move(name)};
 		return;
 	}
-	ParsedExpressionIterator::EnumerateChildren(expr, MySQLUnqualifyColumnRef);
+	ParsedExpressionIterator::EnumerateChildren(expr, ODBCUnqualifyColumnRef);
 }
 
-string GetMySQLCreateIndex(CreateIndexInfo &info, TableCatalogEntry &tbl) {
+string GetODBCCreateIndex(CreateIndexInfo &info, TableCatalogEntry &tbl) {
 	string sql;
 	sql = "CREATE";
 	if (info.constraint_type == IndexConstraintType::UNIQUE) {
 		sql += " UNIQUE";
 	}
 	sql += " INDEX ";
-	sql += MySQLUtils::WriteIdentifier(info.index_name);
+	sql += ODBCUtils::WriteIdentifier(info.index_name);
 	sql += " ON ";
-	sql += MySQLUtils::WriteIdentifier(tbl.name);
+	sql += ODBCUtils::WriteIdentifier(tbl.name);
 	sql += "(";
 	for (idx_t i = 0; i < info.parsed_expressions.size(); i++) {
 		if (i > 0) {
 			sql += ", ";
 		}
-		MySQLUnqualifyColumnRef(*info.parsed_expressions[i]);
+		ODBCUnqualifyColumnRef(*info.parsed_expressions[i]);
 		if (info.parsed_expressions[i]->type == ExpressionType::COLUMN_REF) {
 			// index on column
 			sql += info.parsed_expressions[i]->ToString();
@@ -86,17 +86,17 @@ string GetMySQLCreateIndex(CreateIndexInfo &info, TableCatalogEntry &tbl) {
 	return sql;
 }
 
-optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
+optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
                                                          TableCatalogEntry &table) {
-	auto &odbc_transaction = MySQLTransaction::Get(transaction.GetContext(), table.catalog);
-	odbc_transaction.Query(GetMySQLCreateIndex(info, table));
+	auto &odbc_transaction = ODBCTransaction::Get(transaction.GetContext(), table.catalog);
+	odbc_transaction.Query(GetODBCCreateIndex(info, table));
 	return nullptr;
 }
 
-string GetMySQLCreateView(CreateViewInfo &info) {
+string GetODBCCreateView(CreateViewInfo &info) {
 	string sql;
 	sql = "CREATE VIEW ";
-	sql += MySQLUtils::WriteIdentifier(info.view_name);
+	sql += ODBCUtils::WriteIdentifier(info.view_name);
 	sql += " ";
 	if (!info.aliases.empty()) {
 		sql += "(";
@@ -105,7 +105,7 @@ string GetMySQLCreateView(CreateViewInfo &info) {
 				sql += ", ";
 			}
 			auto &alias = info.aliases[i];
-			sql += MySQLUtils::WriteIdentifier(alias);
+			sql += ODBCUtils::WriteIdentifier(alias);
 		}
 		sql += ") ";
 	}
@@ -114,9 +114,9 @@ string GetMySQLCreateView(CreateViewInfo &info) {
 	return sql;
 }
 
-optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
+optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
 	if (info.sql.empty()) {
-		throw BinderException("Cannot create view in MySQL that originated from an "
+		throw BinderException("Cannot create view in ODBC that originated from an "
 		                      "empty SQL statement");
 	}
 	if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT ||
@@ -130,40 +130,40 @@ optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateView(CatalogTransaction trans
 			TryDropEntry(transaction.GetContext(), CatalogType::VIEW_ENTRY, info.view_name);
 		}
 	}
-	auto &odbc_transaction = GetMySQLTransaction(transaction);
-	odbc_transaction.Query(GetMySQLCreateView(info));
+	auto &odbc_transaction = GetODBCTransaction(transaction);
+	odbc_transaction.Query(GetODBCCreateView(info));
 	return tables.RefreshTable(transaction.GetContext(), info.view_name);
 }
 
-optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateType(CatalogTransaction transaction, CreateTypeInfo &info) {
-	throw BinderException("MySQL databases do not support creating types");
+optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateType(CatalogTransaction transaction, CreateTypeInfo &info) {
+	throw BinderException("ODBC databases do not support creating types");
 }
 
-optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateSequence(CatalogTransaction transaction, CreateSequenceInfo &info) {
-	throw BinderException("MySQL databases do not support creating sequences");
+optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateSequence(CatalogTransaction transaction, CreateSequenceInfo &info) {
+	throw BinderException("ODBC databases do not support creating sequences");
 }
 
-optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateTableFunction(CatalogTransaction transaction,
+optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateTableFunction(CatalogTransaction transaction,
                                                                  CreateTableFunctionInfo &info) {
-	throw BinderException("MySQL databases do not support creating table functions");
+	throw BinderException("ODBC databases do not support creating table functions");
 }
 
-optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateCopyFunction(CatalogTransaction transaction,
+optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateCopyFunction(CatalogTransaction transaction,
                                                                 CreateCopyFunctionInfo &info) {
-	throw BinderException("MySQL databases do not support creating copy functions");
+	throw BinderException("ODBC databases do not support creating copy functions");
 }
 
-optional_ptr<CatalogEntry> MySQLSchemaEntry::CreatePragmaFunction(CatalogTransaction transaction,
+optional_ptr<CatalogEntry> ODBCSchemaEntry::CreatePragmaFunction(CatalogTransaction transaction,
                                                                   CreatePragmaFunctionInfo &info) {
-	throw BinderException("MySQL databases do not support creating pragma functions");
+	throw BinderException("ODBC databases do not support creating pragma functions");
 }
 
-optional_ptr<CatalogEntry> MySQLSchemaEntry::CreateCollation(CatalogTransaction transaction,
+optional_ptr<CatalogEntry> ODBCSchemaEntry::CreateCollation(CatalogTransaction transaction,
                                                              CreateCollationInfo &info) {
-	throw BinderException("MySQL databases do not support creating collations");
+	throw BinderException("ODBC databases do not support creating collations");
 }
 
-void MySQLSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
+void ODBCSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	if (info.type != AlterType::ALTER_TABLE) {
 		throw BinderException("Only altering tables is supported for now");
 	}
@@ -182,22 +182,22 @@ bool CatalogTypeIsSupported(CatalogType type) {
 	}
 }
 
-void MySQLSchemaEntry::Scan(ClientContext &context, CatalogType type,
+void ODBCSchemaEntry::Scan(ClientContext &context, CatalogType type,
                             const std::function<void(CatalogEntry &)> &callback) {
 	if (!CatalogTypeIsSupported(type)) {
 		return;
 	}
 	GetCatalogSet(type).Scan(context, callback);
 }
-void MySQLSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
+void ODBCSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
 	throw NotImplementedException("Scan without context not supported");
 }
 
-void MySQLSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
+void ODBCSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	GetCatalogSet(info.type).DropEntry(context, info);
 }
 
-optional_ptr<CatalogEntry> MySQLSchemaEntry::LookupEntry(CatalogTransaction transaction,
+optional_ptr<CatalogEntry> ODBCSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                          const EntryLookupInfo &lookup_info) {
 	auto lookup_type = lookup_info.GetCatalogType();
 	if (!CatalogTypeIsSupported(lookup_type)) {
@@ -206,7 +206,7 @@ optional_ptr<CatalogEntry> MySQLSchemaEntry::LookupEntry(CatalogTransaction tran
 	return GetCatalogSet(lookup_type).GetEntry(transaction.GetContext(), lookup_info.GetEntryName());
 }
 
-MySQLCatalogSet &MySQLSchemaEntry::GetCatalogSet(CatalogType type) {
+ODBCCatalogSet &ODBCSchemaEntry::GetCatalogSet(CatalogType type) {
 	switch (type) {
 	case CatalogType::TABLE_ENTRY:
 	case CatalogType::VIEW_ENTRY:

@@ -14,14 +14,14 @@
 
 namespace duckdb {
 
-struct MySQLTableInfo {
-	MySQLTableInfo() {
+struct ODBCTableInfo {
+	ODBCTableInfo() {
 		create_info = make_uniq<CreateTableInfo>();
 	}
-	MySQLTableInfo(const string &schema, const string &table) {
+	ODBCTableInfo(const string &schema, const string &table) {
 		create_info = make_uniq<CreateTableInfo>(string(), schema, table);
 	}
-	MySQLTableInfo(const SchemaCatalogEntry &schema, const string &table) {
+	ODBCTableInfo(const SchemaCatalogEntry &schema, const string &table) {
 		create_info = make_uniq<CreateTableInfo>((SchemaCatalogEntry &)schema, table);
 	}
 
@@ -32,10 +32,10 @@ struct MySQLTableInfo {
 	unique_ptr<CreateTableInfo> create_info;
 };
 
-class MySQLTableEntry : public TableCatalogEntry {
+class ODBCTableEntry : public TableCatalogEntry {
 public:
-	MySQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info);
-	MySQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, MySQLTableInfo &info);
+	ODBCTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info);
+	ODBCTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, ODBCTableInfo &info);
 
 public:
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
