@@ -9,7 +9,8 @@
 #pragma once
 
 #include "duckdb.hpp"
-#include "odbc.h"
+#include <sql.h>
+#include <sqlext.h>
 
 namespace duckdb {
 
@@ -41,7 +42,7 @@ class ODBCTypes {
 public:
 	static LogicalType ToODBCType(const ODBCTypeConfig &type_config, const LogicalType &input);
 	static LogicalType TypeToLogicalType(const ODBCTypeConfig &type_config, const ODBCTypeData &input);
-	static LogicalType FieldToLogicalType(const ODBCTypeConfig &type_config, MYSQL_FIELD *field);
+	static LogicalType FieldToLogicalType(const ODBCTypeConfig &type_config, void *field);
 	static string TypeToString(const LogicalType &input);
 };
 

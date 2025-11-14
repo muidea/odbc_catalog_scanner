@@ -8,7 +8,7 @@
 
 using namespace duckdb;
 
-class MysqlScannerExtension : public Extension {
+class ODBCScannerExtension : public Extension {
 public:
 	std::string Name() override {
 		return "odbc_scanner";

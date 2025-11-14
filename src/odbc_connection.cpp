@@ -39,77 +39,86 @@ ODBCConnection ODBCConnection::Open(ODBCTypeConfig type_config, const string &co
 	return ODBCConnection(std::move(connection), connection_string, std::move(type_config));
 }
 
-idx_t ODBCConnection::ODBCExecute(MYSQL_STMT *stmt, const string &query, vector<Value> params, bool streaming) {
+idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming) {
 	if (ODBCConnection::DebugPrintQueries()) {
 		Printer::Print(query + "\n");
 	}
 
 	lock_guard<mutex> l(query_lock);
+	SQLRETURN ret;
 
-	if (!stmt) { // basic interface
+	if (!stmt) { // basic interface - direct execution
 		auto con = GetConn();
-		int res_query = odbc_real_query(con, query.c_str(), query.size());
-		if (res_query != 0) {
-			throw IOException("Failed to run query \"%s\": %s\n", query.c_str(), odbc_error(con));
+		SQLHSTMT hstmt;
+		ret = SQLAllocHandle(SQL_HANDLE_STMT, con, &hstmt);
+		if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+			throw IOException("Failed to allocate statement handle for query \"%s\"", query.c_str());
 		}
-		auto result = ODBCResultPtr(odbc_store_result(con), ODBCResultDelete);
+
+		ret = SQLExecDirect(hstmt, (SQLCHAR*)query.c_str(), SQL_NTS);
+		if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+			SQLCHAR sqlstate[6];
+			SQLINTEGER native_error;
+			SQLCHAR message_text[SQL_MAX_MESSAGE_LENGTH];
+			SQLSMALLINT text_length;
+			
+			SQLGetDiagRec(SQL_HANDLE_STMT, hstmt, 1, sqlstate, &native_error,
+				message_text, SQL_MAX_MESSAGE_LENGTH, &text_length);
+			
+			SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+			throw IOException("Failed to run query \"%s\": %s", query.c_str(), (char*)message_text);
+		}
+
+		SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
 		return 0;
 	}
 
 	// prepared statement interface
-
-	int res_prepare = odbc_stmt_prepare(stmt, query.c_str(), query.size());
-	if (res_prepare != 0) {
-		throw IOException("Failed to prepare ODBC query \"%s\": %s\n", query.c_str(), odbc_stmt_error(stmt));
+	ret = SQLPrepare(stmt, (SQLCHAR*)query.c_str(), SQL_NTS);
+	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+		SQLCHAR sqlstate[6];
+		SQLINTEGER native_error;
+		SQLCHAR message_text[SQL_MAX_MESSAGE_LENGTH];
+		SQLSMALLINT text_length;
+		
+		SQLGetDiagRec(SQL_HANDLE_STMT, stmt, 1, sqlstate, &native_error,
+			message_text, SQL_MAX_MESSAGE_LENGTH, &text_length);
+		
+		throw IOException("Failed to prepare ODBC query \"%s\": %s", query.c_str(), (char*)message_text);
 	}
 
-	vector<ODBCParameter> odbc_params;
-	vector<MYSQL_BIND> binds;
+	// TODO: Implement parameter binding for ODBC
+	// This is a complex task that requires mapping DuckDB Value types to ODBC SQL types
+	// For now, we'll skip parameter binding and assume queries don't have parameters
 	if (params.size() > 0) {
-		size_t expected_count = odbc_stmt_param_count(stmt);
-		if (expected_count != params.size()) {
-			throw IOException(
-			    "Incorrect query parameters count specified, expected: %zu, actual: %zu, ODBC query \"%s\": %s\n",
-			    expected_count, params.size(), query.c_str(), odbc_stmt_error(stmt));
-		}
-		odbc_params.reserve(params.size());
-		binds.reserve(params.size());
-		for (Value &dp : params) {
-			ODBCParameter mp(query, std::move(dp));
-			odbc_params.emplace_back(std::move(mp));
-			ODBCParameter &mp_ref = odbc_params.back();
-			binds.push_back(mp_ref.CreateBind());
-		}
-		auto res_bind = odbc_stmt_bind_param(stmt, binds.data());
-		if (res_bind != 0) {
-			throw IOException("Failed to bind parameters, count: %zu, ODBC query \"%s\": %s\n", binds.size(),
-			                  query.c_str(), odbc_stmt_error(stmt));
-		}
+		throw IOException("Parameter binding not yet implemented for ODBC queries");
 	}
 
-	int res_exec = odbc_stmt_execute(stmt);
-	if (res_exec != 0) {
-		throw IOException("Failed to execute ODBC query \"%s\": %s\n", query.c_str(), odbc_stmt_error(stmt));
+	ret = SQLExecute(stmt);
+	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+		SQLCHAR sqlstate[6];
+		SQLINTEGER native_error;
+		SQLCHAR message_text[SQL_MAX_MESSAGE_LENGTH];
+		SQLSMALLINT text_length;
+		
+		SQLGetDiagRec(SQL_HANDLE_STMT, stmt, 1, sqlstate, &native_error,
+			message_text, SQL_MAX_MESSAGE_LENGTH, &text_length);
+		
+		throw IOException("Failed to execute ODBC query \"%s\": %s", query.c_str(), (char*)message_text);
 	}
 
-	idx_t affected_rows = odbc_stmt_affected_rows(stmt);
-
-	if (!streaming && affected_rows == static_cast<idx_t>(-1)) {
-		bool btrue = true;
-		auto res_attr = odbc_stmt_attr_set(stmt, STMT_ATTR_UPDATE_MAX_LENGTH, &btrue);
-		if (res_attr != 0) {
-			throw IOException("Failed to set STMT_ATTR_UPDATE_MAX_LENGTH for ODBC query \"%s\": %s\n", query.c_str(),
-			                  odbc_stmt_error(stmt));
-		}
-
-		int res_store = odbc_stmt_store_result(stmt);
-		if (res_store != 0) {
-			throw IOException("Failed to store result for ODBC query \"%s\": %s\n", query.c_str(),
-			                  odbc_stmt_error(stmt));
-		}
+	SQLLEN affected_rows = 0;
+	ret = SQLRowCount(stmt, &affected_rows);
+	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+		affected_rows = 0;
 	}
 
-	return affected_rows;
+	if (!streaming && affected_rows == 0) {
+		// For SELECT queries, we need to fetch the result set
+		// This is handled by the ODBCResult class
+	}
+
+	return affected_rows >= 0 ? static_cast<idx_t>(affected_rows) : 0;
 }
 
 unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector<Value> params,
@@ -124,12 +133,15 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 		return unique_ptr<ODBCResult>(nullptr);
 	}
 
-	auto stmt = ODBCStatementPtr(odbc_stmt_init(con), ODBCStatementDelete);
-	if (!stmt) {
-		throw IOException("Failed to initialize ODBC query \"%s\": %s\n", query.c_str(), odbc_error(con));
+	SQLHSTMT stmt;
+	SQLRETURN ret = SQLAllocHandle(SQL_HANDLE_STMT, con, &stmt);
+	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+		throw IOException("Failed to allocate statement handle for query \"%s\"", query.c_str());
 	}
-	idx_t affected_rows = ODBCExecute(stmt.get(), query, params, result_streaming);
-	return make_uniq<ODBCResult>(query, std::move(stmt), type_config, affected_rows);
+
+	auto stmt_ptr = ODBCStatementPtr(stmt, ODBCStatementDelete);
+	idx_t affected_rows = ODBCExecute(stmt_ptr.get(), query, params, result_streaming);
+	return make_uniq<ODBCResult>(query, std::move(stmt_ptr), type_config, affected_rows);
 }
 
 unique_ptr<ODBCResult> ODBCConnection::Query(const string &query, ODBCResultStreaming streaming) {

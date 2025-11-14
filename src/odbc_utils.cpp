@@ -2,7 +2,8 @@
 
 #include <tuple>
 
-#include "odbc_com.h"
+#include <sql.h>
+#include <sqlext.h>
 
 #include "duckdb/common/string_util.hpp"
 
@@ -132,40 +133,19 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 		} else if (key == "socket" || key == "unix_socket") {
 			set_options.insert("socket");
 			result.unix_socket = value;
-		} else if (key == "compress") {
-			set_options.insert("compress");
-			if (ParseBoolValue(value)) {
-				result.client_flag |= CLIENT_COMPRESS;
-			} else {
-				result.client_flag &= ~CLIENT_COMPRESS;
-			}
-		} else if (key == "compression") {
-			set_options.insert("compress");
-			auto val = StringUtil::Lower(value);
-			if (val == "required") {
-				result.client_flag |= CLIENT_COMPRESS;
-			} else if (val == "disabled") {
-				result.client_flag &= ~CLIENT_COMPRESS;
-			} else if (val == "preferred") {
-				// nop
-			} else {
-				throw InvalidInputException("Invalid dsn - compression mode must be either "
-				                            "disabled/required/preferred - got %s",
-				                            value);
-			}
 		} else if (key == "ssl_mode") {
 			set_options.insert("ssl_mode");
 			auto val = StringUtil::Lower(value);
 			if (val == "disabled") {
-				result.ssl_mode = SSL_MODE_DISABLED;
+				result.ssl_mode = 0;
 			} else if (val == "required") {
-				result.ssl_mode = SSL_MODE_REQUIRED;
+				result.ssl_mode = 1;
 			} else if (val == "verify_ca") {
-				result.ssl_mode = SSL_MODE_VERIFY_CA;
+				result.ssl_mode = 2;
 			} else if (val == "verify_identity") {
-				result.ssl_mode = SSL_MODE_VERIFY_IDENTITY;
+				result.ssl_mode = 3;
 			} else if (val == "preferred") {
-				result.ssl_mode = SSL_MODE_PREFERRED;
+				result.ssl_mode = 4;
 			} else {
 				throw InvalidInputException("Invalid dsn - ssl mode must be either "
 				                            "disabled, required, verify_ca, "
@@ -201,105 +181,88 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 		}
 	}
 	// read options that are not set from environment variables
-	if (set_options.find("host") == set_options.end()) {
-		ReadOptionFromEnv("MYSQL_HOST", result.host);
-	}
-	if (set_options.find("password") == set_options.end()) {
-		ReadOptionFromEnv("MYSQL_PWD", result.passwd);
-	}
-	if (set_options.find("user") == set_options.end()) {
-		ReadOptionFromEnv("MYSQL_USER", result.user);
-	}
-	if (set_options.find("database") == set_options.end()) {
-		ReadOptionFromEnv("MYSQL_DATABASE", result.db);
-	}
-	if (set_options.find("socket") == set_options.end()) {
-		ReadOptionFromEnv("MYSQL_UNIX_PORT", result.unix_socket);
-	}
-	if (set_options.find("port") == set_options.end()) {
-		string port_number;
-		if (ReadOptionFromEnv("MYSQL_TCP_PORT", port_number)) {
-			result.port = ParsePort(port_number);
-		}
-	}
-	if (set_options.find("compress") == set_options.end()) {
-		string compress;
-		if (ReadOptionFromEnv("MYSQL_COMPRESS", compress)) {
-			if (ParseBoolValue(compress)) {
-				result.client_flag |= CLIENT_COMPRESS;
-			} else {
-				result.client_flag &= ~CLIENT_COMPRESS;
-			}
-		}
-	}
+	// Note: ODBC typically uses DSN or connection strings, not environment variables
+	// For ODBC, connection parameters are usually specified in the connection string
 	return std::make_tuple(result, set_options);
 }
 
-void SetODBCOption(MYSQL *odbc, enum odbc_option option, const string &value) {
-	if (value.empty()) {
-		return;
-	}
-	int rc = odbc_options(odbc, option, value.c_str());
-	if (rc != 0) {
-		throw InternalException("Failed to set ODBC option");
-	}
-}
+SQLHDBC ODBCUtils::Connect(const string &dsn) {
+	SQLHENV env;
+	SQLHDBC dbc;
+	SQLRETURN ret;
 
-MYSQL *ODBCUtils::Connect(const string &dsn) {
-	MYSQL *odbc = odbc_init(NULL);
-	if (!odbc) {
-		throw IOException("Failure in odbc_init");
+	// Allocate environment handle
+	ret = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env);
+	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+		throw IOException("Failed to allocate ODBC environment handle");
 	}
-	MYSQL *result;
+
+	// Set ODBC version
+	ret = SQLSetEnvAttr(env, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
+	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+		SQLFreeHandle(SQL_HANDLE_ENV, env);
+		throw IOException("Failed to set ODBC version");
+	}
+
+	// Allocate connection handle
+	ret = SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc);
+	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+		SQLFreeHandle(SQL_HANDLE_ENV, env);
+		throw IOException("Failed to allocate ODBC connection handle");
+	}
 
 	ODBCConnectionParameters config;
 	unordered_set<string> unused;
 	std::tie(config, unused) = ParseConnectionParameters(dsn);
 
-	// set SSL options (if any)
-	if (config.ssl_mode != SSL_MODE_PREFERRED) {
-		odbc_options(odbc, MYSQL_OPT_SSL_MODE, &config.ssl_mode);
+	// Build connection string
+	string connection_string;
+	if (!config.host.empty()) {
+		connection_string += "SERVER=" + config.host + ";";
 	}
-	SetODBCOption(odbc, MYSQL_OPT_SSL_CA, config.ssl_ca);
-	SetODBCOption(odbc, MYSQL_OPT_SSL_CAPATH, config.ssl_ca_path);
-	SetODBCOption(odbc, MYSQL_OPT_SSL_CERT, config.ssl_cert);
-	SetODBCOption(odbc, MYSQL_OPT_SSL_CIPHER, config.ssl_cipher);
-	SetODBCOption(odbc, MYSQL_OPT_SSL_CRL, config.ssl_crl);
-	SetODBCOption(odbc, MYSQL_OPT_SSL_CRLPATH, config.ssl_crl_path);
-	SetODBCOption(odbc, MYSQL_OPT_SSL_KEY, config.ssl_key);
-
-	// get connection options
-	const char *host = config.host.empty() ? nullptr : config.host.c_str();
-	const char *user = config.user.empty() ? nullptr : config.user.c_str();
-	const char *passwd = config.passwd.empty() ? nullptr : config.passwd.c_str();
-	const char *db = config.db.empty() ? nullptr : config.db.c_str();
-	const char *unix_socket = config.unix_socket.empty() ? nullptr : config.unix_socket.c_str();
-	result = odbc_real_connect(odbc, host, user, passwd, db, config.port, unix_socket, config.client_flag);
-	if (!result) {
-		string original_error = odbc_error(odbc);
-		string attempted_host = host ? host : "nullptr (default)";
-
-		if (config.host.empty() || config.host == "localhost") {
-			result =
-			    odbc_real_connect(odbc, "127.0.0.1", user, passwd, db, config.port, unix_socket, config.client_flag);
-
-			if (!result) {
-				throw IOException("Failed to connect to ODBC database with parameters "
-				                  "\"%s\": %s. First attempted host: %s. "
-				                  "Retry with 127.0.0.1 also failed.",
-				                  dsn, odbc_error(odbc), attempted_host.c_str());
-			}
-		} else {
-			throw IOException("Failed to connect to ODBC database with parameters "
-			                  "\"%s\": %s. Attempted host: %s",
-			                  dsn, original_error.c_str(), attempted_host.c_str());
-		}
+	if (!config.user.empty()) {
+		connection_string += "UID=" + config.user + ";";
 	}
-	if (odbc_set_character_set(odbc, "utf8mb4") != 0) {
-		throw IOException("Failed to set ODBC character set");
+	if (!config.passwd.empty()) {
+		connection_string += "PWD=" + config.passwd + ";";
 	}
-	D_ASSERT(odbc == result);
-	return result;
+	if (!config.db.empty()) {
+		connection_string += "DATABASE=" + config.db + ";";
+	}
+	if (config.port != 0) {
+		connection_string += "PORT=" + std::to_string(config.port) + ";";
+	}
+
+	// Connect to the data source
+	SQLCHAR outstr[1024];
+	SQLSMALLINT outstrlen;
+	ret = SQLDriverConnect(dbc, NULL,
+		(SQLCHAR*)connection_string.c_str(), SQL_NTS,
+		outstr, sizeof(outstr), &outstrlen, SQL_DRIVER_COMPLETE);
+
+	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+		SQLCHAR sqlstate[6];
+		SQLINTEGER native_error;
+		SQLCHAR message_text[SQL_MAX_MESSAGE_LENGTH];
+		SQLSMALLINT text_length;
+		
+		SQLGetDiagRec(SQL_HANDLE_DBC, dbc, 1, sqlstate, &native_error,
+			message_text, SQL_MAX_MESSAGE_LENGTH, &text_length);
+		
+		SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+		SQLFreeHandle(SQL_HANDLE_ENV, env);
+		
+		throw IOException("Failed to connect to ODBC database with parameters \"%s\": %s",
+			dsn.c_str(), (char*)message_text);
+	}
+
+	// Set character set if needed
+	// Note: Character set setting in ODBC is driver-specific and may not be needed
+
+	// Free environment handle as it's no longer needed
+	SQLFreeHandle(SQL_HANDLE_ENV, env);
+
+	return dbc;
 }
 
 string ODBCUtils::EscapeQuotes(const string &text, char quote) {

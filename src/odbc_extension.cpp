@@ -84,7 +84,8 @@ void SetODBCSecretParameters(CreateSecretFunction &function) {
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	odbc_library_init(0, NULL, NULL);
+	// ODBC doesn't require explicit library initialization like MySQL
+	// The ODBC driver manager handles initialization automatically
 	ODBCClearCacheFunction clear_cache_func;
 	loader.RegisterFunction(clear_cache_func);
 
@@ -132,7 +133,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.optimizer_extensions.push_back(std::move(odbc_optimizer));
 }
 
-void MysqlScannerExtension::Load(ExtensionLoader &loader) {
+void ODBCScannerExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
 

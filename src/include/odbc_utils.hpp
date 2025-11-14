@@ -9,7 +9,8 @@
 #pragma once
 
 #include "duckdb.hpp"
-#include "odbc.h"
+#include <sql.h>
+#include <sqlext.h>
 
 namespace duckdb {
 class ODBCSchemaEntry;
@@ -22,8 +23,8 @@ struct ODBCConnectionParameters {
 	string db;
 	uint32_t port = 0;
 	string unix_socket;
-	idx_t client_flag = CLIENT_COMPRESS | CLIENT_IGNORE_SIGPIPE | CLIENT_MULTI_STATEMENTS;
-	unsigned int ssl_mode = SSL_MODE_PREFERRED;
+	SQLUINTEGER client_flag = 0;
+	SQLUINTEGER ssl_mode = 0;
 	string ssl_ca;
 	string ssl_ca_path;
 	string ssl_cert;
@@ -40,7 +41,7 @@ enum class ODBCConnectorInterface { UNINITIALIZED, BASIC, PREPARED_STATEMENT };
 class ODBCUtils {
 public:
 	static std::tuple<ODBCConnectionParameters, unordered_set<string>> ParseConnectionParameters(const string &dsn);
-	static MYSQL *Connect(const string &dsn);
+	static SQLHDBC Connect(const string &dsn);
 
 	static string WriteIdentifier(const string &identifier);
 	static string WriteLiteral(const string &identifier);
@@ -49,16 +50,22 @@ public:
 	static string TransformConstant(const Value &val);
 };
 
-using ODBCStatementPtr = duckdb::unique_ptr<MYSQL_STMT, void (*)(MYSQL_STMT *)>;
+using ODBCStatementPtr = duckdb::unique_ptr<void, void (*)(SQLHSTMT)>;
 
-inline void ODBCStatementDelete(MYSQL_STMT *stmt) {
-	odbc_stmt_close(stmt);
+inline void ODBCStatementDelete(SQLHSTMT stmt) {
+	if (stmt) {
+		SQLFreeStmt(stmt, SQL_CLOSE);
+		SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+	}
 }
 
-using ODBCResultPtr = duckdb::unique_ptr<MYSQL_RES, void (*)(MYSQL_RES *)>;
+using ODBCResultPtr = duckdb::unique_ptr<void, void (*)(SQLHSTMT)>;
 
-inline void ODBCResultDelete(MYSQL_RES *res) {
-	odbc_free_result(res);
+inline void ODBCResultDelete(SQLHSTMT stmt) {
+	if (stmt) {
+		SQLFreeStmt(stmt, SQL_CLOSE);
+		SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+	}
 }
 
 } // namespace duckdb

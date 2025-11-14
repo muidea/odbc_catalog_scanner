@@ -10,6 +10,8 @@
 
 #include "odbc_types.hpp"
 #include "odbc_utils.hpp"
+#include <sql.h>
+#include <sqlext.h>
 
 namespace duckdb {
 class ODBCConnection;
@@ -17,7 +19,7 @@ struct OwnedODBCConnection;
 
 struct ODBCField {
 	string name;
-	enum_field_types odbc_type;
+	SQLSMALLINT odbc_type;
 	LogicalType duckdb_type;
 
 	vector<char> bind_buffer;
@@ -25,7 +27,7 @@ struct ODBCField {
 	bool bind_is_null = false;
 	bool bind_error = false;
 
-	ODBCField(MYSQL_FIELD *mf, LogicalType duckdb_type_p, const ODBCTypeConfig &type_config);
+	ODBCField(void *field_info, LogicalType duckdb_type_p, const ODBCTypeConfig &type_config);
 
 	void ResetBind();
 };
@@ -57,7 +59,9 @@ private:
 	idx_t affected_rows = static_cast<idx_t>(-1);
 
 	vector<ODBCField> fields;
-	vector<MYSQL_BIND> binds;
+	vector<SQLPOINTER> bind_buffers;
+	vector<SQLLEN> bind_lengths;
+	vector<SQLSMALLINT> bind_types;
 
 	DataChunk data_chunk;
 	idx_t row_idx = static_cast<idx_t>(-1);

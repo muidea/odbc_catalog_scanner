@@ -26,17 +26,18 @@ class ODBCResult;
 struct IndexInfo;
 
 struct OwnedODBCConnection {
-	explicit OwnedODBCConnection(MYSQL *conn = nullptr) : connection(conn) {
+	explicit OwnedODBCConnection(SQLHDBC conn = nullptr) : connection(conn) {
 	}
 	~OwnedODBCConnection() {
 		if (!connection) {
 			return;
 		}
-		odbc_close(connection);
+		SQLDisconnect(connection);
+		SQLFreeHandle(SQL_HANDLE_DBC, connection);
 		connection = nullptr;
 	}
 
-	MYSQL *connection;
+	SQLHDBC connection;
 };
 
 class ODBCConnection {
@@ -70,7 +71,7 @@ public:
 		return dsn;
 	}
 
-	MYSQL *GetConn() {
+	SQLHDBC GetConn() {
 		if (!connection || !connection->connection) {
 			throw InternalException("ODBCConnection::GetConn - no connection available");
 		}
@@ -83,7 +84,7 @@ public:
 private:
 	unique_ptr<ODBCResult> QueryInternal(const string &query, vector<Value> params, ODBCResultStreaming streaming,
 	                                      ODBCConnectorInterface con_interface);
-	idx_t ODBCExecute(MYSQL_STMT *stmt, const string &query, vector<Value> params, bool streaming);
+	idx_t ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming);
 
 	mutex query_lock;
 	shared_ptr<OwnedODBCConnection> connection;

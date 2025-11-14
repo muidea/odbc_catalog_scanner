@@ -3,6 +3,8 @@
 #include "duckdb/common/types/datetime.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include <sql.h>
+#include <sqlext.h>
 
 namespace duckdb {
 
@@ -14,39 +16,38 @@ static void FillNumberBuffer(Value &value, vector<char> &bind_buffer) {
 }
 
 static void FillDateBuffer(Value &value, vector<char> &bind_buffer) {
-	MYSQL_TIME mt;
-	std::memset(&mt, '\0', sizeof(MYSQL_TIME));
+	SQL_DATE_STRUCT date;
+	std::memset(&date, '\0', sizeof(SQL_DATE_STRUCT));
 	date_t dd = DateValue::Get(value);
 	int32_t year, month, day;
 	Date::Convert(dd, year, month, day);
 
-	mt.year = static_cast<unsigned int>(std::abs(year));
-	mt.month = static_cast<unsigned int>(std::abs(month));
-	mt.day = static_cast<unsigned int>(std::abs(day));
+	date.year = static_cast<SQLSMALLINT>(std::abs(year));
+	date.month = static_cast<SQLUSMALLINT>(std::abs(month));
+	date.day = static_cast<SQLUSMALLINT>(std::abs(day));
 
-	bind_buffer.resize(sizeof(MYSQL_TIME));
-	std::memcpy(bind_buffer.data(), &mt, sizeof(MYSQL_TIME));
+	bind_buffer.resize(sizeof(SQL_DATE_STRUCT));
+	std::memcpy(bind_buffer.data(), &date, sizeof(SQL_DATE_STRUCT));
 }
 
 static void FillTimeBuffer(Value &value, vector<char> &bind_buffer) {
-	MYSQL_TIME mt;
-	std::memset(&mt, '\0', sizeof(MYSQL_TIME));
+	SQL_TIME_STRUCT time;
+	std::memset(&time, '\0', sizeof(SQL_TIME_STRUCT));
 	dtime_t dt = TimeValue::Get(value);
 	int32_t hour, minute, second, micros;
 	Time::Convert(dt, hour, minute, second, micros);
 
-	mt.hour = static_cast<unsigned int>(std::abs(hour));
-	mt.minute = static_cast<unsigned int>(std::abs(minute));
-	mt.second = static_cast<unsigned int>(std::abs(second));
-	mt.second_part = static_cast<unsigned long>(std::abs(micros));
+	time.hour = static_cast<SQLUSMALLINT>(std::abs(hour));
+	time.minute = static_cast<SQLUSMALLINT>(std::abs(minute));
+	time.second = static_cast<SQLUSMALLINT>(std::abs(second));
 
-	bind_buffer.resize(sizeof(MYSQL_TIME));
-	std::memcpy(bind_buffer.data(), &mt, sizeof(MYSQL_TIME));
+	bind_buffer.resize(sizeof(SQL_TIME_STRUCT));
+	std::memcpy(bind_buffer.data(), &time, sizeof(SQL_TIME_STRUCT));
 }
 
 static void FillTimestampBuffer(Value &value, vector<char> &bind_buffer) {
-	MYSQL_TIME mt;
-	std::memset(&mt, '\0', sizeof(MYSQL_TIME));
+	SQL_TIMESTAMP_STRUCT timestamp;
+	std::memset(&timestamp, '\0', sizeof(SQL_TIMESTAMP_STRUCT));
 	timestamp_t ts = TimestampValue::Get(value);
 	date_t dd;
 	dtime_t dt;
@@ -56,16 +57,16 @@ static void FillTimestampBuffer(Value &value, vector<char> &bind_buffer) {
 	int32_t hour, minute, second, micros;
 	Time::Convert(dt, hour, minute, second, micros);
 
-	mt.year = static_cast<unsigned int>(std::abs(year));
-	mt.month = static_cast<unsigned int>(std::abs(month));
-	mt.day = static_cast<unsigned int>(std::abs(day));
-	mt.hour = static_cast<unsigned int>(std::abs(hour));
-	mt.minute = static_cast<unsigned int>(std::abs(minute));
-	mt.second = static_cast<unsigned int>(std::abs(second));
-	mt.second_part = static_cast<unsigned long>(std::abs(micros));
+	timestamp.year = static_cast<SQLSMALLINT>(std::abs(year));
+	timestamp.month = static_cast<SQLUSMALLINT>(std::abs(month));
+	timestamp.day = static_cast<SQLUSMALLINT>(std::abs(day));
+	timestamp.hour = static_cast<SQLUSMALLINT>(std::abs(hour));
+	timestamp.minute = static_cast<SQLUSMALLINT>(std::abs(minute));
+	timestamp.second = static_cast<SQLUSMALLINT>(std::abs(second));
+	timestamp.fraction = static_cast<SQLUINTEGER>(std::abs(micros)) * 1000; // Convert to nanoseconds
 
-	bind_buffer.resize(sizeof(MYSQL_TIME));
-	std::memcpy(bind_buffer.data(), &mt, sizeof(MYSQL_TIME));
+	bind_buffer.resize(sizeof(SQL_TIMESTAMP_STRUCT));
+	std::memcpy(bind_buffer.data(), &timestamp, sizeof(SQL_TIMESTAMP_STRUCT));
 }
 
 ODBCParameter::ODBCParameter(const string &query, Value value_p) : value(std::move(value_p)) {
@@ -75,101 +76,76 @@ ODBCParameter::ODBCParameter(const string &query, Value value_p) : value(std::mo
 
 	switch (value.type().id()) {
 	case LogicalTypeId::BOOLEAN:
-		this->buffer_type = MYSQL_TYPE_TINY;
-		FillNumberBuffer<bool>(value, bind_buffer);
+		this->buffer_type = SQL_TINYINT;
+		FillNumberBuffer<int8_t>(value, bind_buffer);
 		break;
 	case LogicalTypeId::TINYINT:
-		this->buffer_type = MYSQL_TYPE_TINY;
+		this->buffer_type = SQL_TINYINT;
 		FillNumberBuffer<int8_t>(value, bind_buffer);
 		break;
 	case LogicalTypeId::UTINYINT:
-		this->buffer_type = MYSQL_TYPE_TINY;
+		this->buffer_type = SQL_TINYINT;
 		this->is_unsigned = true;
 		FillNumberBuffer<uint8_t>(value, bind_buffer);
 		break;
 	case LogicalTypeId::SMALLINT:
-		this->buffer_type = MYSQL_TYPE_SHORT;
+		this->buffer_type = SQL_SMALLINT;
 		FillNumberBuffer<int16_t>(value, bind_buffer);
 		break;
 	case LogicalTypeId::USMALLINT:
-		this->buffer_type = MYSQL_TYPE_SHORT;
+		this->buffer_type = SQL_SMALLINT;
 		this->is_unsigned = true;
 		FillNumberBuffer<uint16_t>(value, bind_buffer);
 		break;
 	case LogicalTypeId::INTEGER:
-		this->buffer_type = MYSQL_TYPE_LONG;
+		this->buffer_type = SQL_INTEGER;
 		FillNumberBuffer<int32_t>(value, bind_buffer);
 		break;
 	case LogicalTypeId::UINTEGER:
-		this->buffer_type = MYSQL_TYPE_LONG;
+		this->buffer_type = SQL_INTEGER;
 		this->is_unsigned = true;
 		FillNumberBuffer<uint32_t>(value, bind_buffer);
 		break;
 	case LogicalTypeId::BIGINT:
-		this->buffer_type = MYSQL_TYPE_LONGLONG;
+		this->buffer_type = SQL_BIGINT;
 		FillNumberBuffer<int64_t>(value, bind_buffer);
 		break;
 	case LogicalTypeId::UBIGINT:
-		this->buffer_type = MYSQL_TYPE_LONGLONG;
+		this->buffer_type = SQL_BIGINT;
 		this->is_unsigned = true;
 		FillNumberBuffer<uint64_t>(value, bind_buffer);
 		break;
 	case LogicalTypeId::FLOAT:
-		this->buffer_type = MYSQL_TYPE_FLOAT;
+		this->buffer_type = SQL_REAL;
 		FillNumberBuffer<float>(value, bind_buffer);
 		break;
 	case LogicalTypeId::DOUBLE:
-		this->buffer_type = MYSQL_TYPE_DOUBLE;
+		this->buffer_type = SQL_DOUBLE;
 		FillNumberBuffer<double>(value, bind_buffer);
 		break;
 	case LogicalTypeId::DATE:
-		this->buffer_type = MYSQL_TYPE_DATE;
+		this->buffer_type = SQL_TYPE_DATE;
 		FillDateBuffer(value, bind_buffer);
 		break;
 	case LogicalTypeId::TIME:
-		this->buffer_type = MYSQL_TYPE_TIME;
+		this->buffer_type = SQL_TYPE_TIME;
 		FillTimeBuffer(value, bind_buffer);
 		break;
 	case LogicalTypeId::TIMESTAMP:
-		this->buffer_type = MYSQL_TYPE_DATETIME;
+		this->buffer_type = SQL_TYPE_TIMESTAMP;
 		FillTimestampBuffer(value, bind_buffer);
 		break;
 	case LogicalTypeId::TIMESTAMP_TZ:
-		this->buffer_type = MYSQL_TYPE_TIMESTAMP;
+		this->buffer_type = SQL_TYPE_TIMESTAMP;
 		FillTimestampBuffer(value, bind_buffer);
 		break;
 	case LogicalTypeId::VARCHAR:
 		// use string ref from the value
+		this->buffer_type = SQL_VARCHAR;
 		break;
 	default:
 		throw IOException("Unsupported parameters type: \"%s\", ODBC query \"%s\"", value.type(), query.c_str());
 	}
-}
-
-MYSQL_BIND ODBCParameter::CreateBind() {
-	MYSQL_BIND bind;
-	std::memset(&bind, '\0', sizeof(MYSQL_BIND));
-
-	if (value.IsNull()) {
-		bind.buffer_type = MYSQL_TYPE_NULL;
-		bind.length = &bind_length;
-	} else if (value.type().id() == LogicalTypeId::VARCHAR) {
-		const string &str = StringValue::Get(value);
-		bind.buffer_type = MYSQL_TYPE_VARCHAR;
-		bind.buffer = const_cast<char *>(str.c_str());
-		bind.buffer_length = str.length();
-		bind_length = str.length();
-		bind.length = &bind_length;
-	} else {
-		bind.buffer_type = buffer_type;
-		bind.is_unsigned = is_unsigned;
-		bind.buffer = bind_buffer.data();
-		bind.buffer_length = bind_buffer.size();
-		bind_length = bind_buffer.size();
-		bind.length = &bind_length;
-	}
-
-	return bind;
 }
 
 } // namespace duckdb
