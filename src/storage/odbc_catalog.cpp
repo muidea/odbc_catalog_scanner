@@ -22,7 +22,7 @@ ODBCCatalog::ODBCCatalog(AttachedDatabase &db_p, string connection_string_p, str
 	ODBCConnectionParameters connection_params;
 	unordered_set<string> unused;
 	std::tie(connection_params, unused) = ODBCUtils::ParseConnectionParameters(connection_string);
-	default_schema = connection_params.db;
+	default_schema = connection_params.database;
 	// try to connect
 	ODBCTypeConfig type_config;
 	auto connection = ODBCConnection::Open(type_config, connection_string);
@@ -176,7 +176,7 @@ vector<string> GetAttributeNames(const vector<URIToken> &tokens, idx_t token_cou
 		}
 		D_ASSERT(token_count > 2);
 		result.emplace_back("user");
-		result.emplace_back("passwd");
+		result.emplace_back("pwd");
 		result.emplace_back("host");
 		current_pos = 2;
 	} else {
@@ -200,11 +200,11 @@ vector<string> GetAttributeNames(const vector<URIToken> &tokens, idx_t token_cou
 		if (tokens[current_pos].delimiter != '/') {
 			error = ParserException("Invalid URI string - expected host:port/schema");
 		}
-		result.emplace_back("db");
+		result.emplace_back("database");
 		current_pos++;
 	} else if (tokens[current_pos].delimiter == '/') {
 		// host/schema
-		result.emplace_back("db");
+		result.emplace_back("database");
 		current_pos++;
 	} else {
 		error = ParserException("Invalid URI string - expected host:port or host/schema");
@@ -390,20 +390,12 @@ string ODBCCatalog::GetConnectionString(ClientContext &context, const string &at
 		// already exist in the original connection string
 		string new_connection_info;
 
-		new_connection_info += AddConnectionOption(kv_secret, "user", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "password", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "host", existing_params);
+		new_connection_info += AddConnectionOption(kv_secret, "uid", existing_params);
+		new_connection_info += AddConnectionOption(kv_secret, "pwd", existing_params);
+		new_connection_info += AddConnectionOption(kv_secret, "server", existing_params);
 		new_connection_info += AddConnectionOption(kv_secret, "port", existing_params);
 		new_connection_info += AddConnectionOption(kv_secret, "database", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "socket", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "ssl_mode", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "ssl_ca", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "ssl_capath", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "ssl_cert", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "ssl_cipher", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "ssl_crl", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "ssl_crlpath", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "ssl_key", existing_params);
+		new_connection_info += AddConnectionOption(kv_secret, "driver", existing_params);
 
 		// Combine the parameters, putting secret parameters first
 		if (!new_connection_info.empty()) {

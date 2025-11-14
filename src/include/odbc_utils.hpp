@@ -17,21 +17,12 @@ class ODBCSchemaEntry;
 class ODBCTransaction;
 
 struct ODBCConnectionParameters {
-	string host;
-	string user;
-	string passwd;
-	string db;
+	string driver;
+	string server;
+	string database;
+	string uid;
+	string pwd;
 	uint32_t port = 0;
-	string unix_socket;
-	SQLUINTEGER client_flag = 0;
-	SQLUINTEGER ssl_mode = 0;
-	string ssl_ca;
-	string ssl_ca_path;
-	string ssl_cert;
-	string ssl_cipher;
-	string ssl_crl;
-	string ssl_crl_path;
-	string ssl_key;
 };
 
 enum class ODBCResultStreaming { UNINITIALIZED, ALLOW_STREAMING, FORCE_MATERIALIZATION };

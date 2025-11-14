@@ -90,21 +90,33 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 	ODBCConnectionParameters result;
 
 	unordered_set<string> set_options;
-	// parse options
+	// parse options from ODBC connection string format: "key1=value1;key2=value2;"
 	idx_t pos = 0;
 	while (pos < dsn.size()) {
 		string key;
 		string value;
-		if (!ParseValue(dsn, pos, key)) {
-			break;
+		
+		// Parse key
+		while (pos < dsn.size() && dsn[pos] != '=' && dsn[pos] != ';') {
+			key += dsn[pos];
+			pos++;
 		}
+		
 		if (pos >= dsn.size() || dsn[pos] != '=') {
-			throw InvalidInputException("Invalid dsn \"%s\" - expected key=value pairs separated by spaces", dsn);
+			throw InvalidInputException("Invalid connection string \"%s\" - expected key=value pairs separated by semicolons", dsn);
 		}
-		pos++;
-		if (!ParseValue(dsn, pos, value)) {
-			throw InvalidInputException("Invalid dsn \"%s\" - expected key=value pairs separated by spaces", dsn);
+		pos++; // skip '='
+		
+		// Parse value
+		while (pos < dsn.size() && dsn[pos] != ';') {
+			value += dsn[pos];
+			pos++;
 		}
+		
+		if (pos < dsn.size() && dsn[pos] == ';') {
+			pos++; // skip ';'
+		}
+		
 		key = StringUtil::Lower(key);
 
 		if (set_options.find(key) != set_options.end()) {
@@ -113,76 +125,32 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 			                            key);
 		}
 
-		// Handle duplicate options (except for aliased options like passwd/password
-		// which map to the same option)
-		if (key == "host") {
-			set_options.insert("host");
-			result.host = value;
-		} else if (key == "user") {
-			set_options.insert("user");
-			result.user = value;
-		} else if (key == "passwd" || key == "password") {
-			set_options.insert("password");
-			result.passwd = value;
-		} else if (key == "db" || key == "database") {
+		// Handle standard ODBC connection parameters
+		if (key == "driver") {
+			set_options.insert("driver");
+			result.driver = value;
+		} else if (key == "server") {
+			set_options.insert("server");
+			result.server = value;
+		} else if (key == "database") {
 			set_options.insert("database");
-			result.db = value;
+			result.database = value;
+		} else if (key == "uid") {
+			set_options.insert("uid");
+			result.uid = value;
+		} else if (key == "pwd") {
+			set_options.insert("pwd");
+			result.pwd = value;
 		} else if (key == "port") {
 			set_options.insert("port");
 			result.port = ParsePort(value);
-		} else if (key == "socket" || key == "unix_socket") {
-			set_options.insert("socket");
-			result.unix_socket = value;
-		} else if (key == "ssl_mode") {
-			set_options.insert("ssl_mode");
-			auto val = StringUtil::Lower(value);
-			if (val == "disabled") {
-				result.ssl_mode = 0;
-			} else if (val == "required") {
-				result.ssl_mode = 1;
-			} else if (val == "verify_ca") {
-				result.ssl_mode = 2;
-			} else if (val == "verify_identity") {
-				result.ssl_mode = 3;
-			} else if (val == "preferred") {
-				result.ssl_mode = 4;
-			} else {
-				throw InvalidInputException("Invalid dsn - ssl mode must be either "
-				                            "disabled, required, verify_ca, "
-				                            "verify_identity or preferred - got %s",
-				                            value);
-			}
-		} else if (key == "ssl_ca") {
-			set_options.insert("ssl_ca");
-			result.ssl_ca = value;
-		} else if (key == "ssl_capath") {
-			set_options.insert("ssl_capath");
-			result.ssl_ca_path = value;
-		} else if (key == "ssl_cert") {
-			set_options.insert("ssl_cert");
-			result.ssl_cert = value;
-		} else if (key == "ssl_cipher") {
-			set_options.insert("ssl_cipher");
-			result.ssl_cipher = value;
-		} else if (key == "ssl_crl") {
-			set_options.insert("ssl_crl");
-			result.ssl_crl = value;
-		} else if (key == "ssl_crlpath") {
-			set_options.insert("ssl_crlpath");
-			result.ssl_crl_path = value;
-		} else if (key == "ssl_key") {
-			set_options.insert("ssl_key");
-			result.ssl_key = value;
 		} else {
-			throw InvalidInputException("Unrecognized configuration parameter \"%s\" "
-			                            "- expected options are host, "
-			                            "user, passwd, db, port, socket",
-			                            key);
+			// Ignore unrecognized parameters (like TDS_Version) as they are driver-specific
+			continue;
 		}
 	}
-	// read options that are not set from environment variables
-	// Note: ODBC typically uses DSN or connection strings, not environment variables
-	// For ODBC, connection parameters are usually specified in the connection string
+	
+	// For ODBC, connection parameters are specified in the connection string
 	return std::make_tuple(result, set_options);
 }
 
@@ -217,17 +185,20 @@ SQLHDBC ODBCUtils::Connect(const string &dsn) {
 
 	// Build connection string
 	string connection_string;
-	if (!config.host.empty()) {
-		connection_string += "SERVER=" + config.host + ";";
+	if (!config.driver.empty()) {
+		connection_string += "DRIVER=" + config.driver + ";";
 	}
-	if (!config.user.empty()) {
-		connection_string += "UID=" + config.user + ";";
+	if (!config.server.empty()) {
+		connection_string += "SERVER=" + config.server + ";";
 	}
-	if (!config.passwd.empty()) {
-		connection_string += "PWD=" + config.passwd + ";";
+	if (!config.uid.empty()) {
+		connection_string += "UID=" + config.uid + ";";
 	}
-	if (!config.db.empty()) {
-		connection_string += "DATABASE=" + config.db + ";";
+	if (!config.pwd.empty()) {
+		connection_string += "PWD=" + config.pwd + ";";
+	}
+	if (!config.database.empty()) {
+		connection_string += "DATABASE=" + config.database + ";";
 	}
 	if (config.port != 0) {
 		connection_string += "PORT=" + std::to_string(config.port) + ";";
