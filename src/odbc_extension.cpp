@@ -26,36 +26,18 @@ unique_ptr<BaseSecret> CreateODBCSecretFunction(ClientContext &, CreateSecretInp
 	for (const auto &named_param : input.options) {
 		auto lower_name = StringUtil::Lower(named_param.first);
 
-		if (lower_name == "host") {
-			result->secret_map["host"] = named_param.second.ToString();
-		} else if (lower_name == "user") {
-			result->secret_map["user"] = named_param.second.ToString();
+		if (lower_name == "driver") {
+			result->secret_map["driver"] = named_param.second.ToString();
+		} else if (lower_name == "server") {
+			result->secret_map["server"] = named_param.second.ToString();
 		} else if (lower_name == "database") {
 			result->secret_map["database"] = named_param.second.ToString();
-		} else if (lower_name == "password") {
-			result->secret_map["password"] = named_param.second.ToString();
+		} else if (lower_name == "uid") {
+			result->secret_map["uid"] = named_param.second.ToString();
+		} else if (lower_name == "pwd") {
+			result->secret_map["pwd"] = named_param.second.ToString();
 		} else if (lower_name == "port") {
 			result->secret_map["port"] = named_param.second.ToString();
-		} else if (lower_name == "socket") {
-			result->secret_map["socket"] = named_param.second.ToString();
-		} else if (lower_name == "ssl_mode") {
-			result->secret_map["ssl_mode"] = named_param.second.ToString();
-		} else if (lower_name == "ssl_ca") {
-			result->secret_map["ssl_ca"] = named_param.second.ToString();
-		} else if (lower_name == "ssl_capath") {
-			result->secret_map["ssl_capath"] = named_param.second.ToString();
-		} else if (lower_name == "ssl_capath") {
-			result->secret_map["ssl_capath"] = named_param.second.ToString();
-		} else if (lower_name == "ssl_cert") {
-			result->secret_map["ssl_cert"] = named_param.second.ToString();
-		} else if (lower_name == "ssl_cipher") {
-			result->secret_map["ssl_cipher"] = named_param.second.ToString();
-		} else if (lower_name == "ssl_crl") {
-			result->secret_map["ssl_crl"] = named_param.second.ToString();
-		} else if (lower_name == "ssl_crlpath") {
-			result->secret_map["ssl_crlpath"] = named_param.second.ToString();
-		} else if (lower_name == "ssl_key") {
-			result->secret_map["ssl_key"] = named_param.second.ToString();
 		} else {
 			throw InternalException("Unknown named parameter passed to CreateODBCSecretFunction: " + lower_name);
 		}
@@ -67,20 +49,12 @@ unique_ptr<BaseSecret> CreateODBCSecretFunction(ClientContext &, CreateSecretInp
 }
 
 void SetODBCSecretParameters(CreateSecretFunction &function) {
-	function.named_parameters["host"] = LogicalType::VARCHAR;
+	function.named_parameters["driver"] = LogicalType::VARCHAR;
+	function.named_parameters["server"] = LogicalType::VARCHAR;
 	function.named_parameters["port"] = LogicalType::VARCHAR;
-	function.named_parameters["password"] = LogicalType::VARCHAR;
-	function.named_parameters["user"] = LogicalType::VARCHAR;
+	function.named_parameters["uid"] = LogicalType::VARCHAR;
+	function.named_parameters["pwd"] = LogicalType::VARCHAR;
 	function.named_parameters["database"] = LogicalType::VARCHAR;
-	function.named_parameters["socket"] = LogicalType::VARCHAR;
-	function.named_parameters["ssl_mode"] = LogicalType::VARCHAR;
-	function.named_parameters["ssl_ca"] = LogicalType::VARCHAR;
-	function.named_parameters["ssl_capath"] = LogicalType::VARCHAR;
-	function.named_parameters["ssl_cert"] = LogicalType::VARCHAR;
-	function.named_parameters["ssl_cipher"] = LogicalType::VARCHAR;
-	function.named_parameters["ssl_crl"] = LogicalType::VARCHAR;
-	function.named_parameters["ssl_crlpath"] = LogicalType::VARCHAR;
-	function.named_parameters["ssl_key"] = LogicalType::VARCHAR;
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
