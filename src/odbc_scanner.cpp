@@ -38,6 +38,12 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 	// generate the SELECT statement
 	string select;
 	select += "SELECT ";
+	
+	// For SQL Server, TOP clause must come immediately after SELECT
+	if (!bind_data.limit.empty()) {
+		select += bind_data.limit;
+	}
+	
 	for (idx_t c = 0; c < input.column_ids.size(); c++) {
 		if (c > 0) {
 			select += ", ";
@@ -57,9 +63,6 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 	string filter_string = ODBCFilterPushdown::TransformFilters(input.column_ids, input.filters, bind_data.names);
 	if (!filter_string.empty()) {
 		select += " WHERE " + filter_string;
-	}
-	if (!bind_data.limit.empty()) {
-		select += bind_data.limit;
 	}
 	// run the query
 	auto &transaction = ODBCTransaction::Get(context, bind_data.table.catalog);

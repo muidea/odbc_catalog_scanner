@@ -64,7 +64,8 @@ void OptimizeODBCScan(unique_ptr<LogicalOperator> &op) {
 		}
 		auto &bind_data = get.bind_data->Cast<ODBCBindData>();
 		if (limit.limit_val.Type() != LimitNodeType::UNSET) {
-			bind_data.limit += " LIMIT " + to_string(limit.limit_val.GetConstantValue());
+			// For SQL Server ODBC, use TOP instead of LIMIT
+			bind_data.limit = " TOP " + to_string(limit.limit_val.GetConstantValue());
 		}
 		if (limit.offset_val.Type() != LimitNodeType::UNSET) {
 			bind_data.limit += " OFFSET " + to_string(limit.offset_val.GetConstantValue());

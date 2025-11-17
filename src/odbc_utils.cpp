@@ -204,6 +204,11 @@ SQLHDBC ODBCUtils::Connect(const string &dsn) {
 		connection_string += "PORT=" + std::to_string(config.port) + ";";
 	}
 
+	// Add character set for Chinese support
+	// For SQL Server with FreeTDS driver, use UTF-8 encoding
+	connection_string += "ClientCharset=UTF-8;";
+	connection_string += "TDS_Version=8.0;";
+
 	// Connect to the data source
 	SQLCHAR outstr[1024];
 	SQLSMALLINT outstrlen;
@@ -258,7 +263,13 @@ string ODBCUtils::WriteQuoted(const string &text, char quote) {
 }
 
 string ODBCUtils::WriteIdentifier(const string &identifier) {
-	return ODBCUtils::WriteQuoted(identifier, '`');
+	// For SQL Server ODBC, use square brackets for identifiers
+	// We need to handle square brackets specially since they are different from quotes
+	string result;
+	result += '[';
+	result += EscapeQuotes(identifier, ']'); // Escape any closing brackets in the identifier
+	result += ']';
+	return result;
 }
 
 string ODBCUtils::WriteLiteral(const string &identifier) {

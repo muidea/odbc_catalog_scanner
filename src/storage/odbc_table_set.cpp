@@ -21,53 +21,84 @@ ODBCTableSet::ODBCTableSet(ODBCSchemaEntry &schema) : ODBCInSchemaSet(schema) {
 }
 
 void ODBCTableSet::AddColumn(ClientContext &context, ODBCResult &result, ODBCTableInfo &table_info,
-                              idx_t column_offset) {
-	ODBCTypeData type_info;
-	idx_t column_index = column_offset;
-	auto column_name = result.GetString(column_index);
-	type_info.type_name = result.GetString(column_index + 1);
-	type_info.column_type = result.GetString(column_index + 2);
-	string default_value;
-	auto is_nullable = result.GetString(column_index + 4);
-	type_info.precision = result.IsNull(column_index + 5) ? -1 : result.GetInt64(column_index + 5);
-	type_info.scale = result.IsNull(column_index + 6) ? -1 : result.GetInt64(column_index + 6);
+                               idx_t column_offset) {
+	try {
+		std::cout << "[DEBUG] AddColumn - Starting for column offset: " << column_offset << std::endl;
+		
+		ODBCTypeData type_info;
+		idx_t column_index = column_offset;
+		
+		// Get column information with error handling
+		auto column_name = result.GetString(column_index);
+		std::cout << "[DEBUG] AddColumn - Column name: " << column_name << std::endl;
+		
+		type_info.type_name = result.GetString(column_index + 1);
+		type_info.column_type = result.GetString(column_index + 2);
+		std::cout << "[DEBUG] AddColumn - Type name: " << type_info.type_name << ", Column type: " << type_info.column_type << std::endl;
+		
+		string default_value;
+		auto is_nullable = result.GetString(column_index + 4);
+		std::cout << "[DEBUG] AddColumn - Is nullable: " << is_nullable << std::endl;
+		
+		type_info.precision = result.IsNull(column_index + 5) ? -1 : result.GetInt64(column_index + 5);
+		type_info.scale = result.IsNull(column_index + 6) ? -1 : result.GetInt64(column_index + 6);
+		std::cout << "[DEBUG] AddColumn - Precision: " << type_info.precision << ", Scale: " << type_info.scale << std::endl;
 
-	auto column_type = ODBCTypes::TypeToLogicalType({context}, type_info);
-	ColumnDefinition column(std::move(column_name), std::move(column_type));
-	if (!default_value.empty()) {
-		auto expressions = Parser::ParseExpressionList(default_value);
-		if (expressions.empty()) {
-			throw InternalException("Expression list is empty");
+		// Convert to logical type
+		std::cout << "[DEBUG] AddColumn - Converting to logical type..." << std::endl;
+		auto column_type = ODBCTypes::TypeToLogicalType({context}, type_info);
+		std::cout << "[DEBUG] AddColumn - Logical type: " << column_type.ToString() << std::endl;
+		
+		ColumnDefinition column(std::move(column_name), std::move(column_type));
+		if (!default_value.empty()) {
+			auto expressions = Parser::ParseExpressionList(default_value);
+			if (expressions.empty()) {
+				throw InternalException("Expression list is empty");
+			}
+			column.SetDefaultValue(std::move(expressions[0]));
 		}
-		column.SetDefaultValue(std::move(expressions[0]));
+		
+		auto &create_info = *table_info.create_info;
+		if (is_nullable != "YES") {
+			auto column_idx = create_info.columns.LogicalColumnCount();
+			create_info.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(column_idx)));
+		}
+		
+		std::cout << "[DEBUG] AddColumn - Adding column to table..." << std::endl;
+		create_info.columns.AddColumn(std::move(column));
+		std::cout << "[DEBUG] AddColumn - Column added successfully" << std::endl;
+	} catch (const std::exception &e) {
+		std::cout << "[ERROR] AddColumn - Exception: " << e.what() << std::endl;
+		throw;
+	} catch (...) {
+		std::cout << "[ERROR] AddColumn - Unknown exception occurred" << std::endl;
+		throw;
 	}
-	auto &create_info = *table_info.create_info;
-	if (is_nullable != "YES") {
-		auto column_idx = create_info.columns.LogicalColumnCount();
-		create_info.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(column_idx)));
-	}
-	create_info.columns.AddColumn(std::move(column));
 }
 
 void ODBCTableSet::LoadEntries(ClientContext &context) {
+	// Debug: Print schema name being queried
+	std::cout << "[DEBUG] ODBCTableSet::LoadEntries - Querying schema: " << schema.name << std::endl;
+
+	// Use INFORMATION_SCHEMA for ODBC compatibility instead of SQL Server specific sys.* tables
 	auto query = StringUtil::Replace(R"(
 SELECT
-	   t.name AS table_name,
-	   c.name AS column_name,
-	   ty.name AS data_type,
-	   ty.name AS column_type,
-	   OBJECT_DEFINITION(c.default_object_id) AS column_default,
-	   CASE WHEN c.is_nullable = 1 THEN 'YES' ELSE 'NO' END AS is_nullable,
-	   c.precision AS numeric_precision,
-	   c.scale AS numeric_scale
-FROM sys.columns c
-JOIN sys.tables t ON c.object_id = t.object_id
-JOIN sys.schemas s ON t.schema_id = s.schema_id
-JOIN sys.types ty ON c.user_type_id = ty.user_type_id
-WHERE s.name = ${SCHEMA_NAME}
-ORDER BY t.name, c.column_id;
+    t.TABLE_NAME AS table_name,
+    c.COLUMN_NAME AS column_name,
+    c.DATA_TYPE AS data_type,
+    c.DATA_TYPE AS column_type,
+    c.COLUMN_DEFAULT AS column_default,
+    c.IS_NULLABLE AS is_nullable,
+    c.NUMERIC_PRECISION AS numeric_precision,
+    c.NUMERIC_SCALE AS numeric_scale
+FROM INFORMATION_SCHEMA.COLUMNS c
+JOIN INFORMATION_SCHEMA.TABLES t ON c.TABLE_NAME = t.TABLE_NAME AND c.TABLE_SCHEMA = t.TABLE_SCHEMA
+WHERE c.TABLE_SCHEMA = ${SCHEMA_NAME} AND t.TABLE_TYPE = 'BASE TABLE'
+ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION;
 )",
 	                                 "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
+
+	std::cout << "[DEBUG] Executing table query:\n" << query << std::endl;
 
 	auto &transaction = ODBCTransaction::Get(context, catalog);
 	auto result = transaction.Query(query);
@@ -75,41 +106,101 @@ ORDER BY t.name, c.column_id;
 	vector<unique_ptr<ODBCTableInfo>> tables;
 	unique_ptr<ODBCTableInfo> info;
 
+	// Debug: Check if we got any results
+	bool has_results = false;
+	int row_count = 0;
 	while (result->Next()) {
-		auto table_name = result->GetString(0);
-		if (!info || info->GetTableName() != table_name) {
-			if (info) {
-				tables.push_back(std::move(info));
+		try {
+			has_results = true;
+			row_count++;
+			auto table_name = result->GetString(0);
+			auto column_name = result->GetString(1);
+			auto data_type = result->GetString(2);
+			
+			if (row_count <= 10) { // Only print first 10 rows to avoid too much output
+				std::cout << "[DEBUG] Row " << row_count << ": table=" << table_name
+				          << ", column=" << column_name << ", type=" << data_type << std::endl;
 			}
-			info = make_uniq<ODBCTableInfo>(schema, table_name);
+			
+			if (!info || info->GetTableName() != table_name) {
+				if (info) {
+					tables.push_back(std::move(info));
+				}
+				info = make_uniq<ODBCTableInfo>(schema, table_name);
+				std::cout << "[DEBUG] Created new table info for: " << table_name << std::endl;
+			}
+			
+			std::cout << "[DEBUG] Processing column: " << column_name << " for table: " << table_name << std::endl;
+			AddColumn(context, *result, *info, 1);
+			std::cout << "[DEBUG] Successfully processed column: " << column_name << std::endl;
+		} catch (const std::exception &e) {
+			std::cout << "[ERROR] Error processing row " << row_count << ": " << e.what() << std::endl;
+			throw;
 		}
-		AddColumn(context, *result, *info, 1);
 	}
+	
 	if (info) {
 		tables.push_back(std::move(info));
 	}
+	
+	std::cout << "[DEBUG] Query result: " << row_count << " rows found, " << tables.size() << " tables created" << std::endl;
+	
+	// Debug output
+	if (!has_results) {
+		std::cout << "[DEBUG] No results from INFORMATION_SCHEMA query, trying alternative queries..." << std::endl;
+		
+		// Try alternative query to debug schema issue
+		auto debug_query1 = StringUtil::Replace(R"(
+SELECT name FROM sys.schemas ORDER BY name;
+)", "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
+		std::cout << "[DEBUG] Executing schema query:\n" << debug_query1 << std::endl;
+		auto debug_result1 = transaction.Query(debug_query1);
+		vector<string> available_schemas;
+		while (debug_result1->Next()) {
+			available_schemas.push_back(debug_result1->GetString(0));
+		}
+		std::cout << "[DEBUG] Available schemas: " << StringUtil::Join(available_schemas, ", ") << std::endl;
+		
+		// Try querying all tables without schema filter
+		auto debug_query2 = R"(
+SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+FROM INFORMATION_SCHEMA.TABLES
+ORDER BY TABLE_SCHEMA, TABLE_NAME;
+)";
+		std::cout << "[DEBUG] Executing all tables query:\n" << debug_query2 << std::endl;
+		auto debug_result2 = transaction.Query(debug_query2);
+		vector<string> all_tables;
+		while (debug_result2->Next()) {
+			auto table_schema = debug_result2->GetString(0);
+			auto table_name = debug_result2->GetString(1);
+			auto table_type = debug_result2->GetString(2);
+			all_tables.push_back(table_schema + "." + table_name + " (" + table_type + ")");
+		}
+		std::cout << "[DEBUG] All tables found: " << StringUtil::Join(all_tables, ", ") << std::endl;
+	}
+	
 	for (auto &tbl_info : tables) {
 		auto table_entry = make_uniq<ODBCTableEntry>(catalog, schema, *tbl_info);
 		CreateEntry(std::move(table_entry));
+		std::cout << "[DEBUG] Created table entry: " << tbl_info->GetTableName() << std::endl;
 	}
+	
+	std::cout << "[DEBUG] ODBCTableSet::LoadEntries completed, created " << tables.size() << " table entries" << std::endl;
 }
 
 string GetTableInfoQuery(const string &schema_name, const string &table_name) {
 	return StringUtil::Replace(StringUtil::Replace(R"(
 SELECT
-    c.name AS column_name,
-    ty.name AS data_type,
-    ty.name AS column_type,
-    OBJECT_DEFINITION(c.default_object_id) AS column_default,
-    CASE WHEN c.is_nullable = 1 THEN 'YES' ELSE 'NO' END AS is_nullable,
-    c.precision AS numeric_precision,
-    c.scale AS numeric_scale
-FROM sys.columns c
-JOIN sys.tables t ON c.object_id = t.object_id
-JOIN sys.schemas s ON t.schema_id = s.schema_id
-JOIN sys.types ty ON c.user_type_id = ty.user_type_id
-WHERE s.name = ${SCHEMA_NAME} AND t.name = ${TABLE_NAME}
-ORDER BY c.column_id;
+    c.COLUMN_NAME AS column_name,
+    c.DATA_TYPE AS data_type,
+    c.DATA_TYPE AS column_type,
+    c.COLUMN_DEFAULT AS column_default,
+    c.IS_NULLABLE AS is_nullable,
+    c.NUMERIC_PRECISION AS numeric_precision,
+    c.NUMERIC_SCALE AS numeric_scale
+FROM INFORMATION_SCHEMA.COLUMNS c
+WHERE c.TABLE_SCHEMA = ${SCHEMA_NAME} AND c.TABLE_NAME = ${TABLE_NAME}
+ORDER BY c.ORDINAL_POSITION;
 )",
 	                                               "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema_name)),
 	                           "${TABLE_NAME}", ODBCUtils::WriteLiteral(table_name));
