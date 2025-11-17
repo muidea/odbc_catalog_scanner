@@ -24,8 +24,7 @@ struct ODBCParameter {
 
 	ODBCParameter(const string &query, Value value_p);
 
-	// TODO: Implement ODBC parameter binding
-	// This is complex and requires mapping DuckDB types to ODBC SQL types
+	SQLRETURN BindParameter(SQLHSTMT stmt, SQLUSMALLINT param_idx);
 };
 
 } // namespace duckdb

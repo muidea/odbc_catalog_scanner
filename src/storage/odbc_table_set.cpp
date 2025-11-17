@@ -51,10 +51,21 @@ void ODBCTableSet::AddColumn(ClientContext &context, ODBCResult &result, ODBCTab
 
 void ODBCTableSet::LoadEntries(ClientContext &context) {
 	auto query = StringUtil::Replace(R"(
-SELECT table_name, column_name, data_type, column_type, column_default, is_nullable, numeric_precision, numeric_scale
-FROM information_schema.columns
-WHERE table_schema=${SCHEMA_NAME}
-ORDER BY table_name, ordinal_position;
+SELECT
+	   t.name AS table_name,
+	   c.name AS column_name,
+	   ty.name AS data_type,
+	   ty.name AS column_type,
+	   OBJECT_DEFINITION(c.default_object_id) AS column_default,
+	   CASE WHEN c.is_nullable = 1 THEN 'YES' ELSE 'NO' END AS is_nullable,
+	   c.precision AS numeric_precision,
+	   c.scale AS numeric_scale
+FROM sys.columns c
+JOIN sys.tables t ON c.object_id = t.object_id
+JOIN sys.schemas s ON t.schema_id = s.schema_id
+JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+WHERE s.name = ${SCHEMA_NAME}
+ORDER BY t.name, c.column_id;
 )",
 	                                 "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
 
@@ -85,10 +96,20 @@ ORDER BY table_name, ordinal_position;
 
 string GetTableInfoQuery(const string &schema_name, const string &table_name) {
 	return StringUtil::Replace(StringUtil::Replace(R"(
-SELECT column_name, data_type, column_type, column_default, is_nullable, numeric_precision, numeric_scale
-FROM information_schema.columns
-WHERE table_schema=${SCHEMA_NAME} AND table_name=${TABLE_NAME}
-ORDER BY table_name, ordinal_position;
+SELECT
+    c.name AS column_name,
+    ty.name AS data_type,
+    ty.name AS column_type,
+    OBJECT_DEFINITION(c.default_object_id) AS column_default,
+    CASE WHEN c.is_nullable = 1 THEN 'YES' ELSE 'NO' END AS is_nullable,
+    c.precision AS numeric_precision,
+    c.scale AS numeric_scale
+FROM sys.columns c
+JOIN sys.tables t ON c.object_id = t.object_id
+JOIN sys.schemas s ON t.schema_id = s.schema_id
+JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+WHERE s.name = ${SCHEMA_NAME} AND t.name = ${TABLE_NAME}
+ORDER BY c.column_id;
 )",
 	                                               "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema_name)),
 	                           "${TABLE_NAME}", ODBCUtils::WriteLiteral(table_name));

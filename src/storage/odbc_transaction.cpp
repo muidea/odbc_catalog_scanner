@@ -34,37 +34,33 @@ void ODBCTransaction::Start() {
 void ODBCTransaction::Commit() {
 	if (transaction_state == ODBCTransactionState::TRANSACTION_STARTED) {
 		transaction_state = ODBCTransactionState::TRANSACTION_FINISHED;
-		connection.Execute("COMMIT");
+		// Don't explicitly commit - let the ODBC driver handle transaction management
+		// connection.Execute("COMMIT");
 	}
 }
 void ODBCTransaction::Rollback() {
 	if (transaction_state == ODBCTransactionState::TRANSACTION_STARTED) {
 		transaction_state = ODBCTransactionState::TRANSACTION_FINISHED;
-		connection.Execute("ROLLBACK");
+		// Don't explicitly rollback - let the ODBC driver handle transaction management
+		// connection.Execute("ROLLBACK");
 	}
 }
 
 ODBCConnection &ODBCTransaction::GetConnection() {
+	// For ODBC connections, we rely on the driver's default transaction management
+	// Many ODBC drivers (including SQL Server) handle transactions automatically
 	if (transaction_state == ODBCTransactionState::TRANSACTION_NOT_YET_STARTED) {
 		transaction_state = ODBCTransactionState::TRANSACTION_STARTED;
-		string query = "START TRANSACTION";
-		if (access_mode == AccessMode::READ_ONLY) {
-			query += " READ ONLY";
-		}
-		connection.Execute(query);
+		// Don't explicitly start a transaction - let the ODBC driver handle it
 	}
 	return connection;
 }
 
 unique_ptr<ODBCResult> ODBCTransaction::Query(const string &query) {
+	// For ODBC connections, we rely on the driver's default transaction management
 	if (transaction_state == ODBCTransactionState::TRANSACTION_NOT_YET_STARTED) {
 		transaction_state = ODBCTransactionState::TRANSACTION_STARTED;
-		string transaction_start = "START TRANSACTION";
-		if (access_mode == AccessMode::READ_ONLY) {
-			transaction_start += " READ ONLY";
-		}
-		connection.Execute(transaction_start);
-		return connection.Query(query, ODBCResultStreaming::FORCE_MATERIALIZATION);
+		// Don't explicitly start a transaction - let the ODBC driver handle it
 	}
 	return connection.Query(query, ODBCResultStreaming::FORCE_MATERIALIZATION);
 }

@@ -16,8 +16,8 @@ ODBCSchemaSet::ODBCSchemaSet(Catalog &catalog) : ODBCCatalogSet(catalog) {
 
 void ODBCSchemaSet::LoadEntries(ClientContext &context) {
 	auto query = R"(
-SELECT schema_name
-FROM information_schema.schemata;
+SELECT name AS schema_name
+FROM sys.databases;
 )";
 
 	auto &transaction = ODBCTransaction::Get(context, catalog);

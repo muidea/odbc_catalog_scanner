@@ -23,7 +23,7 @@ struct ODBCField {
 	LogicalType duckdb_type;
 
 	vector<char> bind_buffer;
-	unsigned long bind_length = 0;
+	SQLLEN bind_length = 0;
 	bool bind_is_null = false;
 	bool bind_error = false;
 
@@ -40,7 +40,7 @@ struct ODBCBind {
 class ODBCResult {
 public:
 	ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBCTypeConfig type_config_p,
-	            idx_t affected_rows_p);
+	            idx_t affected_rows_p, SQLSMALLINT num_cols_p);
 
 	string GetString(idx_t col);
 	int32_t GetInt32(idx_t col);

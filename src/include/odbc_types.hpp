@@ -42,8 +42,12 @@ class ODBCTypes {
 public:
 	static LogicalType ToODBCType(const ODBCTypeConfig &type_config, const LogicalType &input);
 	static LogicalType TypeToLogicalType(const ODBCTypeConfig &type_config, const ODBCTypeData &input);
-	static LogicalType FieldToLogicalType(const ODBCTypeConfig &type_config, void *field);
+	static LogicalType FieldToLogicalType(const ODBCTypeConfig &type_config, SQLSMALLINT data_type, SQLULEN col_size, SQLSMALLINT decimal_digits);
 	static string TypeToString(const LogicalType &input);
+	
+	// ODBC type conversion utilities
+	static SQLSMALLINT GetCType(SQLSMALLINT sql_type);
+	static LogicalType ODBCToLogicalType(const ODBCTypeConfig &type_config, SQLSMALLINT data_type, SQLULEN column_size, SQLSMALLINT decimal_digits);
 };
 
 } // namespace duckdb

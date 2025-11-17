@@ -1,4 +1,5 @@
 #include "odbc_parameter.hpp"
+#include "odbc_types.hpp"
 
 #include "duckdb/common/types/datetime.hpp"
 #include "duckdb/common/types/time.hpp"
@@ -145,6 +146,45 @@ ODBCParameter::ODBCParameter(const string &query, Value value_p) : value(std::mo
 		break;
 	default:
 		throw IOException("Unsupported parameters type: \"%s\", ODBC query \"%s\"", value.type(), query.c_str());
+	}
+}
+
+SQLRETURN ODBCParameter::BindParameter(SQLHSTMT stmt, SQLUSMALLINT param_idx) {
+	if (value.IsNull()) {
+		SQLLEN null_indicator = SQL_NULL_DATA;
+		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT,
+		                       SQL_C_DEFAULT, SQL_UNKNOWN_TYPE, 0, 0,
+		                       nullptr, 0, &null_indicator);
+	}
+
+	switch (buffer_type) {
+	case SQL_TINYINT:
+	case SQL_SMALLINT:
+	case SQL_INTEGER:
+	case SQL_BIGINT:
+	case SQL_REAL:
+	case SQL_DOUBLE:
+	case SQL_TYPE_DATE:
+	case SQL_TYPE_TIME:
+	case SQL_TYPE_TIMESTAMP:
+		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT,
+		                       ODBCTypes::GetCType(buffer_type), buffer_type,
+		                       bind_buffer.size(), 0,
+		                       bind_buffer.data(), bind_buffer.size(),
+		                       &bind_length);
+	case SQL_VARCHAR: {
+		string str = value.ToString();
+		bind_buffer.resize(str.size() + 1);
+		std::memcpy(bind_buffer.data(), str.c_str(), str.size() + 1);
+		bind_length = str.size();
+		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT,
+		                       SQL_C_CHAR, SQL_VARCHAR,
+		                       str.size(), 0,
+		                       bind_buffer.data(), bind_buffer.size(),
+		                       &bind_length);
+	}
+	default:
+		return SQL_ERROR;
 	}
 }
 

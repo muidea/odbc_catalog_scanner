@@ -1,4 +1,5 @@
 #include "odbc_result.hpp"
+#include "odbc_connection.hpp"
 
 #include "duckdb/common/types/datetime.hpp"
 #include "duckdb/common/types/time.hpp"
@@ -11,36 +12,39 @@ namespace duckdb {
 
 static const size_t DEFAULT_BIND_BUFFER_SIZE = 64;
 
-static size_t GetBufferSize(SQLSMALLINT sql_type, size_t max_len, const ODBCTypeConfig &type_config) {
-	switch (sql_type) {
+static size_t GetBufferSize(SQLSMALLINT odbc_type, SQLULEN column_size, const ODBCTypeConfig &type_config) {
+	switch (odbc_type) {
 	case SQL_TINYINT:
+	case SQL_BIT:
 		return sizeof(int8_t);
 	case SQL_SMALLINT:
 		return sizeof(int16_t);
 	case SQL_INTEGER:
 		return sizeof(int32_t);
-	case SQL_BIGINT:
-		return sizeof(int64_t);
 	case SQL_REAL:
 		return sizeof(float);
+	case SQL_FLOAT:
 	case SQL_DOUBLE:
 		return sizeof(double);
+	case SQL_BIGINT:
+		return sizeof(int64_t);
 	case SQL_TYPE_DATE:
 	case SQL_TYPE_TIME:
 	case SQL_TYPE_TIMESTAMP:
-		return sizeof(SQL_DATE_STRUCT); // Use SQL_DATE_STRUCT as base size
+		return sizeof(SQL_TIMESTAMP_STRUCT);
+	case SQL_DECIMAL:
+	case SQL_NUMERIC:
+		return 64; // Large enough for decimal strings
 	default:
-		return max_len > 0 ? max_len : DEFAULT_BIND_BUFFER_SIZE;
+		return column_size > 0 ? column_size : DEFAULT_BIND_BUFFER_SIZE;
 	}
 }
 
 ODBCField::ODBCField(void *field_info, LogicalType duckdb_type_p, const ODBCTypeConfig &type_config)
     : duckdb_type(std::move(duckdb_type_p)) {
-	// TODO: Extract field information from ODBC
-	// For now, we'll use basic defaults
-	this->odbc_type = SQL_VARCHAR;
-	size_t buf_size = GetBufferSize(this->odbc_type, 0, type_config);
-	bind_buffer.resize(buf_size);
+	// For ODBC, we need to extract field information differently
+	// This will be implemented in the ReadFields function
+	bind_buffer.resize(DEFAULT_BIND_BUFFER_SIZE);
 }
 
 void ODBCField::ResetBind() {
@@ -51,14 +55,10 @@ void ODBCField::ResetBind() {
 
 static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, const ODBCTypeConfig &type_config) {
 	vector<ODBCField> fields;
-	
 	SQLSMALLINT num_cols;
-	SQLRETURN ret = SQLNumResultCols(stmt, &num_cols);
-	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
-		throw IOException("Failed to get number of result columns for ODBC query \"%s\"", query.c_str());
-	}
+	SQLRETURN retcode = SQLNumResultCols(stmt, &num_cols);
 	
-	if (num_cols == 0) {
+	if (!SQL_SUCCEEDED(retcode) || num_cols == 0) {
 		return fields;
 	}
 
@@ -66,81 +66,45 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 	for (SQLSMALLINT i = 0; i < num_cols; i++) {
 		SQLCHAR col_name[256];
 		SQLSMALLINT name_len, data_type, decimal_digits, nullable;
-		SQLULEN col_size;
+		SQLULEN column_size;
 		
-		ret = SQLDescribeCol(stmt, i + 1, col_name, sizeof(col_name), &name_len, 
-							&data_type, &col_size, &decimal_digits, &nullable);
-		if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
-			throw IOException("Failed to describe column %d for ODBC query \"%s\"", i, query.c_str());
+		retcode = SQLDescribeCol(stmt, i + 1, col_name, sizeof(col_name), &name_len,
+		                        &data_type, &column_size, &decimal_digits, &nullable);
+		if (!SQL_SUCCEEDED(retcode)) {
+			throw IOException("Failed to describe column %d for ODBC query \"%s\"\n", i + 1, query.c_str());
 		}
 		
-		// TODO: Map ODBC data type to DuckDB logical type
-		// For now, use VARCHAR for everything
-		LogicalType ltype = LogicalType::VARCHAR;
+		// Convert ODBC type to logical type
+		LogicalType ltype = ODBCTypes::ODBCToLogicalType(type_config, data_type, column_size, decimal_digits);
 		
+		// Create field with placeholder information
 		ODBCField field(nullptr, std::move(ltype), type_config);
-		field.name = string((char*)col_name, name_len);
+		field.name = string(reinterpret_cast<char*>(col_name), name_len);
 		field.odbc_type = data_type;
+		
+		// Resize buffer based on ODBC type
+		size_t buf_size = GetBufferSize(data_type, column_size, type_config);
+		field.bind_buffer.resize(buf_size);
+		
 		fields.emplace_back(std::move(field));
 	}
 
 	return fields;
 }
 
-static void InitODBCBinds(SQLHSTMT stmt, vector<ODBCField> &fields, 
-                         vector<SQLPOINTER> &bind_buffers,
-                         vector<SQLLEN> &bind_lengths,
-                         vector<SQLSMALLINT> &bind_types) {
-	SQLRETURN ret;
-	
-	for (size_t i = 0; i < fields.size(); i++) {
-		auto &f = fields[i];
+static void InitBinds(vector<ODBCField> &fields, SQLHSTMT stmt) {
+	for (SQLSMALLINT i = 0; i < fields.size(); i++) {
+		ODBCField &f = fields[i];
 		
-		// Allocate buffer for this column
-		size_t buf_size = GetBufferSize(f.odbc_type, 0, ODBCTypeConfig());
-		f.bind_buffer.resize(buf_size);
+		SQLRETURN retcode = SQLBindCol(stmt, i + 1,
+		                              ODBCTypes::GetCType(f.odbc_type),
+		                              f.bind_buffer.data(),
+		                              f.bind_buffer.size(),
+		                              &f.bind_length);
 		
-		SQLPOINTER buffer_ptr = f.bind_buffer.data();
-		SQLLEN indicator = 0;
-		SQLSMALLINT target_type;
-		
-		// Map ODBC type to appropriate target type
-		switch (f.odbc_type) {
-		case SQL_TINYINT:
-		case SQL_SMALLINT:
-		case SQL_INTEGER:
-		case SQL_BIGINT:
-			target_type = SQL_C_SBIGINT;
-			break;
-		case SQL_REAL:
-			target_type = SQL_C_FLOAT;
-			break;
-		case SQL_DOUBLE:
-			target_type = SQL_C_DOUBLE;
-			break;
-		case SQL_TYPE_DATE:
-			target_type = SQL_C_TYPE_DATE;
-			break;
-		case SQL_TYPE_TIME:
-			target_type = SQL_C_TYPE_TIME;
-			break;
-		case SQL_TYPE_TIMESTAMP:
-			target_type = SQL_C_TYPE_TIMESTAMP;
-			break;
-		default:
-			target_type = SQL_C_CHAR;
-			buffer_ptr = f.bind_buffer.data();
-			break;
+		if (!SQL_SUCCEEDED(retcode)) {
+			throw IOException("Failed to bind column %d for ODBC query\n", i + 1);
 		}
-		
-		ret = SQLBindCol(stmt, i + 1, target_type, buffer_ptr, buf_size, &indicator);
-		if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
-			throw IOException("Failed to bind column %zu", i);
-		}
-		
-		bind_buffers.push_back(buffer_ptr);
-		bind_lengths.push_back(indicator);
-		bind_types.push_back(target_type);
 	}
 }
 
@@ -150,30 +114,65 @@ static vector<LogicalType> CreateChunkTypes(vector<ODBCField> &fields, const ODB
 		ODBCField &f = fields[c];
 		LogicalType &lt = f.duckdb_type;
 		
-		// TODO: Implement proper type mapping from ODBC to DuckDB
-		// For now, use VARCHAR for everything
-		ltypes.push_back(LogicalType::VARCHAR);
+		// For ODBC, we use the already converted logical types
+		// Additional type adjustments can be made here if needed
+		ltypes.push_back(lt);
 	}
 	return ltypes;
 }
 
 ODBCResult::ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBCTypeConfig type_config_p,
-                         idx_t affected_rows_p)
+                         idx_t affected_rows_p, SQLSMALLINT num_cols_p)
     : query(query_p), stmt(std::move(stmt_p)), type_config(std::move(type_config_p)), affected_rows(affected_rows_p) {
+	// For SELECT queries, affected_rows should be -1 and we should have columns
+	// For DML queries, affected_rows will be >= 0 and we may not have columns
 	if (affected_rows != static_cast<idx_t>(-1)) {
+		// This is a DML query (INSERT, UPDATE, DELETE) that doesn't return a result set
 		return;
 	}
 	
+	// For SELECT queries, we need to read the fields and initialize the data chunk
 	this->fields = ReadFields(query, stmt.get(), type_config);
-	InitODBCBinds(stmt.get(), fields, bind_buffers, bind_lengths, bind_types);
-
-	auto ltypes = CreateChunkTypes(fields, type_config);
-	this->data_chunk.Initialize(Allocator::DefaultAllocator(), ltypes);
+	if (fields.empty()) {
+		// If ReadFields returned empty, try to get column count again
+		SQLSMALLINT num_cols;
+		SQLRETURN retcode = SQLNumResultCols(stmt.get(), &num_cols);
+		if (SQL_SUCCEEDED(retcode) && num_cols > 0) {
+			this->fields = ReadFields(query, stmt.get(), type_config);
+		}
+	}
+	
+	if (!fields.empty()) {
+		InitBinds(fields, stmt.get());
+		auto ltypes = CreateChunkTypes(fields, type_config);
+		this->data_chunk.Initialize(Allocator::DefaultAllocator(), ltypes);
+	}
 }
 
 void ODBCResult::HandleTruncatedData() {
-	// TODO: Implement truncated data handling for ODBC
-	// This is complex and driver-specific
+	// For ODBC, truncated data handling is different
+	// We rely on SQLGetData for large data or use larger buffers
+	// This is a simplified implementation
+	for (size_t i = 0; i < fields.size(); i++) {
+		ODBCField &f = fields[i];
+		
+		if (f.bind_length == SQL_NO_TOTAL || f.bind_length > f.bind_buffer.size()) {
+			// Data was truncated, we need to handle this case
+			// For now, we'll just resize the buffer and re-bind
+			size_t new_size = f.bind_length > 0 ? f.bind_length : f.bind_buffer.size() * 2;
+			f.bind_buffer.resize(new_size);
+			
+			SQLRETURN retcode = SQLBindCol(stmt.get(), i + 1,
+			                              ODBCTypes::GetCType(f.odbc_type),
+			                              f.bind_buffer.data(),
+			                              f.bind_buffer.size(),
+			                              &f.bind_length);
+			
+			if (!SQL_SUCCEEDED(retcode)) {
+				throw IOException("Failed to re-bind column %zu for ODBC query \"%s\"\n", i, query.c_str());
+			}
+		}
+	}
 }
 
 DataChunk &ODBCResult::NextChunk() {
@@ -201,24 +200,15 @@ bool ODBCResult::FetchNext() {
 		f.ResetBind();
 	}
 
-	SQLRETURN ret = SQLFetch(stmt.get());
-	
-	if (ret == SQL_ERROR) {
-		SQLCHAR sqlstate[6];
-		SQLINTEGER native_error;
-		SQLCHAR message_text[SQL_MAX_MESSAGE_LENGTH];
-		SQLSMALLINT text_length;
-		
-		SQLGetDiagRec(SQL_HANDLE_STMT, stmt.get(), 1, sqlstate, &native_error, 
-			message_text, SQL_MAX_MESSAGE_LENGTH, &text_length);
-		
-		throw IOException("Failed to fetch result row for ODBC query \"%s\": %s", 
-			query.c_str(), (char*)message_text);
+	SQLRETURN retcode = SQLFetch(stmt.get());
+
+	if (retcode == SQL_ERROR) {
+		throw IOException("Failed to fetch result row for ODBC query \"%s\"\n", query.c_str());
 	}
 
 	HandleTruncatedData();
 
-	return ret == SQL_SUCCESS || ret == SQL_SUCCESS_WITH_INFO;
+	return retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO;
 }
 
 bool ODBCResult::Next() {
@@ -233,15 +223,14 @@ bool ODBCResult::Next() {
 
 void ODBCResult::CheckColumnIdx(idx_t col) {
 	if (col >= data_chunk.ColumnCount()) {
-		throw IOException("Column: %zu out of range of field count: %zu, ODBC query \"%s\"", 
-			col, data_chunk.ColumnCount(), query.c_str());
+		throw IOException("Column: %zu out of range of field count: %zu, ODBC query \"%s\"\n", col,
+		                  data_chunk.ColumnCount(), query.c_str());
 	}
 }
 
 void ODBCResult::CheckNotNull(idx_t col) {
 	if (IsNull(col)) {
-		throw InternalException("Get called for a NULL value, column: %zu, ODBC query \"%s\"", 
-			col, query.c_str());
+		throw InternalException("Get called for a NULL value, column: %zu, ODBC query \"%s\"\n", col, query.c_str());
 	}
 }
 
@@ -254,8 +243,8 @@ string ODBCResult::GetString(idx_t col) {
 		string_t &st = data[row_idx];
 		return string(st.GetData(), st.GetSize());
 	}
-	throw InternalException("Get called for a String type, actual type: \"%s\", column: %zu, ODBC query \"%s\"",
-		f.duckdb_type.ToString(), col, query.c_str());
+	throw InternalException("Get called for a String type, actual type: \"%s\", column: %zu, ODBC query \"%s\"\n",
+	                        f.duckdb_type.ToString(), col, query.c_str());
 }
 
 int32_t ODBCResult::GetInt32(idx_t col) {
@@ -269,8 +258,8 @@ int32_t ODBCResult::GetInt32(idx_t col) {
 		uint32_t *data = FlatVector::GetData<uint32_t>(vec);
 		return static_cast<int32_t>(data[row_idx]);
 	}
-	throw InternalException("Get called for an Int32 type, actual type: \"%s\", column: %zu, ODBC query \"%s\"",
-		f.duckdb_type.ToString(), col, query.c_str());
+	throw InternalException("Get called for an Int32 type, actual type: \"%s\", column: %zu, ODBC query \"%s\"\n",
+	                        f.duckdb_type.ToString(), col, query.c_str());
 }
 
 int64_t ODBCResult::GetInt64(idx_t col) {
@@ -283,9 +272,18 @@ int64_t ODBCResult::GetInt64(idx_t col) {
 	} else if (f.duckdb_type.id() == LogicalTypeId::UBIGINT) {
 		uint64_t *data = FlatVector::GetData<uint64_t>(vec);
 		return static_cast<int64_t>(data[row_idx]);
+	} else if (f.duckdb_type.id() == LogicalTypeId::DOUBLE) {
+		if (vec.GetType().id() == LogicalTypeId::DOUBLE) {
+			double *data = FlatVector::GetData<double>(vec);
+			return static_cast<uint64_t>(data[row_idx]);
+		} else if (vec.GetType().id() == LogicalTypeId::VARCHAR) {
+			string_t *data = FlatVector::GetData<string_t>(vec);
+			string_t st = data[row_idx];
+			return atoll(st.GetData());
+		}
 	}
-	throw InternalException("Get called for an Int64 type, actual type: \"%s\", column: %zu, ODBC query \"%s\"",
-		f.duckdb_type.ToString(), col, query.c_str());
+	throw InternalException("Get called for an Int64 type, actual type: \"%s\", column: %zu, ODBC query \"%s\"\n",
+	                        f.duckdb_type.ToString(), col, query.c_str());
 }
 
 bool ODBCResult::IsNull(idx_t col) {
@@ -297,7 +295,7 @@ bool ODBCResult::IsNull(idx_t col) {
 idx_t ODBCResult::AffectedRows() {
 	if (affected_rows == idx_t(-1)) {
 		throw InternalException("ODBCResult::AffectedRows called for result "
-		                        "that didn't affect any rows, query \"%s\"",
+		                        "that didn't affect any rows, query \"%s\"\n",
 		                        query.c_str());
 	}
 	return affected_rows;
@@ -307,7 +305,27 @@ const vector<ODBCField> &ODBCResult::Fields() {
 	return fields;
 }
 
+// ODBC TIME values use SQL_TIMESTAMP_STRUCT
+static void WriteTimeAsString(ODBCField &f, Vector &vec, idx_t row) {
+	SQL_TIMESTAMP_STRUCT *ts = reinterpret_cast<SQL_TIMESTAMP_STRUCT *>(f.bind_buffer.data());
+	if (ts->hour == 0 && ts->minute == 0 && ts->second == 0) {
+		FlatVector::SetNull(vec, row, true);
+		return;
+	}
+	dtime_t tm = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
+	string time_str = Time::ToString(tm);
+	string_t st(time_str.c_str(), time_str.length());
+	auto data = FlatVector::GetData<string_t>(vec);
+	data[row] = StringVector::AddStringOrBlob(vec, std::move(st));
+}
+
 static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
+	if (f.odbc_type == SQL_TYPE_TIME) {
+		WriteTimeAsString(f, vec, row);
+		return;
+	}
+
+	D_ASSERT(f.bind_buffer.size() >= f.bind_length);
 	string_t st(f.bind_buffer.data(), f.bind_length);
 	auto data = FlatVector::GetData<string_t>(vec);
 	data[row] = StringVector::AddStringOrBlob(vec, std::move(st));
@@ -316,11 +334,24 @@ static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
 static void WriteBool(ODBCField &f, Vector &vec, idx_t row) {
 	D_ASSERT(f.bind_buffer.size() >= sizeof(int8_t));
 	auto data = FlatVector::GetData<bool>(vec);
-	
-	// Simple boolean conversion - check if first character is non-zero
+	if (f.odbc_type == SQL_TINYINT || f.odbc_type == SQL_BIT) {
+		int8_t val = *reinterpret_cast<int8_t *>(f.bind_buffer.data());
+		data[row] = val != 0;
+		return;
+	}
+	if (f.bind_length == 0) {
+		throw BinderException("Failed to cast ODBC boolean - expected 1 byte "
+		                      "element but got element of size %d\n",
+		                      f.bind_length);
+	}
+	// For ODBC, boolean values can be represented in various ways
+	// We check the first character for common boolean representations
 	char first = f.bind_buffer[0];
-	auto data_ptr = FlatVector::GetData<bool>(vec);
-	data_ptr[row] = (first != '\0' && first != '0');
+	if (first == '\0' || first == '0' || first == 'f' || first == 'F' || first == '-') {
+		data[row] = false;
+	} else {
+		data[row] = true;
+	}
 }
 
 template <typename NUM_TYPE>
@@ -329,6 +360,59 @@ static void WriteNumber(ODBCField &f, Vector &vec, idx_t row) {
 	NUM_TYPE num = *reinterpret_cast<NUM_TYPE *>(f.bind_buffer.data());
 	auto data = FlatVector::GetData<NUM_TYPE>(vec);
 	data[row] = num;
+}
+
+static void WriteDateTime(ODBCField &f, Vector &vec, idx_t row) {
+	D_ASSERT(f.bind_buffer.size() >= sizeof(SQL_TIMESTAMP_STRUCT));
+	SQL_TIMESTAMP_STRUCT *ts = reinterpret_cast<SQL_TIMESTAMP_STRUCT *>(f.bind_buffer.data());
+	
+	// Check for null/zero values
+	if ((ts->year == 0 && ts->month == 0 && ts->day == 0 && ts->hour == 0 && ts->minute == 0 && ts->second == 0 &&
+	     ts->fraction == 0) ||
+	    (f.odbc_type == SQL_TYPE_TIME && ts->hour == 0 && ts->minute == 0 && ts->second == 0) ||
+	    (f.odbc_type == SQL_TYPE_DATE && ts->year == 0 && ts->month == 0 && ts->day == 0)) {
+		FlatVector::SetNull(vec, row, true);
+		return;
+	}
+
+	switch (vec.GetType().id()) {
+	case LogicalTypeId::DATE: {
+		date_t val = Date::FromDate(ts->year, ts->month, ts->day);
+		date_t *data = FlatVector::GetData<date_t>(vec);
+		data[row] = val;
+		break;
+	}
+	case LogicalTypeId::TIME: {
+		if (ts->hour < 0 || ts->hour > 24 ||
+		    (ts->hour == 24 && (ts->minute > 0 || ts->second > 0 || ts->fraction > 0))) {
+			throw BinderException("time field value out of range, hour value: " + std::to_string(ts->hour));
+		}
+		dtime_t val = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
+		dtime_t *data = FlatVector::GetData<dtime_t>(vec);
+		data[row] = val;
+		break;
+	}
+	case LogicalTypeId::TIMESTAMP: {
+		date_t dt = Date::FromDate(ts->year, ts->month, ts->day);
+		dtime_t tm = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
+		timestamp_t val = Timestamp::FromDatetime(dt, tm);
+		timestamp_t *data = FlatVector::GetData<timestamp_t>(vec);
+		data[row] = val;
+		break;
+	}
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		// For ODBC, timezone information is not directly available in SQL_TIMESTAMP_STRUCT
+		// We assume local time and convert accordingly
+		date_t dt = Date::FromDate(ts->year, ts->month, ts->day);
+		dtime_t tm = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
+		timestamp_t val = Timestamp::FromDatetime(dt, tm);
+		timestamp_tz_t *data = FlatVector::GetData<timestamp_tz_t>(vec);
+		data[row] = timestamp_tz_t(val.value);
+		break;
+	}
+	default:
+		throw InternalException("Unsupported date/time type: " + vec.GetType().ToString());
+	}
 }
 
 void ODBCResult::WriteToChunk(idx_t row) {
@@ -341,9 +425,66 @@ void ODBCResult::WriteToChunk(idx_t row) {
 			continue;
 		}
 
-		// For now, write everything as string
-		// TODO: Implement proper type conversion based on ODBC type
-		WriteString(f, vec, row);
+		switch (vec.GetType().id()) {
+		case LogicalTypeId::BOOLEAN: {
+			WriteBool(f, vec, row);
+			break;
+		}
+		case LogicalTypeId::TINYINT: {
+			WriteNumber<int8_t>(f, vec, row);
+			break;
+		}
+		case LogicalTypeId::UTINYINT: {
+			WriteNumber<uint8_t>(f, vec, row);
+			break;
+		}
+		case LogicalTypeId::SMALLINT: {
+			WriteNumber<int16_t>(f, vec, row);
+			break;
+		}
+		case LogicalTypeId::USMALLINT: {
+			WriteNumber<uint16_t>(f, vec, row);
+			break;
+		}
+		case LogicalTypeId::INTEGER: {
+			WriteNumber<int32_t>(f, vec, row);
+			break;
+		}
+		case LogicalTypeId::UINTEGER: {
+			WriteNumber<uint32_t>(f, vec, row);
+			break;
+		}
+		case LogicalTypeId::BIGINT: {
+			WriteNumber<int64_t>(f, vec, row);
+			break;
+		}
+		case LogicalTypeId::UBIGINT: {
+			WriteNumber<uint64_t>(f, vec, row);
+			break;
+		}
+		case LogicalTypeId::FLOAT: {
+			WriteNumber<float>(f, vec, row);
+			break;
+		}
+		case LogicalTypeId::DOUBLE: {
+			if (f.odbc_type == SQL_DOUBLE || f.odbc_type == SQL_FLOAT) {
+				WriteNumber<double>(f, vec, row);
+			} else {
+				WriteString(f, vec, row);
+			}
+			break;
+		}
+		case LogicalTypeId::DATE:
+		case LogicalTypeId::TIME:
+		case LogicalTypeId::TIMESTAMP:
+		case LogicalTypeId::TIMESTAMP_TZ: {
+			WriteDateTime(f, vec, row);
+			break;
+		}
+		default: {
+			WriteString(f, vec, row);
+		}
+		}
 	}
 }
 
