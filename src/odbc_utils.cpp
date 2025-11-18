@@ -180,8 +180,8 @@ SQLHDBC ODBCUtils::Connect(const string &dsn) {
 	}
 
 	ODBCConnectionParameters config;
-	unordered_set<string> unused;
-	std::tie(config, unused) = ParseConnectionParameters(dsn);
+	unordered_set<string> unused_params;
+	std::tie(config, unused_params) = ParseConnectionParameters(dsn);
 
 	// Build connection string
 	string connection_string;

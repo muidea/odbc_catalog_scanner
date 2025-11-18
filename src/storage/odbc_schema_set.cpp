@@ -22,7 +22,6 @@ FROM INFORMATION_SCHEMA.SCHEMATA
 ORDER BY SCHEMA_NAME;
 )";
 
-	std::cout << "[DEBUG] ODBCSchemaSet::LoadEntries - Executing schema query:\n" << query << std::endl;
 
 	auto &transaction = ODBCTransaction::Get(context, catalog);
 	auto result = transaction.Query(query);
@@ -37,28 +36,23 @@ ORDER BY SCHEMA_NAME;
 		auto schema = make_uniq<ODBCSchemaEntry>(catalog, info);
 		CreateEntry(std::move(schema));
 		schema_names.push_back(info.schema);
-		std::cout << "[DEBUG] ODBCSchemaSet::LoadEntries - Found schema: " << info.schema
-		          << " (internal: " << info.internal << ")" << std::endl;
 	}
 	
-	std::cout << "[DEBUG] ODBCSchemaSet::LoadEntries - Found " << schema_count << " schemas" << std::endl;
 	
 	// Print usage information for the user
-	if (!schema_names.empty()) {
-		std::cout << "[INFO] Available schemas: " << StringUtil::Join(schema_names, ", ") << std::endl;
-		std::cout << "[INFO] To use a specific schema, run: USE schema_name (e.g., USE dbo)" << std::endl;
-	}
+	//if (!schema_names.empty()) {
+	//	// User-friendly schema information is now handled at a higher level
+	//	// This avoids cluttering the output with debug information
+	//}
 	
 	// If no schemas found with INFORMATION_SCHEMA, try alternative methods
 	if (schema_count == 0) {
-		std::cout << "[DEBUG] ODBCSchemaSet::LoadEntries - No schemas found with INFORMATION_SCHEMA, trying alternative..." << std::endl;
 		
 		// Try SQL Server specific query as fallback
 		auto fallback_query = R"(
 SELECT name AS schema_name
 FROM sys.databases;
 )";
-		std::cout << "[DEBUG] ODBCSchemaSet::LoadEntries - Trying fallback query:\n" << fallback_query << std::endl;
 		auto fallback_result = transaction.Query(fallback_query);
 		while (fallback_result->Next()) {
 			schema_count++;
@@ -68,10 +62,7 @@ FROM sys.databases;
 			auto schema = make_uniq<ODBCSchemaEntry>(catalog, info);
 			CreateEntry(std::move(schema));
 			schema_names.push_back(info.schema);
-			std::cout << "[DEBUG] ODBCSchemaSet::LoadEntries - Found schema (fallback): " << info.schema
-			          << " (internal: " << info.internal << ")" << std::endl;
 		}
-		std::cout << "[DEBUG] ODBCSchemaSet::LoadEntries - Fallback found " << schema_count << " schemas" << std::endl;
 	}
 }
 

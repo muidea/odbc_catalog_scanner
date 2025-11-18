@@ -29,6 +29,7 @@ void ODBCTransactionManager::RollbackTransaction(Transaction &transaction) {
 	try {
 		odbc_transaction.Rollback();
 	} catch (...) {
+		// Ignore exceptions during rollback - transaction is being rolled back anyway
 	}
 	lock_guard<mutex> l(transaction_lock);
 	transactions.erase(transaction);

@@ -20,8 +20,8 @@ ODBCCatalog::ODBCCatalog(AttachedDatabase &db_p, string connection_string_p, str
     : Catalog(db_p), connection_string(std::move(connection_string_p)), attach_path(std::move(attach_path_p)),
       access_mode(access_mode), schemas(*this) {
 	ODBCConnectionParameters connection_params;
-	unordered_set<string> unused;
-	std::tie(connection_params, unused) = ODBCUtils::ParseConnectionParameters(connection_string);
+	unordered_set<string> unused_params;
+	std::tie(connection_params, unused_params) = ODBCUtils::ParseConnectionParameters(connection_string);
 	default_schema = connection_params.database;
 	// try to connect
 	ODBCTypeConfig type_config;
@@ -381,10 +381,10 @@ string ODBCCatalog::GetConnectionString(ClientContext &context, const string &at
 		const auto &kv_secret = dynamic_cast<const KeyValueSecret &>(*secret_entry->secret);
 
 		// Parse the original connection string to find which parameters are already
-		// set
-		ODBCConnectionParameters unused;
+		// Parse the original connection string to find which parameters are already set
+		ODBCConnectionParameters unused_config;
 		unordered_set<string> existing_params;
-		std::tie(unused, existing_params) = ODBCUtils::ParseConnectionParameters(connection_string);
+		std::tie(unused_config, existing_params) = ODBCUtils::ParseConnectionParameters(connection_string);
 
 		// Build a new connection string with parameters from the secret that don't
 		// already exist in the original connection string
