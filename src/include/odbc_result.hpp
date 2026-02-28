@@ -40,7 +40,8 @@ struct ODBCBind {
 class ODBCResult {
 public:
 	ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBCTypeConfig type_config_p,
-	            idx_t affected_rows_p, SQLSMALLINT num_cols_p);
+	            idx_t affected_rows_p, SQLSMALLINT num_cols_p, shared_ptr<ODBCConnection> connection_p);
+	~ODBCResult();
 
 	string GetString(idx_t col);
 	int32_t GetInt32(idx_t col);
@@ -57,6 +58,7 @@ private:
 	ODBCStatementPtr stmt;
 	ODBCTypeConfig type_config;
 	idx_t affected_rows = static_cast<idx_t>(-1);
+	shared_ptr<ODBCConnection> connection;
 
 	vector<ODBCField> fields;
 	vector<SQLPOINTER> bind_buffers;
@@ -65,6 +67,7 @@ private:
 
 	DataChunk data_chunk;
 	idx_t row_idx = static_cast<idx_t>(-1);
+	bool connection_released = false;
 
 	bool FetchNext();
 	void HandleTruncatedData();
@@ -72,6 +75,9 @@ private:
 	void CheckColumnIdx(idx_t col);
 	void CheckNotNull(idx_t col);
 	void CheckType(idx_t col, LogicalTypeId type_id);
+	
+	// 清理ODBC状态
+	void CleanupODBCState();
 };
 
 } // namespace duckdb

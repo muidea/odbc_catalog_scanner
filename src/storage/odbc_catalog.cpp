@@ -18,14 +18,15 @@ namespace duckdb {
 ODBCCatalog::ODBCCatalog(AttachedDatabase &db_p, string connection_string_p, string attach_path_p,
                            AccessMode access_mode)
     : Catalog(db_p), connection_string(std::move(connection_string_p)), attach_path(std::move(attach_path_p)),
-      access_mode(access_mode), schemas(*this) {
+      access_mode(access_mode), schemas(*this), connection_pool(*this) {
 	ODBCConnectionParameters connection_params;
 	unordered_set<string> unused_params;
 	std::tie(connection_params, unused_params) = ODBCUtils::ParseConnectionParameters(connection_string);
 	default_schema = connection_params.database;
 	// try to connect
-	ODBCTypeConfig type_config;
+	ODBCTypeConfig type_config; // 使用默认构造函数
 	auto connection = ODBCConnection::Open(type_config, connection_string);
+	// 连接创建成功，但这里不需要存储它，因为每个事务会创建自己的连接
 }
 
 ODBCCatalog::~ODBCCatalog() = default;

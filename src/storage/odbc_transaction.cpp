@@ -12,8 +12,13 @@ namespace duckdb {
 
 ODBCTransaction::ODBCTransaction(ODBCCatalog &odbc_catalog, TransactionManager &manager, ClientContext &context)
     : Transaction(manager, context),
-      connection(ODBCConnection::Open(ODBCTypeConfig(context), odbc_catalog.connection_string)),
+      odbc_catalog(odbc_catalog),
       access_mode(odbc_catalog.access_mode) {
+	// 从连接池获取连接
+	if (!odbc_catalog.GetConnectionPool().TryGetConnection(pool_connection)) {
+		throw IOException("Failed to get connection from ODBC connection pool");
+	}
+	
 	string time_zone;
 	{
 		Value odbc_session_time_zone;
@@ -22,7 +27,7 @@ ODBCTransaction::ODBCTransaction(ODBCCatalog &odbc_catalog, TransactionManager &
 		}
 	}
 	if (!time_zone.empty()) {
-		connection.Execute("SET TIME_ZONE = '" + time_zone + "'");
+		pool_connection.GetConnection()->Execute("SET TIME_ZONE = '" + time_zone + "'");
 	}
 }
 
@@ -53,7 +58,27 @@ ODBCConnection &ODBCTransaction::GetConnection() {
 		transaction_state = ODBCTransactionState::TRANSACTION_STARTED;
 		// Don't explicitly start a transaction - let the ODBC driver handle it
 	}
-	return connection;
+	
+	if (!pool_connection.HasConnection()) {
+		throw InternalException("ODBCTransaction::GetConnection called but pool connection is not valid");
+	}
+	
+	return *pool_connection.GetConnection();
+}
+
+shared_ptr<ODBCConnection> ODBCTransaction::GetConnectionShared() {
+	// For ODBC connections, we rely on the driver's default transaction management
+	// Many ODBC drivers (including SQL Server) handle transactions automatically
+	if (transaction_state == ODBCTransactionState::TRANSACTION_NOT_YET_STARTED) {
+		transaction_state = ODBCTransactionState::TRANSACTION_STARTED;
+		// Don't explicitly start a transaction - let the ODBC driver handle it
+	}
+	
+	if (!pool_connection.HasConnection()) {
+		throw InternalException("ODBCTransaction::GetConnectionShared called but pool connection is not valid");
+	}
+	
+	return pool_connection.GetConnection();
 }
 
 unique_ptr<ODBCResult> ODBCTransaction::Query(const string &query) {
@@ -62,7 +87,12 @@ unique_ptr<ODBCResult> ODBCTransaction::Query(const string &query) {
 		transaction_state = ODBCTransactionState::TRANSACTION_STARTED;
 		// Don't explicitly start a transaction - let the ODBC driver handle it
 	}
-	return connection.Query(query, ODBCResultStreaming::FORCE_MATERIALIZATION);
+	
+	if (!pool_connection.HasConnection()) {
+		throw InternalException("ODBCTransaction::Query called but pool connection is not valid");
+	}
+	
+	return pool_connection.GetConnection()->Query(query, ODBCResultStreaming::FORCE_MATERIALIZATION);
 }
 
 ODBCTransaction &ODBCTransaction::Get(ClientContext &context, Catalog &catalog) {

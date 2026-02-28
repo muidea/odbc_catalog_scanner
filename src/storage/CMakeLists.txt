@@ -3,6 +3,7 @@ add_library(
   odbc_catalog.cpp
   odbc_catalog_set.cpp
   odbc_clear_cache.cpp
+  odbc_connection_pool.cpp
   odbc_execute_query.cpp
   odbc_index.cpp
   odbc_index_entry.cpp

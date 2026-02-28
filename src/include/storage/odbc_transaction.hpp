@@ -8,8 +8,10 @@
 
 #pragma once
 
-#include "duckdb/transaction/transaction.hpp"
+#include "duckdb.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 #include "odbc_connection.hpp"
+#include "storage/odbc_connection_pool.hpp"
 
 namespace duckdb {
 class ODBCCatalog;
@@ -28,6 +30,7 @@ public:
 	void Rollback();
 
 	ODBCConnection &GetConnection();
+	shared_ptr<ODBCConnection> GetConnectionShared();
 	unique_ptr<ODBCResult> Query(const string &query);
 	static ODBCTransaction &Get(ClientContext &context, Catalog &catalog);
 	AccessMode GetAccessMode() const {
@@ -35,7 +38,8 @@ public:
 	}
 
 private:
-	ODBCConnection connection;
+	ODBCCatalog &odbc_catalog;
+	ODBCPoolConnection pool_connection;
 	ODBCTransactionState transaction_state;
 	AccessMode access_mode;
 };

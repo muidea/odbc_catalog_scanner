@@ -8,10 +8,9 @@
 
 #pragma once
 
-#include "duckdb/catalog/catalog.hpp"
-#include "duckdb/common/enums/access_mode.hpp"
-#include "odbc_connection.hpp"
+#include "duckdb.hpp"
 #include "storage/odbc_schema_set.hpp"
+#include "storage/odbc_connection_pool.hpp"
 
 namespace duckdb {
 class ODBCSchemaEntry;
@@ -64,12 +63,18 @@ public:
 	static bool IsODBCScan(const string &name);
 	static bool IsODBCQuery(const string &name);
 
+public:
+	ODBCConnectionPool &GetConnectionPool() {
+		return connection_pool;
+	}
+
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 
 private:
 	ODBCSchemaSet schemas;
 	string default_schema;
+	ODBCConnectionPool connection_pool;
 };
 
 } // namespace duckdb

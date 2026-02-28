@@ -8,12 +8,14 @@
 
 #pragma once
 
+#include "duckdb.hpp"
 #include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/mutex.hpp"
 
 #include "odbc_result.hpp"
 #include "odbc_types.hpp"
 #include "odbc_utils.hpp"
+#include <atomic>
 
 namespace duckdb {
 class ODBCBinaryWriter;
@@ -40,7 +42,7 @@ struct OwnedODBCConnection {
 	SQLHDBC connection;
 };
 
-class ODBCConnection {
+class ODBCConnection : public enable_shared_from_this<ODBCConnection> {
 public:
 	explicit ODBCConnection(shared_ptr<OwnedODBCConnection> connection, const std::string &dsn_p,
 	                         ODBCTypeConfig type_config_p);
@@ -53,7 +55,7 @@ public:
 	ODBCConnection &operator=(ODBCConnection &&) noexcept;
 
 public:
-	static ODBCConnection Open(ODBCTypeConfig type_config, const string &connection_string);
+	static shared_ptr<ODBCConnection> Open(ODBCTypeConfig type_config, const string &connection_string);
 	void Execute(const string &query);
 	void Execute(const string &query, vector<Value> params);
 	unique_ptr<ODBCResult> Query(const string &query, ODBCResultStreaming streaming);
@@ -81,12 +83,19 @@ public:
 	static void DebugSetPrintQueries(bool print);
 	static bool DebugPrintQueries();
 
+	// 连接状态管理方法
+	bool CheckConnectionHealth();
+	void ResetConnectionState();
+	bool HasPendingResults();
+	void ReleaseConnection();
+
 private:
 	unique_ptr<ODBCResult> QueryInternal(const string &query, vector<Value> params, ODBCResultStreaming streaming,
 	                                      ODBCConnectorInterface con_interface);
 	idx_t ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming);
 
-	mutex query_lock;
+	std::recursive_mutex query_lock;
+	std::atomic<bool> connection_busy{false};
 	shared_ptr<OwnedODBCConnection> connection;
 	string dsn;
 	ODBCTypeConfig type_config;

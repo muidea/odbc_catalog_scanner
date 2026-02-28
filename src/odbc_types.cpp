@@ -1,4 +1,5 @@
 #include "odbc_types.hpp"
+#include <cstdio>
 
 namespace duckdb {
 
@@ -20,6 +21,7 @@ ODBCTypeConfig::ODBCTypeConfig(ClientContext &context)
 }
 
 LogicalType ODBCTypes::TypeToLogicalType(const ODBCTypeConfig &type_config, const ODBCTypeData &type_info) {
+	
 	if (type_info.type_name == "tinyint") {
 		if (type_info.column_type == "tinyint(1)" && type_config.tinyint1_as_boolean) {
 			return LogicalType::BOOLEAN;
@@ -178,7 +180,35 @@ LogicalType ODBCTypes::FieldToLogicalType(const ODBCTypeConfig &type_config, SQL
 	}
 	
 	type_data.column_type = type_data.type_name;
-	return ODBCTypes::TypeToLogicalType(type_config, type_data);
+	LogicalType result = ODBCTypes::TypeToLogicalType(type_config, type_data);
+	
+	if (result.id() == LogicalTypeId::VARCHAR) {
+		// Check if this should have been an integer type
+		switch (data_type) {
+		case SQL_TINYINT:
+			return LogicalType::TINYINT;
+		case SQL_SMALLINT:
+			return LogicalType::SMALLINT;
+		case SQL_INTEGER:
+			return LogicalType::INTEGER;
+		case SQL_BIGINT:
+			return LogicalType::BIGINT;
+		case SQL_REAL:
+			return LogicalType::FLOAT;
+		case SQL_FLOAT:
+		case SQL_DOUBLE:
+			return LogicalType::DOUBLE;
+		case SQL_DECIMAL:
+		case SQL_NUMERIC:
+			// For decimal/numeric, check if we have precision info
+			if (col_size > 0 && col_size <= 38) {
+				return LogicalType::DECIMAL(col_size, decimal_digits);
+			}
+			return LogicalType::DOUBLE;
+		}
+	}
+	
+	return result;
 }
 
 LogicalType ODBCTypes::ToODBCType(const ODBCTypeConfig &type_config, const LogicalType &input) {
@@ -243,6 +273,7 @@ string ODBCTypes::TypeToString(const LogicalType &input) {
 }
 
 SQLSMALLINT ODBCTypes::GetCType(SQLSMALLINT sql_type) {
+	
 	switch (sql_type) {
 	case SQL_CHAR:
 	case SQL_VARCHAR:

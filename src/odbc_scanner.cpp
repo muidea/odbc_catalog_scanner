@@ -1,20 +1,25 @@
 #include "duckdb.hpp"
-
-#include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "odbc_scanner.hpp"
-#include "odbc_result.hpp"
+#include "odbc_utils.hpp"
+#include "odbc_filter_pushdown.hpp"
+#include "storage/odbc_catalog.hpp"
 #include "storage/odbc_transaction.hpp"
+#include "storage/odbc_connection_pool.hpp"
 #include "storage/odbc_table_set.hpp"
 #include "odbc_filter_pushdown.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include <thread>
 
 namespace duckdb {
 
 struct ODBCGlobalState;
 
-struct ODBCLocalState : public LocalTableFunctionState {};
+struct ODBCLocalState : public LocalTableFunctionState {
+	ODBCPoolConnection pool_connection;
+	shared_ptr<ODBCConnection> connection;
+	unique_ptr<ODBCResult> result;
+};
 
 struct ODBCGlobalState : public GlobalTableFunctionState {
 	explicit ODBCGlobalState(unique_ptr<ODBCResult> result_p) : result(std::move(result_p)) {
@@ -64,10 +69,19 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 	if (!filter_string.empty()) {
 		select += " WHERE " + filter_string;
 	}
+	
 	// run the query
 	auto &transaction = ODBCTransaction::Get(context, bind_data.table.catalog);
 	auto &con = transaction.GetConnection();
+	
 	auto query_result = con.Query(select, bind_data.streaming);
+	
+	// 检查查询结果是否为空
+	if (!query_result) {
+		throw InternalException("ODBCInitGlobalState: Query returned null result for table %s.%s",
+		                       bind_data.table.schema.name.c_str(), bind_data.table.name.c_str());
+	}
+	
 	auto result = make_uniq<ODBCGlobalState>(std::move(query_result));
 
 	return std::move(result);
@@ -80,43 +94,47 @@ static unique_ptr<LocalTableFunctionState> ODBCInitLocalState(ExecutionContext &
 
 static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &gstate = data.global_state->Cast<ODBCGlobalState>();
+	
+	if (!gstate.result) {
+		throw InternalException("ODBCScan: result pointer is null");
+	}
+	
 	DataChunk &res_chunk = gstate.result->NextChunk();
-	D_ASSERT(output.ColumnCount() == res_chunk.ColumnCount());
+	
+	// 空结果集，设置输出为空
+	if (res_chunk.size() == 0) {
+		output.SetCardinality(0);
+		return;
+	}
+	
+	// 没有列的结果集，设置输出为空
+	if (res_chunk.ColumnCount() == 0) {
+		output.SetCardinality(0);
+		return;
+	}
+	
+	// 检查列数匹配
+	if (output.ColumnCount() != res_chunk.ColumnCount()) {
+		throw InternalException("ODBCScan: column count mismatch. Output has %lu columns, result has %lu columns",
+		                       output.ColumnCount(), res_chunk.ColumnCount());
+	}
+	
 	string error;
 	for (idx_t c = 0; c < output.ColumnCount(); c++) {
 		Vector &output_vec = output.data[c];
 		Vector &res_vec = res_chunk.data[c];
-		switch (output_vec.GetType().id()) {
-		case LogicalTypeId::BOOLEAN:
-		case LogicalTypeId::TINYINT:
-		case LogicalTypeId::UTINYINT:
-		case LogicalTypeId::SMALLINT:
-		case LogicalTypeId::USMALLINT:
-		case LogicalTypeId::INTEGER:
-		case LogicalTypeId::UINTEGER:
-		case LogicalTypeId::BIGINT:
-		case LogicalTypeId::UBIGINT:
-		case LogicalTypeId::FLOAT:
-		case LogicalTypeId::DOUBLE:
-		case LogicalTypeId::BLOB:
-		case LogicalTypeId::DATE:
-		case LogicalTypeId::TIME:
-		case LogicalTypeId::TIMESTAMP:
-		case LogicalTypeId::TIMESTAMP_TZ: {
-			if (output_vec.GetType().id() == res_vec.GetType().id() ||
-			    (output_vec.GetType().id() == LogicalTypeId::BLOB &&
-			     res_vec.GetType().id() == LogicalTypeId::VARCHAR)) {
-				output_vec.Reinterpret(res_vec);
-			} else {
-				VectorOperations::TryCast(context, res_vec, output_vec, res_chunk.size(), &error);
-			}
-			break;
+		
+		// 检查向量有效性
+		if (output_vec.GetType().id() == LogicalTypeId::INVALID) {
+			throw InternalException("ODBCScan: output vector %lu has invalid type", c);
 		}
-		default: {
-			VectorOperations::TryCast(context, res_vec, output_vec, res_chunk.size(), &error);
-			break;
+		if (res_vec.GetType().id() == LogicalTypeId::INVALID) {
+			throw InternalException("ODBCScan: result vector %lu has invalid type", c);
 		}
-		}
+		
+		// 总是使用 TryCast 进行安全的数据复制，避免引用生命周期问题
+		VectorOperations::TryCast(context, res_vec, output_vec, res_chunk.size(), &error);
+		
 		// throw an error in case of TryCast fails
 		if (!error.empty()) {
 			throw BinderException(error);
