@@ -143,7 +143,7 @@ ODBCResult::ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBC
 	// For DML queries, affected_rows will be >= 0 and we may not have columns
 	if (affected_rows != static_cast<idx_t>(-1)) {
 		// This is a DML query (INSERT, UPDATE, DELETE) that doesn't return a result set
-		// 对于DML查询，也需要释放连接繁忙状态
+		// 对于DML查询，可以立即释放连接繁忙状态，因为没有结果集需要读取
 		if (connection && !connection_released) {
 			connection->ReleaseConnection();
 			connection_released = true;
@@ -172,23 +172,85 @@ ODBCResult::ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBC
 			// 创建逻辑类型并初始化数据块
 			auto ltypes = CreateChunkTypes(fields, type_config);
 			this->data_chunk.Initialize(Allocator::DefaultAllocator(), ltypes);
+			
+			// 立即读取所有数据到数据块
+			// 这样可以在读取完成后立即释放连接，支持UNION查询
+			ReadAllData();
 		}
 		
-		// 查询已成功执行，语句句柄已分配，现在可以释放连接繁忙状态
-		// 连接可以用于其他查询（使用不同的语句句柄）
+		// 重要：SELECT查询完成后立即释放连接繁忙状态
+		// 这样连接可以立即被下一个查询使用，支持UNION查询
 		if (connection && !connection_released) {
 			connection->ReleaseConnection();
 			connection_released = true;
 		}
 	} catch (const std::exception &e) {
+		// 发生异常时确保连接被释放
+		if (connection && !connection_released) {
+			connection->ReleaseConnection();
+			connection_released = true;
+		}
 		throw;
 	}
+}
+
+void ODBCResult::ReadAllData() {
+	// 清空现有的缓存
+	cached_chunks.clear();
+	
+	// 如果没有字段，说明是空结果集
+	if (fields.empty()) {
+		return;
+	}
+	
+	// 保存原始的data_chunk状态
+	DataChunk original_chunk;
+	original_chunk.Initialize(Allocator::DefaultAllocator(), data_chunk.GetTypes());
+	
+	// 循环读取所有数据，直到没有更多行
+	while (true) {
+		// 创建一个新的数据块
+		auto chunk = make_uniq<DataChunk>();
+		auto ltypes = CreateChunkTypes(fields, type_config);
+		chunk->Initialize(Allocator::DefaultAllocator(), ltypes);
+		
+		// 临时设置data_chunk指向当前chunk，以便WriteToChunk正确写入
+		data_chunk.Reference(*chunk);
+		
+		idx_t r = 0;
+		for (; r < STANDARD_VECTOR_SIZE; r++) {
+			if (!FetchNext()) {
+				break;
+			}
+			
+			WriteToChunk(r);
+		}
+		
+		// 恢复原始的data_chunk
+		data_chunk.Reference(original_chunk);
+		
+		if (r == 0) {
+			// 没有读取到任何数据，结束循环
+			break;
+		}
+		
+		// 设置数据块大小并添加到缓存
+		chunk->SetCardinality(r);
+		cached_chunks.push_back(std::move(chunk));
+		
+		// 如果读取的行数少于标准向量大小，说明已经读取完所有数据
+		if (r < STANDARD_VECTOR_SIZE) {
+			break;
+		}
+	}
+	
+	// 重置当前读取位置
+	current_chunk_idx = 0;
 }
 
 ODBCResult::~ODBCResult() {
 	CleanupODBCState();
 	
-	// 连接已经在构造函数中释放，这里只需要记录日志
 	// 如果由于异常等原因连接未被释放，则尝试释放
 	if (connection && !connection_released) {
 		connection->ReleaseConnection();
@@ -196,40 +258,9 @@ ODBCResult::~ODBCResult() {
 }
 
 void ODBCResult::CleanupODBCState() {
-	// 确保所有ODBC结果都被消费完，避免连接状态残留
-	if (stmt) {
-		// 对于FreeTDS驱动，需要更彻底的清理
-		// 首先检查是否有未消费的结果集
-		SQLSMALLINT num_cols = 0;
-		SQLRETURN retcode = SQLNumResultCols(stmt.get(), &num_cols);
-		
-		if (SQL_SUCCEEDED(retcode) && num_cols > 0) {
-			// 有未消费的结果集，尝试消费所有行
-			// 这对于FreeTDS驱动特别重要，否则连接会保持繁忙状态
-			while (true) {
-				retcode = SQLFetch(stmt.get());
-				if (retcode == SQL_NO_DATA || !SQL_SUCCEEDED(retcode)) {
-					break;
-				}
-			}
-		}
-		
-		// 尝试关闭游标
-		SQLCloseCursor(stmt.get());
-		
-		// 尝试取消任何挂起的操作
-		SQLCancel(stmt.get());
-		
-		// 对于某些驱动，可能需要多次关闭游标
-		SQLCloseCursor(stmt.get());
-		
-		// 检查语句状态
-		SQLLEN row_count = 0;
-		SQLRowCount(stmt.get(), &row_count);
-		
-		// 让ODBCStatementDelete自定义删除器处理最终的清理
-		// 它会调用SQLFreeStmt(stmt, SQL_CLOSE)和SQLFreeHandle
-	}
+	// 数据已经在ReadAllData中被完全读取，连接也已经释放
+	// 这里只需要确保语句句柄被正确清理
+	// ODBCStatementDelete自定义删除器会处理SQLFreeStmt和SQLFreeHandle
 }
 
 void ODBCResult::HandleTruncatedData() {
@@ -265,22 +296,22 @@ void ODBCResult::HandleTruncatedData() {
 }
 
 DataChunk &ODBCResult::NextChunk() {
-	
-	this->data_chunk.Reset();
-	this->row_idx = 0;
-
-	idx_t r = 0;
-	for (; r < STANDARD_VECTOR_SIZE; r++) {
-		if (!FetchNext()) {
-			break;
+	// 如果已经缓存了数据块，从缓存中读取
+	if (!cached_chunks.empty()) {
+		if (current_chunk_idx < cached_chunks.size()) {
+			data_chunk.Reference(*cached_chunks[current_chunk_idx]);
+			current_chunk_idx++;
+			return data_chunk;
+		} else {
+			// 所有数据块都已读取完毕
+			data_chunk.SetCardinality(0);
+			return data_chunk;
 		}
-
-		WriteToChunk(r);
 	}
-
-	this->data_chunk.SetCardinality(r);
 	
-	return this->data_chunk;
+	// 如果没有缓存（可能是DML查询或空结果集），返回空数据块
+	data_chunk.SetCardinality(0);
+	return data_chunk;
 }
 
 bool ODBCResult::FetchNext() {
@@ -295,7 +326,17 @@ bool ODBCResult::FetchNext() {
 	SQLRETURN retcode = SQLFetch(stmt.get());
 
 	if (retcode == SQL_ERROR) {
-		throw IOException("Failed to fetch result row for ODBC query \"%s\"\n", query.c_str());
+		// 获取详细的ODBC错误信息
+		SQLCHAR sqlstate[6] = {0};
+		SQLCHAR message[SQL_MAX_MESSAGE_LENGTH] = {0};
+		SQLINTEGER native_error = 0;
+		SQLSMALLINT message_length = 0;
+		
+		SQLGetDiagRec(SQL_HANDLE_STMT, stmt.get(), 1, sqlstate, &native_error,
+		              message, SQL_MAX_MESSAGE_LENGTH, &message_length);
+		
+		throw IOException("Failed to fetch result row for ODBC query \"%s\": SQLState=%s, NativeError=%d, Message=%s\n",
+		                  query.c_str(), reinterpret_cast<const char*>(sqlstate), native_error, reinterpret_cast<const char*>(message));
 	}
 
 	if (retcode == SQL_NO_DATA) {

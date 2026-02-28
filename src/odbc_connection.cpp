@@ -92,7 +92,7 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 		              message, SQL_MAX_MESSAGE_LENGTH, &message_length);
 		
 		throw IOException("Failed to prepare ODBC query \"%s\": SQLState=%s, NativeError=%d, Message=%s\n",
-		                  query.c_str(), sqlstate, native_error, message);
+		                  query.c_str(), reinterpret_cast<const char*>(sqlstate), native_error, reinterpret_cast<const char*>(message));
 	}
 
 	vector<ODBCParameter> odbc_params;
@@ -110,7 +110,7 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 			              message, SQL_MAX_MESSAGE_LENGTH, &message_length);
 			
 			throw IOException("Failed to get parameter count for ODBC query \"%s\": SQLState=%s, NativeError=%d, Message=%s\n",
-			                  query.c_str(), sqlstate, native_error, message);
+			                  query.c_str(), reinterpret_cast<const char*>(sqlstate), native_error, reinterpret_cast<const char*>(message));
 		}
 		
 		if (param_count != params.size()) {
@@ -144,7 +144,7 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 		              message, SQL_MAX_MESSAGE_LENGTH, &message_length);
 		
 		throw IOException("Failed to execute ODBC query \"%s\": SQLState=%s, NativeError=%d, Message=%s\n",
-		                  query.c_str(), sqlstate, native_error, message);
+		                  query.c_str(), reinterpret_cast<const char*>(sqlstate), native_error, reinterpret_cast<const char*>(message));
 	}
 
 	SQLLEN affected_rows = 0;
@@ -331,38 +331,51 @@ void ODBCConnection::ResetConnectionState() {
 	
 	auto hdbc = GetConn();
 	
-	// 尝试取消任何挂起的操作
-	SQLHSTMT hstmt = SQL_NULL_HSTMT;
-	SQLRETURN retcode = SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
+	// 尝试回滚任何未提交的事务
+	SQLEndTran(SQL_HANDLE_DBC, hdbc, SQL_ROLLBACK);
 	
-	if (SQL_SUCCEEDED(retcode)) {
-		// 尝试取消语句
-		SQLCancel(hstmt);
+	// 对于FreeTDS驱动，可能需要更激进的清理
+	// 尝试多次分配和释放语句句柄，清理可能残留的状态
+	for (int i = 0; i < 3; i++) {
+		SQLHSTMT hstmt = SQL_NULL_HSTMT;
+		SQLRETURN retcode = SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
 		
-		// 尝试关闭游标
-		SQLCloseCursor(hstmt);
-		
-		// 对于FreeTDS驱动，可能需要更彻底的清理
-		// 尝试获取并丢弃任何挂起的结果
-		SQLSMALLINT num_cols = 0;
-		while (SQL_SUCCEEDED(SQLNumResultCols(hstmt, &num_cols)) && num_cols > 0) {
-			// 有结果集，尝试获取一行来清理
-			SQLRETURN fetch_ret = SQLFetch(hstmt);
-			if (fetch_ret == SQL_NO_DATA || !SQL_SUCCEEDED(fetch_ret)) {
-				break;
-			}
+		if (SQL_SUCCEEDED(retcode)) {
+			// 尝试取消任何挂起的操作
+			SQLCancel(hstmt);
+			
+			// 尝试关闭游标
+			SQLCloseCursor(hstmt);
+			
+			// 尝试使用SQLFreeStmt with SQL_CLOSE
+			SQLFreeStmt(hstmt, SQL_CLOSE);
+			
+			// 尝试使用SQLFreeStmt with SQL_DROP
+			SQLFreeStmt(hstmt, SQL_DROP);
+			
+			// 如果SQL_DROP失败，使用SQLFreeHandle
+			SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+			
+			// 短暂延迟，让驱动处理清理
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
-		
-		// 尝试关闭游标（再次）
-		SQLCloseCursor(hstmt);
-		
-		// 释放语句句柄
-		SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
 	}
 	
 	// 对于某些驱动，可能需要重置连接属性
 	// 尝试设置连接属性为默认值
 	SQLSetConnectAttr(hdbc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_ON, 0);
+	
+	// 尝试设置连接超时
+	SQLSetConnectAttr(hdbc, SQL_ATTR_CONNECTION_TIMEOUT, (SQLPOINTER)5, 0);
+	
+	// 尝试设置登录超时
+	SQLSetConnectAttr(hdbc, SQL_ATTR_LOGIN_TIMEOUT, (SQLPOINTER)5, 0);
+	
+	// 尝试重置连接状态
+	SQLSetConnectAttr(hdbc, SQL_ATTR_CONNECTION_DEAD, (SQLPOINTER)SQL_CD_FALSE, 0);
+	
+	// 尝试设置访问模式
+	SQLSetConnectAttr(hdbc, SQL_ATTR_ACCESS_MODE, (SQLPOINTER)SQL_MODE_READ_WRITE, 0);
 }
 
 bool ODBCConnection::HasPendingResults() {
@@ -407,8 +420,6 @@ bool ODBCConnection::HasPendingResults() {
 	SQLCHAR test_query[] = "SELECT 1";
 	retcode = SQLExecDirect(hstmt, test_query, SQL_NTS);
 	
-	SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-	
 	// 如果查询失败，可能是有挂起的结果集或连接有问题
 	// 但为了兼容性，我们只在特定错误码时返回true
 	if (!SQL_SUCCEEDED(retcode)) {
@@ -421,12 +432,17 @@ bool ODBCConnection::HasPendingResults() {
 		// 24000: 无效的游标状态
 		// HY010: 函数序列错误
 		// 08S01: 通信链接失败
-		if (strcmp((char*)sqlstate, "HY000") == 0 || strcmp((char*)sqlstate, "24000") == 0 ||
-		    strcmp((char*)sqlstate, "HY010") == 0 || strcmp((char*)sqlstate, "08S01") == 0) {
+		// 空字符串也可能表示有挂起的结果
+		const char* sqlstate_str = reinterpret_cast<const char*>(sqlstate);
+		if (strcmp(sqlstate_str, "HY000") == 0 || strcmp(sqlstate_str, "24000") == 0 ||
+		    strcmp(sqlstate_str, "HY010") == 0 || strcmp(sqlstate_str, "08S01") == 0 ||
+		    sqlstate_str[0] == '\0') {  // 空字符串也可能表示有问题
+			SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
 			return true;
 		}
 	}
 	
+	SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
 	return false;
 }
 

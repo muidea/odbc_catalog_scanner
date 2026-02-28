@@ -68,6 +68,10 @@ private:
 	DataChunk data_chunk;
 	idx_t row_idx = static_cast<idx_t>(-1);
 	bool connection_released = false;
+	
+	// 数据缓冲区 - 使用unique_ptr存储DataChunk，因为DataChunk不能被复制
+	vector<unique_ptr<DataChunk>> cached_chunks;
+	idx_t current_chunk_idx = 0;
 
 	bool FetchNext();
 	void HandleTruncatedData();
@@ -78,6 +82,9 @@ private:
 	
 	// 清理ODBC状态
 	void CleanupODBCState();
+	
+	// 读取所有数据到缓冲区
+	void ReadAllData();
 };
 
 } // namespace duckdb
