@@ -40,7 +40,8 @@ struct ODBCBind {
 class ODBCResult {
 public:
 	ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBCTypeConfig type_config_p,
-	            idx_t affected_rows_p, SQLSMALLINT num_cols_p, shared_ptr<ODBCConnection> connection_p);
+	           idx_t affected_rows_p, SQLSMALLINT num_cols_p, shared_ptr<ODBCConnection> connection_p,
+	           ODBCResultStreaming streaming_p = ODBCResultStreaming::FORCE_MATERIALIZATION);
 	~ODBCResult();
 
 	string GetString(idx_t col);
@@ -68,8 +69,11 @@ private:
 	DataChunk data_chunk;
 	idx_t row_idx = static_cast<idx_t>(-1);
 	bool connection_released = false;
-	
-	// 数据缓冲区 - 使用unique_ptr存储DataChunk，因为DataChunk不能被复制
+
+	bool is_streaming = false;
+	bool stream_exhausted = false;
+
+	// Materialized mode: cached chunks for full result set
 	vector<unique_ptr<DataChunk>> cached_chunks;
 	idx_t current_chunk_idx = 0;
 
@@ -79,11 +83,8 @@ private:
 	void CheckColumnIdx(idx_t col);
 	void CheckNotNull(idx_t col);
 	void CheckType(idx_t col, LogicalTypeId type_id);
-	
-	// 清理ODBC状态
-	void CleanupODBCState();
-	
-	// 读取所有数据到缓冲区
+
+	// Materialized mode: read all data into cached_chunks
 	void ReadAllData();
 };
 

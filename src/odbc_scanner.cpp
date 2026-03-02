@@ -69,7 +69,7 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 	if (!filter_string.empty()) {
 		select += " WHERE " + filter_string;
 	}
-	
+
 	// run the query
 	auto &transaction = ODBCTransaction::Get(context, bind_data.table.catalog);
 	auto &con = transaction.GetConnection();

@@ -2,6 +2,7 @@
 #include "odbc_connection.hpp"
 #include "storage/odbc_connection_pool.hpp"
 
+#include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "odbc_types.hpp"
@@ -18,6 +19,7 @@
 namespace duckdb {
 
 static const size_t DEFAULT_BIND_BUFFER_SIZE = 64;
+static const size_t MAX_BIND_BUFFER_SIZE = 65536;
 
 static size_t GetBufferSize(SQLSMALLINT odbc_type, SQLULEN column_size, const ODBCTypeConfig &type_config) {
 	switch (odbc_type) {
@@ -41,9 +43,12 @@ static size_t GetBufferSize(SQLSMALLINT odbc_type, SQLULEN column_size, const OD
 		return sizeof(SQL_TIMESTAMP_STRUCT);
 	case SQL_DECIMAL:
 	case SQL_NUMERIC:
-		return 64; // Large enough for decimal strings
+		return 64;
 	default:
-		return column_size > 0 ? column_size : DEFAULT_BIND_BUFFER_SIZE;
+		if (column_size > 0 && column_size <= MAX_BIND_BUFFER_SIZE) {
+			return static_cast<size_t>(column_size);
+		}
+		return DEFAULT_BIND_BUFFER_SIZE;
 	}
 }
 
@@ -131,61 +136,52 @@ static vector<LogicalType> CreateChunkTypes(vector<ODBCField> &fields, const ODB
 }
 
 ODBCResult::ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBCTypeConfig type_config_p,
-                          idx_t affected_rows_p, SQLSMALLINT num_cols_p, shared_ptr<ODBCConnection> connection_p)
-    : query(query_p), stmt(std::move(stmt_p)), type_config(std::move(type_config_p)), affected_rows(affected_rows_p), connection(std::move(connection_p)) {
-	
-	// 验证语句句柄
+                       idx_t affected_rows_p, SQLSMALLINT num_cols_p, shared_ptr<ODBCConnection> connection_p,
+                       ODBCResultStreaming streaming_p)
+    : query(query_p), stmt(std::move(stmt_p)), type_config(std::move(type_config_p)), affected_rows(affected_rows_p),
+      connection(std::move(connection_p)),
+      is_streaming(streaming_p == ODBCResultStreaming::ALLOW_STREAMING) {
+
 	if (!stmt) {
 		throw InternalException("ODBCResult: Statement handle is null for query \"%s\"\n", query_p.c_str());
 	}
-	
-	// For SELECT queries, affected_rows should be -1 and we should have columns
-	// For DML queries, affected_rows will be >= 0 and we may not have columns
+
 	if (affected_rows != static_cast<idx_t>(-1)) {
-		// This is a DML query (INSERT, UPDATE, DELETE) that doesn't return a result set
-		// 对于DML查询，可以立即释放连接繁忙状态，因为没有结果集需要读取
 		if (connection && !connection_released) {
 			connection->ReleaseConnection();
 			connection_released = true;
 		}
 		return;
 	}
-	
-	// For SELECT queries, we need to read the fields and initialize the data chunk
+
 	try {
 		this->fields = ReadFields(query, stmt.get(), type_config);
-		
+
 		if (fields.empty()) {
-			// If ReadFields returned empty, try to get column count again
 			SQLSMALLINT num_cols;
 			SQLRETURN retcode = SQLNumResultCols(stmt.get(), &num_cols);
-			
 			if (SQL_SUCCEEDED(retcode) && num_cols > 0) {
 				this->fields = ReadFields(query, stmt.get(), type_config);
 			}
 		}
-		
+
 		if (!fields.empty()) {
-			// 初始化列绑定
 			InitBinds(fields, stmt.get());
-			
-			// 创建逻辑类型并初始化数据块
 			auto ltypes = CreateChunkTypes(fields, type_config);
 			this->data_chunk.Initialize(Allocator::DefaultAllocator(), ltypes);
-			
-			// 立即读取所有数据到数据块
-			// 这样可以在读取完成后立即释放连接，支持UNION查询
-			ReadAllData();
+
+			if (!is_streaming) {
+				ReadAllData();
+			}
 		}
-		
-		// 重要：SELECT查询完成后立即释放连接繁忙状态
-		// 这样连接可以立即被下一个查询使用，支持UNION查询
-		if (connection && !connection_released) {
-			connection->ReleaseConnection();
-			connection_released = true;
+
+		if (!is_streaming) {
+			if (connection && !connection_released) {
+				connection->ReleaseConnection();
+				connection_released = true;
+			}
 		}
 	} catch (const std::exception &e) {
-		// 发生异常时确保连接被释放
 		if (connection && !connection_released) {
 			connection->ReleaseConnection();
 			connection_released = true;
@@ -249,67 +245,118 @@ void ODBCResult::ReadAllData() {
 }
 
 ODBCResult::~ODBCResult() {
-	CleanupODBCState();
-	
-	// 如果由于异常等原因连接未被释放，则尝试释放
+	if (stmt) {
+		if (is_streaming && !stream_exhausted) {
+			SQLCancel(static_cast<SQLHSTMT>(stmt.get()));
+		}
+		stmt.reset();
+	}
+
 	if (connection && !connection_released) {
 		connection->ReleaseConnection();
 	}
 }
 
-void ODBCResult::CleanupODBCState() {
-	// 数据已经在ReadAllData中被完全读取，连接也已经释放
-	// 这里只需要确保语句句柄被正确清理
-	// ODBCStatementDelete自定义删除器会处理SQLFreeStmt和SQLFreeHandle
-}
-
 void ODBCResult::HandleTruncatedData() {
-	// For ODBC, truncated data handling is different
-	// We rely on SQLGetData for large data or use larger buffers
-	// This is a simplified implementation
 	for (size_t i = 0; i < fields.size(); i++) {
 		ODBCField &f = fields[i];
-		
-		// Skip NULL values (bind_length == -1)
+
 		if (f.bind_length == SQL_NULL_DATA) {
 			continue;
 		}
-		
-		// Only handle truncation for non-NULL data
-		if (f.bind_length == SQL_NO_TOTAL || f.bind_length > f.bind_buffer.size()) {
-			// Data was truncated, we need to handle this case
-			// For now, we'll just resize the buffer and re-bind
-			size_t new_size = f.bind_length > 0 ? f.bind_length : f.bind_buffer.size() * 2;
-			f.bind_buffer.resize(new_size);
-			
-			SQLRETURN retcode = SQLBindCol(stmt.get(), i + 1,
-			                              ODBCTypes::GetCType(f.odbc_type),
-			                              f.bind_buffer.data(),
-			                              f.bind_buffer.size(),
-			                              &f.bind_length);
-			
-			if (!SQL_SUCCEEDED(retcode)) {
-				throw IOException("Failed to re-bind column %zu for ODBC query \"%s\"\n", i, query.c_str());
+
+		bool truncated = (f.bind_length == SQL_NO_TOTAL) ||
+		                 (f.bind_length > 0 && static_cast<size_t>(f.bind_length) > f.bind_buffer.size());
+		if (!truncated) {
+			continue;
+		}
+
+		SQLSMALLINT c_type = ODBCTypes::GetCType(f.odbc_type);
+
+		// Determine the full data length; double the buffer when length is unknown
+		size_t total_len;
+		if (f.bind_length != SQL_NO_TOTAL && f.bind_length > 0) {
+			total_len = static_cast<size_t>(f.bind_length);
+		} else {
+			total_len = f.bind_buffer.size() * 2;
+		}
+
+		// Cap at a reasonable maximum to prevent OOM
+		if (total_len > MAX_BIND_BUFFER_SIZE * 16) {
+			total_len = MAX_BIND_BUFFER_SIZE * 16;
+		}
+
+		// For character data, retrieve remaining bytes via SQLGetData.
+		// The bind buffer already contains the first portion (before truncation).
+		if (c_type == SQL_C_CHAR || c_type == SQL_C_BINARY) {
+			size_t already_have = f.bind_buffer.size();
+			if (c_type == SQL_C_CHAR && already_have > 0) {
+				already_have--; // null terminator doesn't count
 			}
+
+			f.bind_buffer.resize(total_len + 1);
+
+			SQLLEN remaining_len = 0;
+			SQLRETURN retcode = SQLGetData(stmt.get(), static_cast<SQLUSMALLINT>(i + 1), c_type,
+			                               f.bind_buffer.data() + already_have,
+			                               static_cast<SQLLEN>(f.bind_buffer.size() - already_have),
+			                               &remaining_len);
+
+			if (SQL_SUCCEEDED(retcode) && remaining_len >= 0) {
+				f.bind_length = static_cast<SQLLEN>(already_have) + remaining_len;
+			} else {
+				// SQLGetData failed; keep what we have, clamp length to buffer
+				f.bind_length = static_cast<SQLLEN>(already_have);
+			}
+		} else {
+			// Non-character types: just resize and re-bind for next fetch
+			f.bind_buffer.resize(total_len);
+			SQLBindCol(stmt.get(), static_cast<SQLUSMALLINT>(i + 1), c_type, f.bind_buffer.data(),
+			           static_cast<SQLLEN>(f.bind_buffer.size()), &f.bind_length);
 		}
 	}
 }
 
 DataChunk &ODBCResult::NextChunk() {
-	// 如果已经缓存了数据块，从缓存中读取
+	if (is_streaming) {
+		data_chunk.Reset();
+
+		if (stream_exhausted) {
+			data_chunk.SetCardinality(0);
+			return data_chunk;
+		}
+
+		idx_t r = 0;
+		for (; r < STANDARD_VECTOR_SIZE; r++) {
+			if (!FetchNext()) {
+				stream_exhausted = true;
+				break;
+			}
+			WriteToChunk(r);
+		}
+
+		data_chunk.SetCardinality(r);
+
+		if (stream_exhausted && connection && !connection_released) {
+			connection->ReleaseConnection();
+			connection_released = true;
+		}
+
+		return data_chunk;
+	}
+
+	// Materialized mode: return from cache
 	if (!cached_chunks.empty()) {
 		if (current_chunk_idx < cached_chunks.size()) {
 			data_chunk.Reference(*cached_chunks[current_chunk_idx]);
 			current_chunk_idx++;
 			return data_chunk;
 		} else {
-			// 所有数据块都已读取完毕
 			data_chunk.SetCardinality(0);
 			return data_chunk;
 		}
 	}
-	
-	// 如果没有缓存（可能是DML查询或空结果集），返回空数据块
+
 	data_chunk.SetCardinality(0);
 	return data_chunk;
 }
@@ -346,7 +393,7 @@ bool ODBCResult::FetchNext() {
 	HandleTruncatedData();
 	
 	for (size_t i = 0; i < fields.size(); i++) {
-		ODBCField &f = fields[i];
+		fields[i].bind_is_null = (fields[i].bind_length == SQL_NULL_DATA);
 	}
 
 	bool result = (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO);
@@ -503,129 +550,84 @@ static void WriteDecimal(ODBCField &f, Vector &vec, idx_t row) {
 		FlatVector::SetNull(vec, row, true);
 		return;
 	}
-	
-	// ODBC decimal values are typically passed as strings
-	// We need to parse the string and convert to appropriate decimal value
-	string decimal_str(f.bind_buffer.data(), f.bind_length);
-	
-	// Get the vector's type
+
+	if (f.bind_length < 0 || static_cast<size_t>(f.bind_length) > f.bind_buffer.size()) {
+		FlatVector::SetNull(vec, row, true);
+		return;
+	}
+
+	string decimal_str(f.bind_buffer.data(), static_cast<size_t>(f.bind_length));
+
 	auto &vec_type = vec.GetType();
-	
-	// Get decimal precision and scale from the logical type
 	uint8_t precision = DecimalType::GetWidth(vec_type);
 	uint8_t scale = DecimalType::GetScale(vec_type);
-	
-	
+
 	try {
-		// Parse the decimal string
 		size_t dot_pos = decimal_str.find('.');
 		string int_part, frac_part;
-		
+
 		if (dot_pos != string::npos) {
 			int_part = decimal_str.substr(0, dot_pos);
 			frac_part = decimal_str.substr(dot_pos + 1);
 		} else {
 			int_part = decimal_str;
-			frac_part = "0";
 		}
-		
-		// Pad fractional part to the expected scale
+
 		if (frac_part.length() < scale) {
 			frac_part.append(scale - frac_part.length(), '0');
 		} else if (frac_part.length() > scale) {
-			// Truncate if fractional part is longer than scale
 			frac_part = frac_part.substr(0, scale);
 		}
-		
-		
-		// Combine integer and fractional parts
+
 		string scaled_str = int_part + frac_part;
-		
-		// Determine which integer type to use based on precision
-		// DECIMAL precision determines the internal storage type:
-		// - precision <= 18: INT64
-		// - precision <= 38: INT128 (hugeint_t)
-		// - precision > 38: HUGEINT (not supported by ODBC)
-		
-		if (precision <= 18) {
-			// Use INT64 for DECIMAL with precision <= 18
-			try {
-				int64_t scaled_val = std::stoll(scaled_str);
-				auto data = FlatVector::GetData<int64_t>(vec);
-				data[row] = scaled_val;
-				return;
-			} catch (const std::exception &e) {
-				throw;
-			}
+
+		// DuckDB DECIMAL internal storage depends on precision:
+		//   1-4   → int16_t
+		//   5-9   → int32_t
+		//   10-18 → int64_t
+		//   19-38 → hugeint_t
+		if (precision <= 4) {
+			FlatVector::GetData<int16_t>(vec)[row] = static_cast<int16_t>(std::stoi(scaled_str));
+		} else if (precision <= 9) {
+			FlatVector::GetData<int32_t>(vec)[row] = static_cast<int32_t>(std::stol(scaled_str));
+		} else if (precision <= 18) {
+			FlatVector::GetData<int64_t>(vec)[row] = std::stoll(scaled_str);
 		} else if (precision <= 38) {
-			// Use INT128 (hugeint_t) for DECIMAL with precision <= 38
-			try {
-				// For hugeint_t, we need to parse the string differently
-				// Since std::stoll doesn't support 128-bit integers
-				// We'll use string parsing for now
-				hugeint_t huge_val;
-				
-				// Simple string to hugeint conversion
-				// For now, we'll handle values that fit in 64-bit
-				// For larger values, we'd need a proper big integer parser
-				try {
-					// Try to parse as int64 first
-					int64_t int64_val = std::stoll(scaled_str);
-					huge_val.lower = int64_val;
-					// Sign extend for negative numbers
-					if (int64_val < 0) {
-						huge_val.upper = -1;
-					} else {
-						huge_val.upper = 0;
-					}
-				} catch (const std::out_of_range &e) {
-					// Value doesn't fit in int64, need proper hugeint parsing
-					// For now, we'll throw an error
-					throw InternalException("Decimal value too large for int64, needs proper hugeint parsing: %s", 
-						scaled_str.c_str());
-				}
-				
-				auto data = FlatVector::GetData<hugeint_t>(vec);
-				data[row] = huge_val;
-				return;
-			} catch (const std::exception &e) {
-				throw;
+			hugeint_t huge_val;
+			if (!Hugeint::TryConvert(scaled_str.c_str(), huge_val)) {
+				throw InternalException("Decimal value out of hugeint range: %s", scaled_str.c_str());
 			}
+			FlatVector::GetData<hugeint_t>(vec)[row] = huge_val;
 		} else {
-			throw InternalException("Unsupported DECIMAL precision %u for column %s (max supported: 38)", 
-				precision, f.name.c_str());
+			throw InternalException("Unsupported DECIMAL precision %u for column %s (max: 38)", precision,
+			                        f.name.c_str());
 		}
-		
 	} catch (const std::exception &e) {
-		// Cannot fall back to string for DECIMAL type
-		throw InternalException("Failed to parse decimal value '%s' for column %s: %s", 
-			string(f.bind_buffer.data(), f.bind_length).c_str(), f.name.c_str(), e.what());
+		throw InternalException("Failed to parse decimal value '%s' for column %s: %s", decimal_str.c_str(),
+		                        f.name.c_str(), e.what());
 	}
 }
 
 static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
-	
-	// WriteString should only be called for VARCHAR or BLOB types
-	// If called for other types, it's a bug in our code
 	D_ASSERT(vec.GetType().id() == LogicalTypeId::VARCHAR || vec.GetType().id() == LogicalTypeId::BLOB);
-	
+
 	if (f.odbc_type == SQL_TYPE_TIME) {
 		WriteTimeAsString(f, vec, row);
 		return;
 	}
 
 	if (f.bind_buffer.empty()) {
-		throw InternalException("Empty bind buffer in WriteString");
+		FlatVector::SetNull(vec, row, true);
+		return;
 	}
-	
+
 	if (f.bind_length < 0) {
 		FlatVector::SetNull(vec, row, true);
 		return;
 	}
-	
-	if (f.bind_length > f.bind_buffer.size()) {
-		// Truncate to buffer size
-		f.bind_length = f.bind_buffer.size();
+
+	if (static_cast<size_t>(f.bind_length) > f.bind_buffer.size()) {
+		f.bind_length = static_cast<SQLLEN>(f.bind_buffer.size());
 	}
 	
 	// Handle numeric types that should be converted to string
@@ -831,7 +833,8 @@ void ODBCResult::WriteToChunk(idx_t row) {
 		ODBCField &f = fields[col];
 		Vector &vec = data_chunk.data[col];
 
-		if (f.bind_is_null) {
+		if (f.bind_length == SQL_NULL_DATA) {
+			FlatVector::SetNull(vec, row, true);
 			continue;
 		}
 		

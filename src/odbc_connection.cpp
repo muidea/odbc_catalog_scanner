@@ -264,8 +264,8 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 	}
 	
 	try {
-		// 创建 shared_ptr 的副本，确保连接在结果生命周期内保持有效
-		auto result = make_uniq<ODBCResult>(query, ODBCStatementPtr(hstmt, ODBCStatementDelete), type_config, affected_rows, num_cols, shared_from_this());
+		auto result = make_uniq<ODBCResult>(query, ODBCStatementPtr(hstmt, ODBCStatementDelete), type_config,
+		                                    affected_rows, num_cols, shared_from_this(), streaming);
 		return result;
 	} catch (const std::exception &e) {
 		// ODBCResult构造函数失败，清理语句句柄
