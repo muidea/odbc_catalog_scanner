@@ -9,8 +9,7 @@
 #pragma once
 
 #include "duckdb.hpp"
-#include <sql.h>
-#include <sqlext.h>
+#include "odbc_types.hpp"
 
 namespace duckdb {
 class ODBCSchemaEntry;

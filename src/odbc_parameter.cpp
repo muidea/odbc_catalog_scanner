@@ -4,8 +4,6 @@
 #include "duckdb/common/types/datetime.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
-#include <sql.h>
-#include <sqlext.h>
 
 namespace duckdb {
 

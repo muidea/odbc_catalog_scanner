@@ -204,10 +204,13 @@ SQLHDBC ODBCUtils::Connect(const string &dsn) {
 		connection_string += "PORT=" + std::to_string(config.port) + ";";
 	}
 
-	// Add character set for Chinese support
-	// For SQL Server with FreeTDS driver, use UTF-8 encoding
+	// Platform-specific connection settings
+	// FreeTDS (Linux) requires explicit charset and TDS version
+	// SQL Server driver (Windows) doesn't need these and may reject them
+#ifndef _WIN32
 	connection_string += "ClientCharset=UTF-8;";
 	connection_string += "TDS_Version=8.0;";
+#endif
 
 	// Connect to the data source
 	SQLCHAR outstr[1024];

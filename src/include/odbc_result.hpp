@@ -10,8 +10,7 @@
 
 #include "odbc_types.hpp"
 #include "odbc_utils.hpp"
-#include <sql.h>
-#include <sqlext.h>
+#include <memory>
 
 namespace duckdb {
 class ODBCConnection;

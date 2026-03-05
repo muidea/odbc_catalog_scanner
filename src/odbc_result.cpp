@@ -6,8 +6,6 @@
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "odbc_types.hpp"
-#include <sql.h>
-#include <sqlext.h>
 #include <cstdint>
 #include <string>
 #include <cstring>

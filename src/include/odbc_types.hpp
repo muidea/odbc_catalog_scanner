@@ -8,7 +8,21 @@
 
 #pragma once
 
+// On Windows, we need to include Windows headers before DuckDB headers
+// to avoid type definition conflicts
+#ifdef _WIN32
+	#ifndef WIN32_LEAN_AND_MEAN
+		#define WIN32_LEAN_AND_MEAN
+	#endif
+	#ifndef NOMINMAX
+		#define NOMINMAX
+	#endif
+	#include <windows.h>
+#endif
+
 #include "duckdb.hpp"
+
+// Include ODBC headers
 #include <sql.h>
 #include <sqlext.h>
 
