@@ -69,75 +69,55 @@ void ODBCTableSet::AddColumn(ClientContext &context, ODBCResult &result, ODBCTab
 }
 
 void ODBCTableSet::LoadEntries(ClientContext &context) {
-
-	// Use INFORMATION_SCHEMA for ODBC compatibility instead of SQL Server specific sys.* tables
+	// First fetch the list of base tables in this schema
 	auto query = StringUtil::Replace(R"(
 SELECT
-    t.TABLE_NAME AS table_name,
-    c.COLUMN_NAME AS column_name,
-    c.DATA_TYPE AS data_type,
-    c.DATA_TYPE AS column_type,
-    c.COLUMN_DEFAULT AS column_default,
-    c.IS_NULLABLE AS is_nullable,
-    c.NUMERIC_PRECISION AS numeric_precision,
-    c.NUMERIC_SCALE AS numeric_scale
-FROM INFORMATION_SCHEMA.COLUMNS c
-JOIN INFORMATION_SCHEMA.TABLES t ON c.TABLE_NAME = t.TABLE_NAME AND c.TABLE_SCHEMA = t.TABLE_SCHEMA
-WHERE c.TABLE_SCHEMA = ${SCHEMA_NAME} AND t.TABLE_TYPE = 'BASE TABLE'
-ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION;
+    t.TABLE_NAME AS table_name
+FROM INFORMATION_SCHEMA.TABLES t
+WHERE t.TABLE_SCHEMA = ${SCHEMA_NAME} AND t.TABLE_TYPE = 'BASE TABLE'
+ORDER BY t.TABLE_NAME;
 )",
 	                                 "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
 
-
 	auto &transaction = ODBCTransaction::Get(context, catalog);
 	auto result = transaction.Query(query);
-
-	vector<unique_ptr<ODBCTableInfo>> tables;
-	unique_ptr<ODBCTableInfo> info;
 
 	while (result->Next()) {
 		auto table_name = NormalizeObjectName(result->GetString(0));
 		if (table_name.empty()) {
 			continue;
 		}
-
-		if (!info || info->GetTableName() != table_name) {
-			if (info) {
-				tables.push_back(std::move(info));
-			}
-			info = make_uniq<ODBCTableInfo>(schema, table_name);
+		// Skip obviously corrupted table names to avoid failing the whole schema
+		// load because of encoding issues on a single table.
+		if (table_name.find('?') != string::npos) {
+			continue;
 		}
-
-		AddColumn(context, *result, *info, 1);
+		try {
+			auto table_info = GetTableInfo(context, schema, table_name);
+			if (!table_info) {
+				continue;
+			}
+			auto table_entry = make_uniq<ODBCTableEntry>(catalog, schema, *table_info);
+			CreateEntry(std::move(table_entry));
+		} catch (...) {
+			// Ignore per-table probe errors (e.g., 42S02 for corrupted names)
+			// and continue loading remaining tables.
+			continue;
+		}
 	}
-	
-	if (info) {
-		tables.push_back(std::move(info));
-	}
-	
-	for (auto &tbl_info : tables) {
-		auto table_entry = make_uniq<ODBCTableEntry>(catalog, schema, *tbl_info);
-		CreateEntry(std::move(table_entry));
-	}
-	
 }
 
 string GetTableInfoQuery(const string &schema_name, const string &table_name) {
-	return StringUtil::Replace(StringUtil::Replace(R"(
-SELECT
-    c.COLUMN_NAME AS column_name,
-    c.DATA_TYPE AS data_type,
-    c.DATA_TYPE AS column_type,
-    c.COLUMN_DEFAULT AS column_default,
-    c.IS_NULLABLE AS is_nullable,
-    c.NUMERIC_PRECISION AS numeric_precision,
-    c.NUMERIC_SCALE AS numeric_scale
-FROM INFORMATION_SCHEMA.COLUMNS c
-WHERE c.TABLE_SCHEMA = ${SCHEMA_NAME} AND c.TABLE_NAME = ${TABLE_NAME}
-ORDER BY c.ORDINAL_POSITION;
-)",
-	                                               "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema_name)),
-	                           "${TABLE_NAME}", ODBCUtils::WriteLiteral(table_name));
+	// Use a lightweight probe query to let the ODBC driver describe the real columns.
+	// This avoids relying on INFORMATION_SCHEMA.COLUMNS, which can be incomplete or
+	// affected by encoding issues on some drivers/platforms.
+	string sql;
+	sql += "SELECT * FROM ";
+	sql += ODBCUtils::WriteIdentifier(schema_name);
+	sql += ".";
+	sql += ODBCUtils::WriteIdentifier(table_name);
+	sql += " WHERE 1=0";
+	return sql;
 }
 
 unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODBCSchemaEntry &schema,
@@ -146,8 +126,14 @@ unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODB
 	auto query = GetTableInfoQuery(schema.name, table_name);
 	auto result = transaction.Query(query);
 	auto table_info = make_uniq<ODBCTableInfo>(schema, table_name);
-	while (result->Next()) {
-		AddColumn(context, *result, *table_info, 0);
+	// The probe query returns no rows; we only need the field metadata.
+	for (auto &field : result->Fields()) {
+		auto column_name = NormalizeObjectName(field.name);
+		if (column_name.empty()) {
+			continue;
+		}
+		ColumnDefinition column(std::move(column_name), field.duckdb_type);
+		table_info->create_info->columns.AddColumn(std::move(column));
 	}
 	return table_info;
 }

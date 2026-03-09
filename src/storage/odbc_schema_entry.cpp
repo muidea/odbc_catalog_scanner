@@ -203,7 +203,33 @@ optional_ptr<CatalogEntry> ODBCSchemaEntry::LookupEntry(CatalogTransaction trans
 	if (!CatalogTypeIsSupported(lookup_type)) {
 		return nullptr;
 	}
-	return GetCatalogSet(lookup_type).GetEntry(transaction.GetContext(), lookup_info.GetEntryName());
+	auto &context = transaction.GetContext();
+	auto entry_name = lookup_info.GetEntryName();
+
+	// First try the existing catalog set (may have been populated by LoadEntries)
+	auto &catalog_set = GetCatalogSet(lookup_type);
+	auto entry = catalog_set.GetEntry(context, entry_name);
+	if (entry) {
+		return entry;
+	}
+
+	// If the table was not found in the preloaded catalog set, try to lazily
+	// construct it using a probe query (SELECT * WHERE 1=0). This allows
+	// accessing tables whose metadata rows in INFORMATION_SCHEMA are missing
+	// or corrupted on certain drivers/platforms.
+	if (lookup_type == CatalogType::TABLE_ENTRY) {
+		try {
+			auto refreshed = tables.RefreshTable(context, entry_name);
+			return refreshed;
+		} catch (...) {
+			// If the probe fails (e.g., the table truly does not exist), fall
+			// back to returning nullptr so the binder can report a standard
+			// "table does not exist" error.
+			return nullptr;
+		}
+	}
+
+	return nullptr;
 }
 
 ODBCCatalogSet &ODBCSchemaEntry::GetCatalogSet(CatalogType type) {
