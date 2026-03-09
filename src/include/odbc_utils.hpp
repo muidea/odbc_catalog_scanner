@@ -22,6 +22,7 @@ struct ODBCConnectionParameters {
 	string uid;
 	string pwd;
 	uint32_t port = 0;
+	vector<string> extra_params;
 };
 
 enum class ODBCResultStreaming { UNINITIALIZED, ALLOW_STREAMING, FORCE_MATERIALIZATION };
@@ -31,7 +32,8 @@ enum class ODBCConnectorInterface { UNINITIALIZED, BASIC, PREPARED_STATEMENT };
 class ODBCUtils {
 public:
 	static std::tuple<ODBCConnectionParameters, unordered_set<string>> ParseConnectionParameters(const string &dsn);
-	static SQLHDBC Connect(const string &dsn);
+	static string BuildConnectionString(const string &dsn);
+	static SQLHDBC Connect(const string &dsn, SQLHENV &out_env);
 
 	static string WriteIdentifier(const string &identifier);
 	static string WriteLiteral(const string &identifier);

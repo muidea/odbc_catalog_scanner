@@ -5,6 +5,7 @@
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/storage/database_size.hpp"
 
 #include "odbc_connection.hpp"
@@ -12,6 +13,8 @@
 #include "odbc_types.hpp"
 #include "storage/odbc_schema_entry.hpp"
 #include "storage/odbc_transaction.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 
@@ -23,10 +26,27 @@ ODBCCatalog::ODBCCatalog(AttachedDatabase &db_p, string connection_string_p, str
 	unordered_set<string> unused_params;
 	std::tie(connection_params, unused_params) = ODBCUtils::ParseConnectionParameters(connection_string);
 	default_schema = connection_params.database;
-	// try to connect
-	ODBCTypeConfig type_config; // 使用默认构造函数
+
+	ODBCTypeConfig type_config;
 	auto connection = ODBCConnection::Open(type_config, connection_string);
-	// 连接创建成功，但这里不需要存储它，因为每个事务会创建自己的连接
+
+	// Query the actual default schema from the server.
+	// SQL Server: SCHEMA_NAME() returns the default schema (typically "dbo").
+	// This is needed because the database name (e.g. "master") is NOT a schema name.
+	try {
+		auto schema_result = connection->Query("SELECT SCHEMA_NAME()", ODBCResultStreaming::FORCE_MATERIALIZATION);
+		if (schema_result && schema_result->Next()) {
+			string server_schema = schema_result->GetString(0);
+			server_schema.erase(std::remove(server_schema.begin(), server_schema.end(), '\0'),
+			                    server_schema.end());
+			StringUtil::Trim(server_schema);
+			if (!server_schema.empty()) {
+				default_schema = server_schema;
+			}
+		}
+	} catch (...) {
+		// SCHEMA_NAME() is SQL Server specific; if it fails, keep the database name
+	}
 }
 
 ODBCCatalog::~ODBCCatalog() = default;

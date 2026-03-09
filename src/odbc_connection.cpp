@@ -8,12 +8,47 @@
 
 #include "odbc_parameter.hpp"
 #include "odbc_types.hpp"
+#include "encoding_utils.hpp"
 #include <thread>
 #include <memory>
 
 namespace duckdb {
 
 static bool debug_odbc_print_queries = true;
+
+static SQLRETURN SQLExecDirectWithFallback(SQLHSTMT stmt, const string &query) {
+#ifdef _WIN32
+	SQLRETURN retcode = SQLExecDirect(stmt, (SQLCHAR *)query.c_str(), SQL_NTS);
+	if (SQL_SUCCEEDED(retcode)) {
+		return retcode;
+	}
+	string query_gbk = UTF8ToGBK(query);
+	if (query_gbk != query) {
+		SQLFreeStmt(stmt, SQL_CLOSE);
+		retcode = SQLExecDirect(stmt, (SQLCHAR *)query_gbk.c_str(), SQL_NTS);
+	}
+	return retcode;
+#else
+	return SQLExecDirect(stmt, (SQLCHAR *)query.c_str(), SQL_NTS);
+#endif
+}
+
+static SQLRETURN SQLPrepareWithFallback(SQLHSTMT stmt, const string &query) {
+#ifdef _WIN32
+	SQLRETURN retcode = SQLPrepare(stmt, (SQLCHAR *)query.c_str(), SQL_NTS);
+	if (SQL_SUCCEEDED(retcode)) {
+		return retcode;
+	}
+	string query_gbk = UTF8ToGBK(query);
+	if (query_gbk != query) {
+		SQLFreeStmt(stmt, SQL_CLOSE);
+		retcode = SQLPrepare(stmt, (SQLCHAR *)query_gbk.c_str(), SQL_NTS);
+	}
+	return retcode;
+#else
+	return SQLPrepare(stmt, (SQLCHAR *)query.c_str(), SQL_NTS);
+#endif
+}
 
 ODBCConnection::ODBCConnection(shared_ptr<OwnedODBCConnection> connection_p, const std::string &dsn_p,
                                  ODBCTypeConfig type_config_p)
@@ -38,7 +73,9 @@ ODBCConnection &ODBCConnection::operator=(ODBCConnection &&other) noexcept {
 }
 
 shared_ptr<ODBCConnection> ODBCConnection::Open(ODBCTypeConfig type_config, const string &connection_string) {
-	auto owned_connection = make_shared_ptr<OwnedODBCConnection>(ODBCUtils::Connect(connection_string));
+	SQLHENV env = SQL_NULL_HENV;
+	SQLHDBC dbc = ODBCUtils::Connect(connection_string, env);
+	auto owned_connection = make_shared_ptr<OwnedODBCConnection>(dbc, env);
 	return make_shared_ptr<ODBCConnection>(std::move(owned_connection), connection_string, std::move(type_config));
 }
 
@@ -60,7 +97,7 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 		}
 
 		try {
-			retcode = SQLExecDirect(hstmt, (SQLCHAR*)query.c_str(), SQL_NTS);
+			retcode = SQLExecDirectWithFallback(hstmt, query);
 			if (!SQL_SUCCEEDED(retcode)) {
 				throw IOException("Failed to run query \"%s\"\n", query.c_str());
 			}
@@ -80,7 +117,7 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	// 对于预编译语句接口，调用者负责清理语句句柄
 	// 我们只需要确保在失败时抛出适当的异常
 
-	retcode = SQLPrepare(stmt, (SQLCHAR*)query.c_str(), SQL_NTS);
+	retcode = SQLPrepareWithFallback(stmt, query);
 	if (!SQL_SUCCEEDED(retcode)) {
 		// 获取详细的ODBC错误信息
 		SQLCHAR sqlstate[6] = {0};

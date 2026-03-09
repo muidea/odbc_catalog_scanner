@@ -145,7 +145,8 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 			set_options.insert("port");
 			result.port = ParsePort(value);
 		} else {
-			// Ignore unrecognized parameters (like TDS_Version) as they are driver-specific
+			// Preserve driver-specific parameters (like TDS_Version) verbatim
+			result.extra_params.push_back(key + "=" + value);
 			continue;
 		}
 	}
@@ -154,36 +155,11 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 	return std::make_tuple(result, set_options);
 }
 
-SQLHDBC ODBCUtils::Connect(const string &dsn) {
-	SQLHENV env;
-	SQLHDBC dbc;
-	SQLRETURN ret;
-
-	// Allocate environment handle
-	ret = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env);
-	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
-		throw IOException("Failed to allocate ODBC environment handle");
-	}
-
-	// Set ODBC version
-	ret = SQLSetEnvAttr(env, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
-	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
-		SQLFreeHandle(SQL_HANDLE_ENV, env);
-		throw IOException("Failed to set ODBC version");
-	}
-
-	// Allocate connection handle
-	ret = SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc);
-	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
-		SQLFreeHandle(SQL_HANDLE_ENV, env);
-		throw IOException("Failed to allocate ODBC connection handle");
-	}
-
+string ODBCUtils::BuildConnectionString(const string &dsn) {
 	ODBCConnectionParameters config;
 	unordered_set<string> unused_params;
 	std::tie(config, unused_params) = ParseConnectionParameters(dsn);
 
-	// Build connection string
 	string connection_string;
 	if (!config.driver.empty()) {
 		connection_string += "DRIVER=" + config.driver + ";";
@@ -204,43 +180,69 @@ SQLHDBC ODBCUtils::Connect(const string &dsn) {
 		connection_string += "PORT=" + std::to_string(config.port) + ";";
 	}
 
-	// Platform-specific connection settings
-	// FreeTDS (Linux) requires explicit charset and TDS version
-	// SQL Server driver (Windows) doesn't need these and may reject them
-#ifndef _WIN32
-	connection_string += "ClientCharset=UTF-8;";
-	connection_string += "TDS_Version=8.0;";
-#endif
-
-	// Connect to the data source
-	SQLCHAR outstr[1024];
-	SQLSMALLINT outstrlen;
-	ret = SQLDriverConnect(dbc, NULL,
-		(SQLCHAR*)connection_string.c_str(), SQL_NTS,
-		outstr, sizeof(outstr), &outstrlen, SQL_DRIVER_COMPLETE);
-
-	if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
-		SQLCHAR sqlstate[6];
-		SQLINTEGER native_error;
-		SQLCHAR message_text[SQL_MAX_MESSAGE_LENGTH];
-		SQLSMALLINT text_length;
-		
-		SQLGetDiagRec(SQL_HANDLE_DBC, dbc, 1, sqlstate, &native_error,
-			message_text, SQL_MAX_MESSAGE_LENGTH, &text_length);
-		
-		SQLFreeHandle(SQL_HANDLE_DBC, dbc);
-		SQLFreeHandle(SQL_HANDLE_ENV, env);
-		
-		throw IOException("Failed to connect to ODBC database with parameters \"%s\": %s",
-			dsn.c_str(), (char*)message_text);
+	// Append driver-specific / unrecognized parameters verbatim
+	for (auto &extra : config.extra_params) {
+		connection_string += extra + ";";
 	}
 
-	// Set character set if needed
-	// Note: Character set setting in ODBC is driver-specific and may not be needed
+#ifndef _WIN32
+	if (connection_string.find("ClientCharset") == string::npos) {
+		connection_string += "ClientCharset=UTF-8;";
+	}
+	if (connection_string.find("TDS_Version") == string::npos) {
+		connection_string += "TDS_Version=8.0;";
+	}
+#endif
 
-	// Free environment handle as it's no longer needed
-	SQLFreeHandle(SQL_HANDLE_ENV, env);
+	return connection_string;
+}
 
+SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env) {
+	SQLHENV env = SQL_NULL_HENV;
+	SQLHDBC dbc = SQL_NULL_HDBC;
+	SQLRETURN ret;
+
+	ret = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env);
+	if (!SQL_SUCCEEDED(ret)) {
+		throw IOException("Failed to allocate ODBC environment handle");
+	}
+
+	ret = SQLSetEnvAttr(env, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
+	if (!SQL_SUCCEEDED(ret)) {
+		SQLFreeHandle(SQL_HANDLE_ENV, env);
+		throw IOException("Failed to set ODBC version");
+	}
+
+	ret = SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc);
+	if (!SQL_SUCCEEDED(ret)) {
+		SQLFreeHandle(SQL_HANDLE_ENV, env);
+		throw IOException("Failed to allocate ODBC connection handle");
+	}
+
+	string connection_string = BuildConnectionString(dsn);
+
+	SQLCHAR outstr[1024];
+	SQLSMALLINT outstrlen;
+	ret = SQLDriverConnect(dbc, NULL, (SQLCHAR *)connection_string.c_str(), SQL_NTS, outstr, sizeof(outstr),
+	                       &outstrlen, SQL_DRIVER_NOPROMPT);
+
+	if (!SQL_SUCCEEDED(ret)) {
+		SQLCHAR sqlstate[6] = {0};
+		SQLINTEGER native_error = 0;
+		SQLCHAR message_text[SQL_MAX_MESSAGE_LENGTH] = {0};
+		SQLSMALLINT text_length = 0;
+
+		SQLGetDiagRec(SQL_HANDLE_DBC, dbc, 1, sqlstate, &native_error, message_text, SQL_MAX_MESSAGE_LENGTH,
+		              &text_length);
+
+		SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+		SQLFreeHandle(SQL_HANDLE_ENV, env);
+
+		throw IOException("Failed to connect to ODBC database with parameters \"%s\": %s", dsn.c_str(),
+		                  (char *)message_text);
+	}
+
+	out_env = env;
 	return dbc;
 }
 
@@ -248,10 +250,22 @@ string ODBCUtils::EscapeQuotes(const string &text, char quote) {
 	string result;
 	for (auto c : text) {
 		if (c == quote) {
+#ifdef _WIN32
+			// SQL Server on Windows: use double quotes (e.g., 'it''s')
+			result += string(2, quote);
+#else
+			// FreeTDS on Linux: use backslash escape (e.g., 'it\'s')
 			result += "\\";
 			result += quote;
+#endif
 		} else if (c == '\\') {
+#ifndef _WIN32
+			// Only escape backslash on Linux
 			result += "\\\\";
+#else
+			// On Windows, keep backslash as-is
+			result += c;
+#endif
 		} else {
 			result += c;
 		}
@@ -260,7 +274,9 @@ string ODBCUtils::EscapeQuotes(const string &text, char quote) {
 }
 
 string ODBCUtils::WriteQuoted(const string &text, char quote) {
-	// 1. Escapes all occurences of 'quote' by escaping them with a backslash
+	// 1. Escapes all occurrences of 'quote' 
+	//    - Windows/SQL Server: by doubling them
+	//    - Linux/FreeTDS: by backslash escaping
 	// 2. Adds quotes around the string
 	return string(1, quote) + EscapeQuotes(text, quote) + string(1, quote);
 }

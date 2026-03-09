@@ -1,11 +1,14 @@
 #include "storage/odbc_schema_set.hpp"
 #include "storage/odbc_transaction.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/common/string_util.hpp"
+#include <algorithm>
 
 namespace duckdb {
 
 static bool ODBCSchemaIsInternal(const string &name) {
-	if (name == "information_schema" || name == "performance_schema" || name == "sys") {
+	auto lower = StringUtil::Lower(name);
+	if (lower == "information_schema" || lower == "performance_schema" || lower == "sys") {
 		return true;
 	}
 	return false;
@@ -32,6 +35,16 @@ ORDER BY SCHEMA_NAME;
 		schema_count++;
 		CreateSchemaInfo info;
 		info.schema = result->GetString(0);
+
+		// Remove embedded null characters and trim whitespace
+		info.schema.erase(std::remove(info.schema.begin(), info.schema.end(), '\0'), info.schema.end());
+		StringUtil::Trim(info.schema);
+
+		// Skip empty schema names
+		if (info.schema.empty()) {
+			continue;
+		}
+
 		info.internal = ODBCSchemaIsInternal(info.schema);
 		auto schema = make_uniq<ODBCSchemaEntry>(catalog, info);
 		CreateEntry(std::move(schema));
@@ -58,6 +71,16 @@ FROM sys.databases;
 			schema_count++;
 			CreateSchemaInfo info;
 			info.schema = fallback_result->GetString(0);
+
+			// Remove embedded null characters and trim whitespace
+			info.schema.erase(std::remove(info.schema.begin(), info.schema.end(), '\0'), info.schema.end());
+			StringUtil::Trim(info.schema);
+
+			// Skip empty schema names
+			if (info.schema.empty()) {
+				continue;
+			}
+
 			info.internal = ODBCSchemaIsInternal(info.schema);
 			auto schema = make_uniq<ODBCSchemaEntry>(catalog, info);
 			CreateEntry(std::move(schema));

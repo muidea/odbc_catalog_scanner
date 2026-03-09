@@ -8,7 +8,10 @@
 #include "duckdb/catalog/dependency_list.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/constraints/list.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/parser.hpp"
+#include <algorithm>
+#include <unordered_set>
 
 #include "storage/odbc_transaction.hpp"
 #include "storage/odbc_schema_entry.hpp"
@@ -20,52 +23,107 @@ namespace duckdb {
 ODBCTableSet::ODBCTableSet(ODBCSchemaEntry &schema) : ODBCInSchemaSet(schema) {
 }
 
+static string NormalizeRemoteName(string name) {
+	name.erase(std::remove(name.begin(), name.end(), '\0'), name.end());
+	StringUtil::Trim(name);
+	return name;
+}
+
+static string DeduplicateColumnName(const ODBCTableInfo &table_info, const string &base_name) {
+	unordered_set<string> existing_names;
+	for (auto &col : table_info.create_info->columns.Logical()) {
+		existing_names.insert(StringUtil::Lower(col.Name()));
+	}
+	string candidate = base_name;
+	if (candidate.empty()) {
+		candidate = "column";
+	}
+	if (existing_names.find(StringUtil::Lower(candidate)) == existing_names.end()) {
+		return candidate;
+	}
+	idx_t suffix = 1;
+	while (true) {
+		auto next_candidate = candidate + "_" + std::to_string(suffix);
+		if (existing_names.find(StringUtil::Lower(next_candidate)) == existing_names.end()) {
+			return next_candidate;
+		}
+		suffix++;
+	}
+}
+
+static void RebuildColumnsFromDescribe(ClientContext &context, Catalog &catalog, ODBCSchemaEntry &schema_entry,
+                                       ODBCTableInfo &table_info) {
+	auto &transaction = ODBCTransaction::Get(context, catalog);
+	string query = "SELECT * FROM " + ODBCUtils::WriteIdentifier(schema_entry.name) + "." +
+	               ODBCUtils::WriteIdentifier(table_info.GetTableName()) + " WHERE 1=0";
+	auto probe_result = transaction.GetConnection().Query(query, ODBCResultStreaming::FORCE_MATERIALIZATION);
+	table_info.create_info = make_uniq<CreateTableInfo>(string(), schema_entry.name, table_info.GetTableName());
+	for (auto &field : probe_result->Fields()) {
+		string column_name = NormalizeRemoteName(field.name);
+		if (column_name.empty()) {
+			column_name = "column_" + std::to_string(table_info.create_info->columns.LogicalColumnCount() + 1);
+		}
+		column_name = DeduplicateColumnName(table_info, column_name);
+		table_info.create_info->columns.AddColumn(ColumnDefinition(column_name, field.duckdb_type));
+	}
+}
+
 void ODBCTableSet::AddColumn(ClientContext &context, ODBCResult &result, ODBCTableInfo &table_info,
                                idx_t column_offset) {
+	ODBCTypeData type_info;
+	idx_t column_index = column_offset;
+
+	string column_name;
 	try {
-		
-		ODBCTypeData type_info;
-		idx_t column_index = column_offset;
-		
-		// Get column information with error handling
-		auto column_name = result.GetString(column_index);
-		
-		type_info.type_name = result.GetString(column_index + 1);
-		type_info.column_type = result.GetString(column_index + 2);
-		
-		string default_value;
-		auto is_nullable = result.GetString(column_index + 4);
-		
+		column_name = NormalizeRemoteName(result.GetString(column_index));
+	} catch (...) {
+		column_name.clear();
+	}
+	if (column_name.empty()) {
+		column_name = "column_" + std::to_string(table_info.create_info->columns.LogicalColumnCount() + 1);
+	}
+	column_name = DeduplicateColumnName(table_info, column_name);
+
+	try {
+		type_info.type_name = result.IsNull(column_index + 1) ? string() : result.GetString(column_index + 1);
+		type_info.column_type = result.IsNull(column_index + 2) ? type_info.type_name : result.GetString(column_index + 2);
 		type_info.precision = result.IsNull(column_index + 5) ? -1 : result.GetInt64(column_index + 5);
 		type_info.scale = result.IsNull(column_index + 6) ? -1 : result.GetInt64(column_index + 6);
-
-		// Convert to logical type
-		auto column_type = ODBCTypes::TypeToLogicalType({context}, type_info);
-		
-		ColumnDefinition column(std::move(column_name), std::move(column_type));
-		if (!default_value.empty()) {
-			auto expressions = Parser::ParseExpressionList(default_value);
-			if (expressions.empty()) {
-				throw InternalException("Expression list is empty");
-			}
-			column.SetDefaultValue(std::move(expressions[0]));
-		}
-		
-		auto &create_info = *table_info.create_info;
-		if (is_nullable != "YES") {
-			auto column_idx = create_info.columns.LogicalColumnCount();
-			create_info.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(column_idx)));
-		}
-		
-		create_info.columns.AddColumn(std::move(column));
-	} catch (const std::exception &e) {
-		throw;
+	} catch (...) {
+		type_info.type_name = "varchar";
+		type_info.column_type = "varchar";
+		type_info.precision = -1;
+		type_info.scale = -1;
 	}
+
+	LogicalType column_type = LogicalType::VARCHAR;
+	try {
+		column_type = ODBCTypes::TypeToLogicalType({context}, type_info);
+	} catch (...) {
+		column_type = LogicalType::VARCHAR;
+	}
+
+	string is_nullable = "YES";
+	try {
+		is_nullable = result.IsNull(column_index + 4) ? "YES" : result.GetString(column_index + 4);
+	} catch (...) {
+		is_nullable = "YES";
+	}
+
+	ColumnDefinition column(std::move(column_name), std::move(column_type));
+	auto &create_info = *table_info.create_info;
+	if (is_nullable != "YES") {
+		auto column_idx = create_info.columns.LogicalColumnCount();
+		create_info.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(column_idx)));
+	}
+	create_info.columns.AddColumn(std::move(column));
 }
 
 void ODBCTableSet::LoadEntries(ClientContext &context) {
 
-	// Use INFORMATION_SCHEMA for ODBC compatibility instead of SQL Server specific sys.* tables
+	// Load table + column metadata from INFORMATION_SCHEMA in one pass.
+	// Avoid probing every table with SELECT * WHERE 1=0 during schema load, which can
+	// fail on some drivers for unrelated tables and break the whole attach.
 	auto query = StringUtil::Replace(R"(
 SELECT
     t.TABLE_NAME AS table_name,
@@ -86,68 +144,52 @@ ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION;
 
 	auto &transaction = ODBCTransaction::Get(context, catalog);
 	auto result = transaction.Query(query);
-
 	vector<unique_ptr<ODBCTableInfo>> tables;
 	unique_ptr<ODBCTableInfo> info;
 
 	while (result->Next()) {
 		try {
-			auto table_name = result->GetString(0);
-			auto column_name = result->GetString(1);
-			auto data_type = result->GetString(2);
-			
-			
+			string table_name = NormalizeRemoteName(result->GetString(0));
+			if (table_name.empty()) {
+				continue;
+			}
+
 			if (!info || info->GetTableName() != table_name) {
 				if (info) {
 					tables.push_back(std::move(info));
 				}
 				info = make_uniq<ODBCTableInfo>(schema, table_name);
 			}
-			
+
 			AddColumn(context, *result, *info, 1);
-		} catch (const std::exception &e) {
-			throw;
+		} catch (const std::exception &) {
+			// Keep loading other table metadata even if a single row is malformed.
+			continue;
 		}
 	}
-	
+
 	if (info) {
 		tables.push_back(std::move(info));
 	}
-	
+
 	for (auto &tbl_info : tables) {
+		if (tbl_info->create_info->columns.LogicalColumnCount() == 0) {
+			try {
+				RebuildColumnsFromDescribe(context, catalog, schema, *tbl_info);
+			} catch (const std::exception &) {
+				continue;
+			}
+		}
 		auto table_entry = make_uniq<ODBCTableEntry>(catalog, schema, *tbl_info);
 		CreateEntry(std::move(table_entry));
 	}
 	
 }
 
-string GetTableInfoQuery(const string &schema_name, const string &table_name) {
-	return StringUtil::Replace(StringUtil::Replace(R"(
-SELECT
-    c.COLUMN_NAME AS column_name,
-    c.DATA_TYPE AS data_type,
-    c.DATA_TYPE AS column_type,
-    c.COLUMN_DEFAULT AS column_default,
-    c.IS_NULLABLE AS is_nullable,
-    c.NUMERIC_PRECISION AS numeric_precision,
-    c.NUMERIC_SCALE AS numeric_scale
-FROM INFORMATION_SCHEMA.COLUMNS c
-WHERE c.TABLE_SCHEMA = ${SCHEMA_NAME} AND c.TABLE_NAME = ${TABLE_NAME}
-ORDER BY c.ORDINAL_POSITION;
-)",
-	                                               "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema_name)),
-	                           "${TABLE_NAME}", ODBCUtils::WriteLiteral(table_name));
-}
-
 unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODBCSchemaEntry &schema,
                                                        const string &table_name) {
-	auto &transaction = ODBCTransaction::Get(context, schema.ParentCatalog());
-	auto query = GetTableInfoQuery(schema.name, table_name);
-	auto result = transaction.Query(query);
 	auto table_info = make_uniq<ODBCTableInfo>(schema, table_name);
-	while (result->Next()) {
-		AddColumn(context, *result, *table_info, 0);
-	}
+	RebuildColumnsFromDescribe(context, schema.ParentCatalog(), schema, *table_info);
 	return table_info;
 }
 

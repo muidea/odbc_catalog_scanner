@@ -28,18 +28,22 @@ class ODBCResult;
 struct IndexInfo;
 
 struct OwnedODBCConnection {
-	explicit OwnedODBCConnection(SQLHDBC conn = nullptr) : connection(conn) {
+	explicit OwnedODBCConnection(SQLHDBC conn = nullptr, SQLHENV env = nullptr) : connection(conn), environment(env) {
 	}
 	~OwnedODBCConnection() {
-		if (!connection) {
-			return;
+		if (connection) {
+			SQLDisconnect(connection);
+			SQLFreeHandle(SQL_HANDLE_DBC, connection);
+			connection = nullptr;
 		}
-		SQLDisconnect(connection);
-		SQLFreeHandle(SQL_HANDLE_DBC, connection);
-		connection = nullptr;
+		if (environment) {
+			SQLFreeHandle(SQL_HANDLE_ENV, environment);
+			environment = nullptr;
+		}
 	}
 
 	SQLHDBC connection;
+	SQLHENV environment;
 };
 
 class ODBCConnection : public enable_shared_from_this<ODBCConnection> {

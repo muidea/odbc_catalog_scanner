@@ -2,18 +2,19 @@ cmake_minimum_required(VERSION 3.5.0)
 set(TARGET_NAME odbc_scanner)
 project(${TARGET_NAME})
 
-# Platform-specific dependency handling
+# Platform-specific dependency handling (Windows and Linux)
 if(WIN32)
-    # Windows: Use system ODBC SDK
+    # Windows: Use system ODBC SDK (odbc32.lib)
     set(ODBC_LIBRARY odbc32)
     set(ODBC_INCLUDE_DIR "")
-    message(STATUS "Using Windows ODBC SDK")
-    message(STATUS "Note: ODBC drivers (like FreeTDS) can be configured at runtime")
+    message(STATUS "ODBC: Using Windows ODBC SDK")
 else()
-    # Linux: vcpkg's unixodbc will be configured automatically via toolchain
-    # Note: find_package(UnixODBC) is provided by vcpkg
-    # For now, we rely on vcpkg setting up the paths correctly
-    message(STATUS "Using vcpkg unixodbc")
+    # Linux: unixODBC (libodbc.so); vcpkg or system package provides headers and -lodbc
+    set(ODBC_LIBRARY odbc)
+    if(NOT ODBC_INCLUDE_DIR)
+        set(ODBC_INCLUDE_DIR "")
+    endif()
+    message(STATUS "ODBC: Using unixODBC (Linux)")
 endif()
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)

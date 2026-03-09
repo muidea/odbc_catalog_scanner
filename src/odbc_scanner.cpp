@@ -7,6 +7,8 @@
 #include "storage/odbc_connection_pool.hpp"
 #include "storage/odbc_table_set.hpp"
 #include "odbc_filter_pushdown.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include <thread>
@@ -32,6 +34,41 @@ struct ODBCGlobalState : public GlobalTableFunctionState {
 	}
 };
 
+static string NormalizeSQLServerDateTimeOffset(string input) {
+	StringUtil::Trim(input);
+	auto sign_pos = input.find_last_of("+-");
+	if (sign_pos != string::npos && sign_pos > 0 && input[sign_pos - 1] == ' ') {
+		input.erase(sign_pos - 1, 1);
+	}
+	return input;
+}
+
+static bool TryCastDateTimeOffsetVector(Vector &res_vec, Vector &output_vec, idx_t count, string &error) {
+	if (res_vec.GetType().id() != LogicalTypeId::VARCHAR || output_vec.GetType().id() != LogicalTypeId::TIMESTAMP_TZ) {
+		return false;
+	}
+	auto src = FlatVector::GetData<string_t>(res_vec);
+	auto dst = FlatVector::GetData<timestamp_tz_t>(output_vec);
+	for (idx_t r = 0; r < count; r++) {
+		if (FlatVector::IsNull(res_vec, r)) {
+			FlatVector::SetNull(output_vec, r, true);
+			continue;
+		}
+		auto s = src[r];
+		string raw(s.GetData(), s.GetSize());
+		string normalized = NormalizeSQLServerDateTimeOffset(raw);
+		timestamp_t parsed_ts;
+		if (Timestamp::TryConvertTimestamp(normalized.c_str(), normalized.size(), parsed_ts, true) !=
+		    TimestampCastResult::SUCCESS) {
+			error = StringUtil::Format("invalid timestamp field format: \"%s\"", raw);
+			return false;
+		}
+		dst[r] = timestamp_tz_t(parsed_ts.value);
+	}
+	error.clear();
+	return true;
+}
+
 static unique_ptr<FunctionData> ODBCBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
 	throw InternalException("ODBCBind");
@@ -40,25 +77,41 @@ static unique_ptr<FunctionData> ODBCBind(ClientContext &context, TableFunctionBi
 static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &context,
                                                                  TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<ODBCBindData>();
+	auto &transaction = ODBCTransaction::Get(context, bind_data.table.catalog);
+	auto &con = transaction.GetConnection();
+
+	if (bind_data.table.GetColumns().LogicalColumnCount() == 0) {
+		string probe_query = "SELECT * FROM " + ODBCUtils::WriteIdentifier(bind_data.table.schema.name) + "." +
+		                     ODBCUtils::WriteIdentifier(bind_data.table.name) + " WHERE 1=0";
+		auto probe_result = con.Query(probe_query, ODBCResultStreaming::FORCE_MATERIALIZATION);
+		if (probe_result->Fields().empty()) {
+			throw InvalidInputException("ODBC table %s.%s has no readable columns from remote metadata",
+			                            bind_data.table.schema.name.c_str(), bind_data.table.name.c_str());
+		}
+	}
 	// generate the SELECT statement
 	string select;
 	select += "SELECT ";
-	
+
 	// For SQL Server, TOP clause must come immediately after SELECT
 	if (!bind_data.limit.empty()) {
 		select += bind_data.limit;
 	}
-	
-	for (idx_t c = 0; c < input.column_ids.size(); c++) {
-		if (c > 0) {
-			select += ", ";
-		}
-		if (input.column_ids[c] == COLUMN_IDENTIFIER_ROW_ID) {
-			select += "NULL";
-		} else {
-			auto &col = bind_data.table.GetColumn(LogicalIndex(input.column_ids[c]));
-			auto col_name = col.GetName();
-			select += ODBCUtils::WriteIdentifier(col_name);
+
+	if (input.column_ids.empty()) {
+		// Table has no columns in catalog (e.g. 0 columns from GetTableInfo on Windows); use SELECT *
+		select += "*";
+	} else {
+		for (idx_t c = 0; c < input.column_ids.size(); c++) {
+			if (c > 0) {
+				select += ", ";
+			}
+			if (input.column_ids[c] == COLUMN_IDENTIFIER_ROW_ID) {
+				select += "NULL";
+			} else {
+				auto &col = bind_data.table.GetColumn(LogicalIndex(input.column_ids[c]));
+				select += ODBCUtils::WriteIdentifier(col.GetName());
+			}
 		}
 	}
 	select += " FROM ";
@@ -71,9 +124,6 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 	}
 
 	// run the query
-	auto &transaction = ODBCTransaction::Get(context, bind_data.table.catalog);
-	auto &con = transaction.GetConnection();
-	
 	auto query_result = con.Query(select, bind_data.streaming);
 	
 	// 检查查询结果是否为空
@@ -135,7 +185,16 @@ static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk
 		// 总是使用 TryCast 进行安全的数据复制，避免引用生命周期问题
 		VectorOperations::TryCast(context, res_vec, output_vec, res_chunk.size(), &error);
 		
-		// throw an error in case of TryCast fails
+		// SQL Server datetimeoffset text can contain a space before timezone offset,
+		// e.g. "2025-01-15 12:30:00.0000000 +05:30", which DuckDB cast rejects.
+		// Try a normalized fallback cast for TIMESTAMP_TZ columns.
+		if (!error.empty()) {
+			if (TryCastDateTimeOffsetVector(res_vec, output_vec, res_chunk.size(), error)) {
+				continue;
+			}
+		}
+
+		// throw an error in case TryCast fails
 		if (!error.empty()) {
 			throw BinderException(error);
 		}
