@@ -14,6 +14,12 @@ static bool ODBCSchemaIsInternal(const string &name) {
 	return false;
 }
 
+static string NormalizeSchemaName(string name) {
+	name.erase(std::remove(name.begin(), name.end(), '\0'), name.end());
+	StringUtil::Trim(name);
+	return name;
+}
+
 ODBCSchemaSet::ODBCSchemaSet(Catalog &catalog) : ODBCCatalogSet(catalog) {
 }
 
@@ -34,17 +40,10 @@ ORDER BY SCHEMA_NAME;
 	while (result->Next()) {
 		schema_count++;
 		CreateSchemaInfo info;
-		info.schema = result->GetString(0);
-
-		// Remove embedded null characters and trim whitespace
-		info.schema.erase(std::remove(info.schema.begin(), info.schema.end(), '\0'), info.schema.end());
-		StringUtil::Trim(info.schema);
-
-		// Skip empty schema names
+		info.schema = NormalizeSchemaName(result->GetString(0));
 		if (info.schema.empty()) {
 			continue;
 		}
-
 		info.internal = ODBCSchemaIsInternal(info.schema);
 		auto schema = make_uniq<ODBCSchemaEntry>(catalog, info);
 		CreateEntry(std::move(schema));
@@ -64,28 +63,37 @@ ORDER BY SCHEMA_NAME;
 		// Try SQL Server specific query as fallback
 		auto fallback_query = R"(
 SELECT name AS schema_name
-FROM sys.databases;
+FROM sys.schemas;
 )";
 		auto fallback_result = transaction.Query(fallback_query);
 		while (fallback_result->Next()) {
 			schema_count++;
 			CreateSchemaInfo info;
-			info.schema = fallback_result->GetString(0);
-
-			// Remove embedded null characters and trim whitespace
-			info.schema.erase(std::remove(info.schema.begin(), info.schema.end(), '\0'), info.schema.end());
-			StringUtil::Trim(info.schema);
-
-			// Skip empty schema names
+			info.schema = NormalizeSchemaName(fallback_result->GetString(0));
 			if (info.schema.empty()) {
 				continue;
 			}
-
 			info.internal = ODBCSchemaIsInternal(info.schema);
 			auto schema = make_uniq<ODBCSchemaEntry>(catalog, info);
 			CreateEntry(std::move(schema));
 			schema_names.push_back(info.schema);
 		}
+	}
+
+	// Ensure SQL Server default schema is available even under metadata encoding issues
+	bool has_dbo = false;
+	for (auto &schema_name : schema_names) {
+		if (StringUtil::CIEquals(schema_name, "dbo")) {
+			has_dbo = true;
+			break;
+		}
+	}
+	if (!has_dbo) {
+		CreateSchemaInfo info;
+		info.schema = "dbo";
+		info.internal = false;
+		auto schema = make_uniq<ODBCSchemaEntry>(catalog, info);
+		CreateEntry(std::move(schema));
 	}
 }
 

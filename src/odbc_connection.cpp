@@ -101,7 +101,7 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 			if (!SQL_SUCCEEDED(retcode)) {
 				throw IOException("Failed to run query \"%s\"\n", query.c_str());
 			}
-		} catch (const std::exception &e) {
+		} catch (const std::exception &) {
 			// 确保语句句柄被清理
 			if (hstmt != SQL_NULL_HSTMT) {
 				SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
@@ -277,7 +277,7 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 	idx_t affected_rows = 0;
 	try {
 		affected_rows = ODBCExecute(hstmt, query, params, result_streaming);
-	} catch (const std::exception &e) {
+	} catch (const std::exception &) {
 		// 执行失败，清理语句句柄
 		if (hstmt != SQL_NULL_HSTMT) {
 			SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
