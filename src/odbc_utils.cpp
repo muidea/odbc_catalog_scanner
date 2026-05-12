@@ -86,6 +86,25 @@ uint32_t ParsePort(const string &value) {
 	return uint32_t(port_val);
 }
 
+string EscapeODBCConnectionValue(const string &value) {
+	if (value.empty()) {
+		return value;
+	}
+	if (value.find_first_of(";{}") == string::npos) {
+		return value;
+	}
+	string result = "{";
+	for (auto c : value) {
+		if (c == '}') {
+			result += "}}";
+		} else {
+			result += c;
+		}
+	}
+	result += "}";
+	return result;
+}
+
 std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConnectionParameters(const string &dsn) {
 	ODBCConnectionParameters result;
 
@@ -108,15 +127,41 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 		pos++; // skip '='
 		
 		// Parse value
-		while (pos < dsn.size() && dsn[pos] != ';') {
-			value += dsn[pos];
-			pos++;
+		if (pos < dsn.size() && dsn[pos] == '{') {
+			pos++; // skip '{'
+			bool found_closing_brace = false;
+			while (pos < dsn.size()) {
+				if (dsn[pos] == '}') {
+					if (pos + 1 < dsn.size() && dsn[pos + 1] == '}') {
+						value += '}';
+						pos += 2;
+						continue;
+					}
+					pos++; // skip closing '}'
+					found_closing_brace = true;
+					break;
+				}
+				value += dsn[pos];
+				pos++;
+			}
+			if (!found_closing_brace) {
+				throw InvalidInputException("Invalid connection string \"%s\" - unterminated braced value", dsn);
+			}
+			if (pos < dsn.size() && dsn[pos] != ';') {
+				throw InvalidInputException("Invalid connection string \"%s\" - expected semicolon after braced value", dsn);
+			}
+		} else {
+			while (pos < dsn.size() && dsn[pos] != ';') {
+				value += dsn[pos];
+				pos++;
+			}
 		}
 		
 		if (pos < dsn.size() && dsn[pos] == ';') {
 			pos++; // skip ';'
 		}
 		
+		auto original_key = key;
 		key = StringUtil::Lower(key);
 
 		if (set_options.find(key) != set_options.end()) {
@@ -146,7 +191,7 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 			result.port = ParsePort(value);
 		} else {
 			// Preserve driver-specific parameters (like TDS_Version) verbatim
-			result.extra_params.push_back(key + "=" + value);
+			result.extra_params.push_back(original_key + "=" + value);
 			continue;
 		}
 	}
@@ -162,19 +207,19 @@ string ODBCUtils::BuildConnectionString(const string &dsn) {
 
 	string connection_string;
 	if (!config.driver.empty()) {
-		connection_string += "DRIVER=" + config.driver + ";";
+		connection_string += "DRIVER=" + EscapeODBCConnectionValue(config.driver) + ";";
 	}
 	if (!config.server.empty()) {
-		connection_string += "SERVER=" + config.server + ";";
+		connection_string += "SERVER=" + EscapeODBCConnectionValue(config.server) + ";";
 	}
 	if (!config.uid.empty()) {
-		connection_string += "UID=" + config.uid + ";";
+		connection_string += "UID=" + EscapeODBCConnectionValue(config.uid) + ";";
 	}
 	if (!config.pwd.empty()) {
-		connection_string += "PWD=" + config.pwd + ";";
+		connection_string += "PWD=" + EscapeODBCConnectionValue(config.pwd) + ";";
 	}
 	if (!config.database.empty()) {
-		connection_string += "DATABASE=" + config.database + ";";
+		connection_string += "DATABASE=" + EscapeODBCConnectionValue(config.database) + ";";
 	}
 	if (config.port != 0) {
 		connection_string += "PORT=" + std::to_string(config.port) + ";";
@@ -182,14 +227,19 @@ string ODBCUtils::BuildConnectionString(const string &dsn) {
 
 	// Append driver-specific / unrecognized parameters verbatim
 	for (auto &extra : config.extra_params) {
-		connection_string += extra + ";";
+		auto separator = extra.find('=');
+		if (separator == string::npos) {
+			connection_string += extra + ";";
+			continue;
+		}
+		connection_string += extra.substr(0, separator + 1) + EscapeODBCConnectionValue(extra.substr(separator + 1)) + ";";
 	}
 
 #ifndef _WIN32
-	if (connection_string.find("ClientCharset") == string::npos) {
+	if (StringUtil::Lower(connection_string).find("clientcharset") == string::npos) {
 		connection_string += "ClientCharset=UTF-8;";
 	}
-	if (connection_string.find("TDS_Version") == string::npos) {
+	if (StringUtil::Lower(connection_string).find("tds_version") == string::npos) {
 		connection_string += "TDS_Version=8.0;";
 	}
 #endif

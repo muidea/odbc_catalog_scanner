@@ -342,6 +342,8 @@ void TryConvertURI(string &dsn) {
 		start_pos = 8;
 	} else if (StringUtil::StartsWith(dsn, "odbcx://")) {
 		start_pos = 9;
+	} else {
+		return;
 	}
 
 	// try to convert this as a URI

@@ -14,7 +14,7 @@
 
 namespace duckdb {
 
-static bool debug_odbc_print_queries = true;
+static bool debug_odbc_print_queries = false;
 
 static SQLRETURN SQLExecDirectWithFallback(SQLHSTMT stmt, const string &query) {
 #ifdef _WIN32
