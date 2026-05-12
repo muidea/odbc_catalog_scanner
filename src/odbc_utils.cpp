@@ -1,6 +1,14 @@
 #include "odbc_utils.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <mutex>
 #include <tuple>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include <sql.h>
 #include <sqlext.h>
@@ -11,6 +19,10 @@
 #include "storage/odbc_transaction.hpp"
 
 namespace duckdb {
+
+#ifndef _WIN32
+static std::mutex odbc_ini_mutex;
+#endif
 
 static bool ParseValue(const string &dsn, idx_t &pos, string &result) {
 	// skip leading spaces
@@ -104,6 +116,105 @@ string EscapeODBCConnectionValue(const string &value) {
 	result += "}";
 	return result;
 }
+
+#ifndef _WIN32
+bool HasExtraParam(const vector<string> &extra_params, const string &name) {
+	auto lower_name = StringUtil::Lower(name);
+	for (auto &extra : extra_params) {
+		auto separator = extra.find('=');
+		auto key = separator == string::npos ? extra : extra.substr(0, separator);
+		if (StringUtil::Lower(key) == lower_name) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void WriteODBCIniValue(std::ofstream &file, const string &key, const string &value) {
+	if (value.find_first_of("\r\n") != string::npos) {
+		throw InvalidInputException("Invalid ODBC connection value for \"%s\" - newlines are not supported", key);
+	}
+	file << key << "=" << value << "\n";
+}
+
+string CreateTemporaryODBCIni(const ODBCConnectionParameters &config, string &dsn_name) {
+	char path_template[] = "/tmp/duckdb_odbc_XXXXXX";
+	auto fd = mkstemp(path_template);
+	if (fd < 0) {
+		throw IOException("Failed to create temporary ODBC ini file");
+	}
+	close(fd);
+
+	string path = path_template;
+	auto slash = path.find_last_of('/');
+	dsn_name = slash == string::npos ? path : path.substr(slash + 1);
+
+	std::ofstream file(path);
+	if (!file.is_open()) {
+		std::remove(path.c_str());
+		throw IOException("Failed to open temporary ODBC ini file \"%s\"", path);
+	}
+
+	file << "[" << dsn_name << "]\n";
+	WriteODBCIniValue(file, "Driver", config.driver);
+	WriteODBCIniValue(file, "Server", config.server);
+	if (config.port != 0) {
+		WriteODBCIniValue(file, "Port", std::to_string(config.port));
+	}
+	if (!config.database.empty()) {
+		WriteODBCIniValue(file, "Database", config.database);
+	}
+	for (auto &extra : config.extra_params) {
+		auto separator = extra.find('=');
+		if (separator == string::npos) {
+			continue;
+		}
+		WriteODBCIniValue(file, extra.substr(0, separator), extra.substr(separator + 1));
+	}
+	if (!HasExtraParam(config.extra_params, "ClientCharset")) {
+		WriteODBCIniValue(file, "ClientCharset", "UTF-8");
+	}
+	if (!HasExtraParam(config.extra_params, "TDS_Version")) {
+		WriteODBCIniValue(file, "TDS_Version", "8.0");
+	}
+
+	file.close();
+	if (!file.good()) {
+		std::remove(path.c_str());
+		throw IOException("Failed to write temporary ODBC ini file \"%s\"", path);
+	}
+	return path;
+}
+
+bool ShouldUseSQLConnectPasswordFallback(const ODBCConnectionParameters &config) {
+	return !config.driver.empty() && !config.server.empty() && !config.uid.empty() && !config.pwd.empty() &&
+	       config.pwd.find('}') != string::npos;
+}
+
+SQLRETURN SQLConnectWithTemporaryDSN(SQLHDBC dbc, const ODBCConnectionParameters &config) {
+	string dsn_name;
+	auto odbc_ini_path = CreateTemporaryODBCIni(config, dsn_name);
+
+	lock_guard<std::mutex> lock(odbc_ini_mutex);
+	auto old_odbc_ini = std::getenv("ODBCINI");
+	string old_odbc_ini_value;
+	if (old_odbc_ini) {
+		old_odbc_ini_value = old_odbc_ini;
+	}
+	setenv("ODBCINI", odbc_ini_path.c_str(), 1);
+
+	auto ret = SQLConnect(dbc, (SQLCHAR *)dsn_name.c_str(), SQL_NTS, (SQLCHAR *)config.uid.c_str(), SQL_NTS,
+	                      (SQLCHAR *)config.pwd.c_str(), SQL_NTS);
+
+	if (old_odbc_ini) {
+		setenv("ODBCINI", old_odbc_ini_value.c_str(), 1);
+	} else {
+		unsetenv("ODBCINI");
+	}
+	std::remove(odbc_ini_path.c_str());
+	return ret;
+}
+#endif
 
 std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConnectionParameters(const string &dsn) {
 	ODBCConnectionParameters result;
@@ -269,12 +380,23 @@ SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env) {
 		throw IOException("Failed to allocate ODBC connection handle");
 	}
 
-	string connection_string = BuildConnectionString(dsn);
+	ODBCConnectionParameters config;
+	unordered_set<string> unused_params;
+	std::tie(config, unused_params) = ParseConnectionParameters(dsn);
 
-	SQLCHAR outstr[1024];
-	SQLSMALLINT outstrlen;
-	ret = SQLDriverConnect(dbc, NULL, (SQLCHAR *)connection_string.c_str(), SQL_NTS, outstr, sizeof(outstr),
-	                       &outstrlen, SQL_DRIVER_NOPROMPT);
+#ifndef _WIN32
+	if (ShouldUseSQLConnectPasswordFallback(config)) {
+		ret = SQLConnectWithTemporaryDSN(dbc, config);
+	} else
+#endif
+	{
+		string connection_string = BuildConnectionString(dsn);
+
+		SQLCHAR outstr[1024];
+		SQLSMALLINT outstrlen;
+		ret = SQLDriverConnect(dbc, NULL, (SQLCHAR *)connection_string.c_str(), SQL_NTS, outstr, sizeof(outstr),
+		                       &outstrlen, SQL_DRIVER_NOPROMPT);
+	}
 
 	if (!SQL_SUCCEEDED(ret)) {
 		SQLCHAR sqlstate[6] = {0};
