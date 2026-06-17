@@ -55,10 +55,10 @@ SinkFinalizeType ODBCExecuteQuery::Finalize(Pipeline &pipeline, Event &event, Cl
 }
 
 //===--------------------------------------------------------------------===//
-// GetData
+// GetDataInternal
 //===--------------------------------------------------------------------===//
-SourceResultType ODBCExecuteQuery::GetData(ExecutionContext &context, DataChunk &chunk,
-                                            OperatorSourceInput &input) const {
+SourceResultType ODBCExecuteQuery::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                   OperatorSourceInput &input) const {
 	auto &insert_gstate = sink_state->Cast<ODBCExecuteQueryGlobalState>();
 	chunk.SetCardinality(1);
 	chunk.SetValue(0, 0, Value::BIGINT(insert_gstate.affected_rows));

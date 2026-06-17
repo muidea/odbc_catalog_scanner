@@ -10,6 +10,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "storage/odbc_catalog.hpp"
 #include "storage/odbc_optimizer.hpp"
 
@@ -83,7 +84,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 
 	auto &config = DBConfig::GetConfig(db);
-	config.storage_extensions["odbc_scanner"] = make_uniq<ODBCStorageExtension>();
+	StorageExtension::Register(config, "odbc_scanner", make_shared_ptr<ODBCStorageExtension>());
 
 	config.AddExtensionOption("odbc_experimental_filter_pushdown",
 	                          "Whether or not to use filter pushdown (currently experimental)", LogicalType::BOOLEAN,
@@ -104,7 +105,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	OptimizerExtension odbc_optimizer;
 	odbc_optimizer.optimize_function = ODBCOptimizer::Optimize;
-	config.optimizer_extensions.push_back(std::move(odbc_optimizer));
+	OptimizerExtension::Register(config, std::move(odbc_optimizer));
 }
 
 void ODBCScannerExtension::Load(ExtensionLoader &loader) {

@@ -2,6 +2,7 @@
 
 #include "odbc_storage.hpp"
 #include "storage/odbc_catalog.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "storage/odbc_transaction_manager.hpp"
 
@@ -11,7 +12,7 @@ static unique_ptr<Catalog> ODBCAttach(optional_ptr<StorageExtensionInfo> storage
                                        AttachedDatabase &db, const string &name, AttachInfo &info,
                                        AttachOptions &attach_options) {
 	auto &config = DBConfig::GetConfig(context);
-	if (!config.options.enable_external_access) {
+	if (!Settings::Get<EnableExternalAccessSetting>(config)) {
 		throw PermissionException("Attaching ODBC databases is disabled through configuration");
 	}
 	// check if we have a secret provided

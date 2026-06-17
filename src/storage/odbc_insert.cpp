@@ -244,9 +244,10 @@ SinkFinalizeType ODBCInsert::Finalize(Pipeline &pipeline, Event &event, ClientCo
 }
 
 //===--------------------------------------------------------------------===//
-// GetData
+// GetDataInternal
 //===--------------------------------------------------------------------===//
-SourceResultType ODBCInsert::GetData(ExecutionContext &context, DataChunk &chunk, OperatorSourceInput &input) const {
+SourceResultType ODBCInsert::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                             OperatorSourceInput &input) const {
 	auto &insert_gstate = sink_state->Cast<ODBCInsertGlobalState>();
 	chunk.SetCardinality(1);
 	chunk.SetValue(0, 0, Value::BIGINT(insert_gstate.insert_count));
