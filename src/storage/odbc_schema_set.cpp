@@ -44,7 +44,10 @@ ORDER BY SCHEMA_NAME;
 		if (info.schema.empty()) {
 			continue;
 		}
-		info.internal = ODBCSchemaIsInternal(info.schema);
+		if (ODBCSchemaIsInternal(info.schema)) {
+			continue;
+		}
+		info.internal = false;
 		auto schema = make_uniq<ODBCSchemaEntry>(catalog, info);
 		CreateEntry(std::move(schema));
 		schema_names.push_back(info.schema);
@@ -73,7 +76,10 @@ FROM sys.schemas;
 			if (info.schema.empty()) {
 				continue;
 			}
-			info.internal = ODBCSchemaIsInternal(info.schema);
+			if (ODBCSchemaIsInternal(info.schema)) {
+				continue;
+			}
+			info.internal = false;
 			auto schema = make_uniq<ODBCSchemaEntry>(catalog, info);
 			CreateEntry(std::move(schema));
 			schema_names.push_back(info.schema);

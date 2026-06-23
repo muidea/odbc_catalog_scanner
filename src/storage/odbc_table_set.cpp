@@ -28,6 +28,11 @@ static string NormalizeObjectName(string name) {
 	return name;
 }
 
+static bool ODBCSchemaIsInternal(const string &name) {
+	auto lower = StringUtil::Lower(name);
+	return lower == "information_schema" || lower == "performance_schema" || lower == "sys";
+}
+
 void ODBCTableSet::AddColumn(ClientContext &context, ODBCResult &result, ODBCTableInfo &table_info,
                                idx_t column_offset) {
 	ODBCTypeData type_info;
@@ -69,6 +74,9 @@ void ODBCTableSet::AddColumn(ClientContext &context, ODBCResult &result, ODBCTab
 }
 
 void ODBCTableSet::LoadEntries(ClientContext &context) {
+	if (ODBCSchemaIsInternal(schema.name)) {
+		return;
+	}
 	// First fetch the list of base tables in this schema
 	auto query = StringUtil::Replace(R"(
 SELECT
