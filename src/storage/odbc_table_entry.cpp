@@ -73,7 +73,7 @@ ODBCTableEntry::ODBCTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, Cre
 }
 
 ODBCTableEntry::ODBCTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, ODBCTableInfo &info)
-    : TableCatalogEntry(catalog, schema, *info.create_info) {
+    : TableCatalogEntry(catalog, schema, *info.create_info), remote_column_names(info.remote_column_names) {
 	this->internal = TableIsInternal(schema, name);
 }
 
@@ -87,9 +87,16 @@ void ODBCTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &, Logical
 
 TableFunction ODBCTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
 	auto result = make_uniq<ODBCBindData>(*this);
+	idx_t column_index = 0;
 	for (auto &col : columns.Logical()) {
 		result->types.push_back(col.GetType());
 		result->names.push_back(col.GetName());
+		if (column_index < remote_column_names.size()) {
+			result->remote_names.push_back(remote_column_names[column_index]);
+		} else {
+			result->remote_names.push_back(col.GetName());
+		}
+		column_index++;
 	}
 
 	bind_data = std::move(result);

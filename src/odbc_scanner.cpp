@@ -93,8 +93,14 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 		if (input.column_ids[c] == COLUMN_IDENTIFIER_ROW_ID) {
 			select += "NULL";
 		} else {
-			auto &col = bind_data.table.GetColumn(LogicalIndex(input.column_ids[c]));
-			auto col_name = col.GetName();
+			auto column_id = input.column_ids[c];
+			string col_name;
+			if (column_id < bind_data.remote_names.size()) {
+				col_name = bind_data.remote_names[column_id];
+			} else {
+				auto &col = bind_data.table.GetColumn(LogicalIndex(column_id));
+				col_name = col.GetName();
+			}
 			select += ODBCUtils::WriteIdentifier(col_name);
 		}
 	}
@@ -102,7 +108,8 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 	select += ODBCUtils::WriteIdentifier(bind_data.table.schema.name);
 	select += ".";
 	select += ODBCUtils::WriteIdentifier(bind_data.table.name);
-	string filter_string = ODBCFilterPushdown::TransformFilters(input.column_ids, input.filters, bind_data.names);
+	auto &filter_names = bind_data.remote_names.empty() ? bind_data.names : bind_data.remote_names;
+	string filter_string = ODBCFilterPushdown::TransformFilters(input.column_ids, input.filters, filter_names);
 	if (!filter_string.empty()) {
 		select += " WHERE " + filter_string;
 	}

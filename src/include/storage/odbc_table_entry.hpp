@@ -30,6 +30,7 @@ struct ODBCTableInfo {
 	}
 
 	unique_ptr<CreateTableInfo> create_info;
+	vector<string> remote_column_names;
 };
 
 class ODBCTableEntry : public TableCatalogEntry {
@@ -46,6 +47,8 @@ public:
 
 	void BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj, LogicalUpdate &update,
 	                           ClientContext &context) override;
+
+	vector<string> remote_column_names;
 };
 
 } // namespace duckdb

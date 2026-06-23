@@ -128,12 +128,14 @@ unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODB
 	auto table_info = make_uniq<ODBCTableInfo>(schema, table_name);
 	// The probe query returns no rows; we only need the field metadata.
 	for (auto &field : result->Fields()) {
+		auto remote_column_name = field.name;
 		auto column_name = NormalizeObjectName(field.name);
 		if (column_name.empty()) {
 			continue;
 		}
 		ColumnDefinition column(std::move(column_name), field.duckdb_type);
 		table_info->create_info->columns.AddColumn(std::move(column));
+		table_info->remote_column_names.push_back(std::move(remote_column_name));
 	}
 	return table_info;
 }
