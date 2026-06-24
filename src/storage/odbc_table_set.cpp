@@ -24,7 +24,15 @@ ODBCTableSet::ODBCTableSet(ODBCSchemaEntry &schema) : ODBCInSchemaSet(schema) {
 
 static string NormalizeObjectName(string name) {
 	name.erase(std::remove(name.begin(), name.end(), '\0'), name.end());
-	StringUtil::Trim(name);
+	auto is_ascii_space = [](unsigned char ch) {
+		return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
+	};
+	while (!name.empty() && is_ascii_space(static_cast<unsigned char>(name.front()))) {
+		name.erase(name.begin());
+	}
+	while (!name.empty() && is_ascii_space(static_cast<unsigned char>(name.back()))) {
+		name.pop_back();
+	}
 	return name;
 }
 
