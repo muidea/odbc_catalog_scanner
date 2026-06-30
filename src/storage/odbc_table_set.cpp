@@ -85,42 +85,129 @@ void ODBCTableSet::LoadEntries(ClientContext &context) {
 	if (ODBCSchemaIsInternal(schema.name)) {
 		return;
 	}
-	// First fetch the list of base tables in this schema
-	auto query = StringUtil::Replace(R"(
-SELECT
-    t.TABLE_NAME AS table_name
-FROM INFORMATION_SCHEMA.TABLES t
-WHERE t.TABLE_SCHEMA = ${SCHEMA_NAME} AND t.TABLE_TYPE = 'BASE TABLE'
-ORDER BY t.TABLE_NAME;
-)",
-	                                 "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
-
-	auto &transaction = ODBCTransaction::Get(context, catalog);
-	auto result = transaction.Query(query);
-
-	while (result->Next()) {
-		auto table_name = NormalizeObjectName(result->GetString(0));
+	auto load_table_entry = [&](const string &raw_table_name) -> bool {
+		auto table_name = NormalizeObjectName(raw_table_name);
 		if (table_name.empty()) {
-			continue;
+			return false;
 		}
 		// Skip obviously corrupted table names to avoid failing the whole schema
 		// load because of encoding issues on a single table.
 		if (table_name.find('?') != string::npos) {
-			continue;
+			return false;
 		}
 		try {
 			auto table_info = GetTableInfo(context, schema, table_name);
 			if (!table_info) {
-				continue;
+				return false;
 			}
 			auto table_entry = make_uniq<ODBCTableEntry>(catalog, schema, *table_info);
 			CreateEntry(std::move(table_entry));
+			return true;
 		} catch (...) {
 			// Ignore per-table probe errors (e.g., 42S02 for corrupted names)
 			// and continue loading remaining tables.
-			continue;
+			return false;
 		}
+	};
+
+	auto load_table_entries_from_query = [&](const string &query) -> idx_t {
+		auto &transaction = ODBCTransaction::Get(context, catalog);
+		idx_t loaded_count = 0;
+		try {
+			auto result = transaction.Query(query);
+			while (result->Next()) {
+				if (load_table_entry(result->GetString(0))) {
+					loaded_count++;
+				}
+			}
+		} catch (...) {
+			return 0;
+		}
+		return loaded_count;
+	};
+
+	auto load_table_entries_from_odbc_catalog = [&]() -> idx_t {
+		auto &transaction = ODBCTransaction::Get(context, catalog);
+		SQLHSTMT stmt = SQL_NULL_HSTMT;
+		auto retcode = SQLAllocHandle(SQL_HANDLE_STMT, transaction.GetConnection().GetConn(), &stmt);
+		if (!SQL_SUCCEEDED(retcode)) {
+			return 0;
+		}
+
+		idx_t loaded_count = 0;
+		auto cleanup = [&]() {
+			if (stmt != SQL_NULL_HSTMT) {
+				SQLFreeStmt(stmt, SQL_CLOSE);
+				SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+				stmt = SQL_NULL_HSTMT;
+			}
+		};
+
+		retcode = SQLTables(stmt, nullptr, 0, (SQLCHAR *)schema.name.c_str(), SQL_NTS, nullptr, 0,
+		                    (SQLCHAR *)"TABLE,VIEW", SQL_NTS);
+		if (!SQL_SUCCEEDED(retcode)) {
+			cleanup();
+			return 0;
+		}
+
+		SQLCHAR table_name_buffer[1024] = {};
+		SQLCHAR table_type_buffer[128] = {};
+		SQLLEN table_name_indicator = 0;
+		SQLLEN table_type_indicator = 0;
+		SQLBindCol(stmt, 3, SQL_C_CHAR, table_name_buffer, sizeof(table_name_buffer), &table_name_indicator);
+		SQLBindCol(stmt, 4, SQL_C_CHAR, table_type_buffer, sizeof(table_type_buffer), &table_type_indicator);
+
+		while (SQL_SUCCEEDED(retcode = SQLFetch(stmt))) {
+			if (table_name_indicator == SQL_NULL_DATA) {
+				continue;
+			}
+			string table_type;
+			if (table_type_indicator != SQL_NULL_DATA) {
+				table_type = StringUtil::Upper(string((char *)table_type_buffer));
+			}
+			if (!table_type.empty() && table_type != "TABLE" && table_type != "BASE TABLE" && table_type != "VIEW") {
+				continue;
+			}
+			if (load_table_entry(string((char *)table_name_buffer))) {
+				loaded_count++;
+			}
+		}
+		cleanup();
+		return loaded_count;
+	};
+
+	// First fetch the list of base tables and views in this schema.
+	auto query = StringUtil::Replace(R"(
+SELECT
+    t.TABLE_NAME AS table_name
+FROM INFORMATION_SCHEMA.TABLES t
+WHERE t.TABLE_SCHEMA = ${SCHEMA_NAME} AND t.TABLE_TYPE IN ('BASE TABLE', 'VIEW')
+ORDER BY t.TABLE_NAME;
+)",
+	                                 "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
+
+	auto loaded_count = load_table_entries_from_query(query);
+	if (loaded_count > 0) {
+		return;
 	}
+
+	// SQL Server fallback for drivers/environments where INFORMATION_SCHEMA.TABLES
+	// is unavailable or incomplete.
+	auto sql_server_fallback_query = StringUtil::Replace(R"(
+SELECT
+    o.name AS table_name
+FROM sys.objects o
+JOIN sys.schemas s ON o.schema_id = s.schema_id
+WHERE s.name = ${SCHEMA_NAME} AND o.type IN ('U', 'V')
+ORDER BY o.name;
+)",
+	                                                    "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
+	loaded_count = load_table_entries_from_query(sql_server_fallback_query);
+	if (loaded_count > 0) {
+		return;
+	}
+
+	(void)load_table_entries_from_odbc_catalog();
 }
 
 string GetTableInfoQuery(const string &schema_name, const string &table_name) {
