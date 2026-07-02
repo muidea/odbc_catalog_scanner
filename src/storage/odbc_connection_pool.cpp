@@ -1,8 +1,10 @@
 #include "storage/odbc_connection_pool.hpp"
 #include "storage/odbc_catalog.hpp"
 
+#include <atomic>
+
 namespace duckdb {
-static bool odbc_use_connection_cache = true;
+static std::atomic<bool> odbc_use_connection_cache {true};
 
 ODBCPoolConnection::ODBCPoolConnection() : pool(nullptr) {
 }
@@ -76,7 +78,7 @@ void ODBCConnectionPool::ODBCSetConnectionCache(ClientContext &context, SetScope
 	if (parameter.IsNull()) {
 		throw BinderException("Cannot be set to NULL");
 	}
-	odbc_use_connection_cache = BooleanValue::Get(parameter);
+	odbc_use_connection_cache.store(BooleanValue::Get(parameter), std::memory_order_relaxed);
 }
 
 ODBCPoolConnection ODBCConnectionPool::GetConnection() {
@@ -100,7 +102,7 @@ void ODBCConnectionPool::ReturnConnection(shared_ptr<ODBCConnection> connection)
 		// immediately
 		return;
 	}
-	if (!odbc_use_connection_cache) {
+	if (!odbc_use_connection_cache.load(std::memory_order_relaxed)) {
 		return;
 	}
 	// check if the underlying connection is still usable

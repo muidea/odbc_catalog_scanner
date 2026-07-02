@@ -8,6 +8,7 @@ add_library(
   odbc_execute.cpp
   odbc_extension.cpp
   odbc_filter_pushdown.cpp
+  odbc_metadata.cpp
   odbc_parameter.cpp
   odbc_result.cpp
   odbc_scanner.cpp

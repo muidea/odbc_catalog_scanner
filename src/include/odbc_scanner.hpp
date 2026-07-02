@@ -68,6 +68,11 @@ public:
 	ODBCQueryFunction();
 };
 
+class ODBCMetadataFunction : public TableFunction {
+public:
+	ODBCMetadataFunction();
+};
+
 class ODBCClearCacheFunction : public TableFunction {
 public:
 	ODBCClearCacheFunction();

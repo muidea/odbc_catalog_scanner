@@ -23,6 +23,11 @@ ODBCCatalog::ODBCCatalog(AttachedDatabase &db_p, string connection_string_p, str
 	unordered_set<string> unused_params;
 	std::tie(connection_params, unused_params) = ODBCUtils::ParseConnectionParameters(connection_string);
 	default_schema = connection_params.database;
+	Value connection_limit;
+	auto &db_instance = db_p.GetDatabase();
+	if (db_instance.TryGetCurrentSetting("odbc_connection_limit", connection_limit)) {
+		connection_pool.SetMaximumConnections(UBigIntValue::Get(connection_limit));
+	}
 	// try to connect
 	ODBCTypeConfig type_config; // 使用默认构造函数
 	auto connection = ODBCConnection::Open(type_config, connection_string);

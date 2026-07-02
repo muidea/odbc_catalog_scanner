@@ -20,6 +20,38 @@ static void SetODBCDebugQueryPrint(ClientContext &context, SetScope scope, Value
 	ODBCConnection::DebugSetPrintQueries(BooleanValue::Get(parameter));
 }
 
+template <typename Fn>
+static void ForEachODBCCatalog(ClientContext &context, Fn &&fn) {
+	auto databases = DatabaseManager::Get(context).GetDatabases(context);
+	for (auto &db_ref : databases) {
+		auto &db = *db_ref;
+		auto &catalog = db.GetCatalog();
+		if (catalog.GetCatalogType() != "odbc") {
+			continue;
+		}
+		fn(catalog.Cast<ODBCCatalog>());
+	}
+}
+
+static void SetODBCConnectionLimit(ClientContext &context, SetScope scope, Value &parameter) {
+	if (scope == SetScope::LOCAL) {
+		throw InvalidInputException("odbc_connection_limit can only be set globally");
+	}
+	auto new_max = parameter.GetValue<uint64_t>();
+	ForEachODBCCatalog(context, [&](ODBCCatalog &catalog) { catalog.GetConnectionPool().SetMaximumConnections(new_max); });
+	auto &config = DBConfig::GetConfig(context);
+	config.SetOption("odbc_connection_limit", parameter);
+}
+
+static void SetODBCConnectionCache(ClientContext &context, SetScope scope, Value &parameter) {
+	if (scope == SetScope::LOCAL) {
+		throw InvalidInputException("odbc_connection_cache can only be set globally");
+	}
+	ODBCConnectionPool::ODBCSetConnectionCache(context, scope, parameter);
+	auto &config = DBConfig::GetConfig(context);
+	config.SetOption("odbc_connection_cache", parameter);
+}
+
 unique_ptr<BaseSecret> CreateODBCSecretFunction(ClientContext &, CreateSecretInput &input) {
 	// apply any overridden settings
 	vector<string> prefix_paths;
@@ -70,6 +102,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ODBCQueryFunction query_function;
 	loader.RegisterFunction(query_function);
 
+	ODBCMetadataFunction metadata_function;
+	loader.RegisterFunction(metadata_function);
+
 	SecretType secret_type;
 	secret_type.name = "odbc";
 	secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
@@ -102,6 +137,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("odbc_time_as_time", "Whether or not to convert ODBC's TIME columns to DuckDB's TIME",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false),
 	                          ODBCClearCacheFunction::ClearCacheOnSetting);
+	config.AddExtensionOption("odbc_connection_limit", "Maximum number of connections per ODBC catalog",
+	                          LogicalType::UBIGINT, Value::UBIGINT(ODBCConnectionPool::DEFAULT_MAX_CONNECTIONS),
+	                          SetODBCConnectionLimit);
+	config.AddExtensionOption("odbc_connection_cache", "Whether or not to cache idle ODBC connections",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), SetODBCConnectionCache);
 
 	OptimizerExtension odbc_optimizer;
 	odbc_optimizer.optimize_function = ODBCOptimizer::Optimize;
