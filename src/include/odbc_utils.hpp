@@ -29,11 +29,19 @@ enum class ODBCResultStreaming { UNINITIALIZED, ALLOW_STREAMING, FORCE_MATERIALI
 
 enum class ODBCConnectorInterface { UNINITIALIZED, BASIC, PREPARED_STATEMENT };
 
+struct ODBCCatalogObject {
+	string schema;
+	string name;
+	string type;
+};
+
 class ODBCUtils {
 public:
 	static std::tuple<ODBCConnectionParameters, unordered_set<string>> ParseConnectionParameters(const string &dsn);
 	static string BuildConnectionString(const string &dsn);
 	static SQLHDBC Connect(const string &dsn, SQLHENV &out_env);
+	static vector<ODBCCatalogObject> GetCatalogObjects(SQLHDBC connection, const string &schema = string(),
+	                                                   const string &table = string());
 
 	static string WriteIdentifier(const string &identifier);
 	static string WriteLiteral(const string &identifier);

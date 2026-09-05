@@ -1,0 +1,84 @@
+# name: test/sql/odbc_catalog_scanner.test
+# description: ODBC catalog scanner registration, secrets, and read-only boundary
+# group: [sql]
+
+statement ok
+LOAD 'build/release/extension/odbc_catalog_scanner/odbc_catalog_scanner.duckdb_extension';
+
+query T
+SELECT function_name
+FROM duckdb_functions()
+WHERE function_name LIKE 'odbc_catalog_%'
+ORDER BY function_name;
+----
+odbc_catalog_clear_cache
+odbc_catalog_metadata
+
+statement error
+SET odbc_catalog_connection_limit = 0;
+----
+must be greater than zero
+
+statement ok
+CREATE TEMPORARY SECRET hana_secret (
+    TYPE odbc_catalog, DIALECT 'hana', DRIVER 'HDBODBC', HOST 'hana.example', PORT 30015,
+    DATABASE 'SYSTEMDB', USER 'reader', PASSWORD 'hana_password'
+);
+
+statement ok
+CREATE TEMPORARY SECRET dameng_secret (
+    TYPE odbc_catalog, DIALECT 'dameng', DRIVER 'DM8 ODBC DRIVER', HOST 'dm.example', PORT 5236,
+    DATABASE 'DAMENG', USER 'reader', PASSWORD 'dameng_password'
+);
+
+statement ok
+CREATE TEMPORARY SECRET db2_secret (
+    TYPE odbc_catalog, DIALECT 'db2', DRIVER 'IBM DB2 ODBC DRIVER', HOST 'db2.example', PORT 50000,
+    DATABASE 'SAMPLE', USER 'reader', PASSWORD 'db2_password'
+);
+
+query I
+SELECT count(*)
+FROM duckdb_secrets()
+WHERE name IN ('hana_secret', 'dameng_secret', 'db2_secret')
+  AND secret_string NOT LIKE '%hana_password%'
+  AND secret_string NOT LIKE '%dameng_password%'
+  AND secret_string NOT LIKE '%db2_password%';
+----
+3
+
+statement error
+CREATE TEMPORARY SECRET invalid_dialect (
+    TYPE odbc_catalog, DIALECT 'generic', DRIVER 'driver', HOST 'host', PORT 1,
+    DATABASE 'database', USER 'user', PASSWORD 'password'
+);
+----
+Unsupported ODBC catalog dialect
+
+statement error
+ATTACH '' AS writable_catalog (
+    TYPE odbc_catalog, SECRET hana_secret, DIALECT 'hana'
+);
+----
+odbc_catalog_scanner is read-only
+
+statement error
+ATTACH 'DRIVER={HDBODBC}' AS inline_catalog (
+    TYPE odbc_catalog, READ_ONLY, SECRET hana_secret, DIALECT 'hana'
+);
+----
+does not accept a connection string
+
+statement error
+ATTACH '' AS mismatched_catalog (
+    TYPE odbc_catalog, READ_ONLY, SECRET hana_secret, DIALECT 'db2'
+);
+----
+SECRET dialect does not match ATTACH DIALECT
+
+statement error
+ATTACH '' AS missing_secret_catalog (
+    TYPE odbc_catalog, READ_ONLY, SECRET missing_secret, DIALECT 'hana'
+);
+----
+Secret with name

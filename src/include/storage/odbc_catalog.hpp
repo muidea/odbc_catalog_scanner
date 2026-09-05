@@ -11,13 +11,15 @@
 #include "duckdb.hpp"
 #include "storage/odbc_schema_set.hpp"
 #include "storage/odbc_connection_pool.hpp"
+#include "odbc_dialect.hpp"
 
 namespace duckdb {
 class ODBCSchemaEntry;
 
 class ODBCCatalog : public Catalog {
 public:
-	explicit ODBCCatalog(AttachedDatabase &db_p, string connection_string, string attach_path, AccessMode access_mode);
+	explicit ODBCCatalog(AttachedDatabase &db_p, string connection_string, string attach_path, string default_schema,
+	                     ODBCDialect dialect, AccessMode access_mode);
 	~ODBCCatalog();
 
 	string connection_string;
@@ -27,10 +29,10 @@ public:
 public:
 	void Initialize(bool load_builtin) override;
 	string GetCatalogType() override {
-		return "odbc";
+		return "odbc_catalog";
 	}
 
-	static string GetConnectionString(ClientContext &context, const string &attach_path, string secret_name);
+	static string GetConnectionString(ClientContext &context, const string &secret_name, ODBCDialect dialect);
 
 	optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override;
 
@@ -61,11 +63,16 @@ public:
 
 	static void MaterializeODBCScans(PhysicalOperator &op);
 	static bool IsODBCScan(const string &name);
-	static bool IsODBCQuery(const string &name);
 
 public:
 	ODBCConnectionPool &GetConnectionPool() {
 		return connection_pool;
+	}
+	string GetDefaultSchema() const override {
+		return default_schema;
+	}
+	ODBCDialect GetDialect() const {
+		return dialect;
 	}
 
 private:
@@ -74,6 +81,7 @@ private:
 private:
 	ODBCSchemaSet schemas;
 	string default_schema;
+	ODBCDialect dialect;
 	ODBCConnectionPool connection_pool;
 };
 

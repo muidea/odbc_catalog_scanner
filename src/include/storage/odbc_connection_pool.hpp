@@ -13,6 +13,8 @@
 #include "duckdb/common/optional_ptr.hpp"
 #include "odbc_connection.hpp"
 
+#include <condition_variable>
+
 namespace duckdb {
 class ODBCCatalog;
 class ODBCConnectionPool;
@@ -50,14 +52,17 @@ public:
 	ODBCPoolConnection ForceGetConnection();
 	void ReturnConnection(shared_ptr<ODBCConnection> connection);
 	void SetMaximumConnections(idx_t new_max);
+	void SetWaitTimeout(idx_t wait_timeout_millis_p);
 
 	static void ODBCSetConnectionCache(ClientContext &context, SetScope scope, Value &parameter);
 
 private:
 	ODBCCatalog &odbc_catalog;
 	mutex connection_lock;
+	std::condition_variable connection_available;
 	idx_t active_connections;
 	idx_t maximum_connections;
+	idx_t wait_timeout_millis = 30000;
 	vector<shared_ptr<ODBCConnection>> connection_cache;
 
 private:

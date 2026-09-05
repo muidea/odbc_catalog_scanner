@@ -2,6 +2,7 @@
 #include "storage/odbc_catalog.hpp"
 
 #include <atomic>
+#include <chrono>
 
 namespace duckdb {
 static std::atomic<bool> odbc_use_connection_cache {true};
@@ -9,8 +10,7 @@ static std::atomic<bool> odbc_use_connection_cache {true};
 ODBCPoolConnection::ODBCPoolConnection() : pool(nullptr) {
 }
 
-ODBCPoolConnection::ODBCPoolConnection(optional_ptr<ODBCConnectionPool> pool,
-                                       shared_ptr<ODBCConnection> connection_p)
+ODBCPoolConnection::ODBCPoolConnection(optional_ptr<ODBCConnectionPool> pool, shared_ptr<ODBCConnection> connection_p)
     : pool(pool), connection(std::move(connection_p)) {
 }
 
@@ -56,8 +56,13 @@ ODBCPoolConnection ODBCConnectionPool::GetConnectionInternal() {
 	}
 
 	// no cached connections left but there is space to open a new one - open it
-	ODBCTypeConfig type_config;
-	return ODBCPoolConnection(this, ODBCConnection::Open(type_config, odbc_catalog.connection_string));
+	try {
+		ODBCTypeConfig type_config;
+		return ODBCPoolConnection(this, ODBCConnection::Open(type_config, odbc_catalog.connection_string));
+	} catch (...) {
+		active_connections--;
+		throw;
+	}
 }
 
 ODBCPoolConnection ODBCConnectionPool::ForceGetConnection() {
@@ -82,13 +87,12 @@ void ODBCConnectionPool::ODBCSetConnectionCache(ClientContext &context, SetScope
 }
 
 ODBCPoolConnection ODBCConnectionPool::GetConnection() {
-	ODBCPoolConnection result;
-	if (!TryGetConnection(result)) {
-		throw IOException(
-		    "Failed to get connection from ODBCConnectionPool - maximum connection count exceeded (%llu/%llu max)",
-		    active_connections, maximum_connections);
+	unique_lock<mutex> lock(connection_lock);
+	if (!connection_available.wait_for(lock, std::chrono::milliseconds(wait_timeout_millis),
+	                                   [&] { return active_connections < maximum_connections; })) {
+		throw IOException("Timed out waiting for an ODBC catalog connection (%llu ms)", wait_timeout_millis);
 	}
-	return result;
+	return GetConnectionInternal();
 }
 
 void ODBCConnectionPool::ReturnConnection(shared_ptr<ODBCConnection> connection) {
@@ -100,15 +104,18 @@ void ODBCConnectionPool::ReturnConnection(shared_ptr<ODBCConnection> connection)
 	if (active_connections >= maximum_connections) {
 		// if the maximum number of connections has been decreased by the user we might need to reclaim the connection
 		// immediately
+		connection_available.notify_one();
 		return;
 	}
 	if (!odbc_use_connection_cache.load(std::memory_order_relaxed)) {
+		connection_available.notify_one();
 		return;
 	}
 	// check if the underlying connection is still usable
 	// For ODBC, we need to check if the connection is still valid
 	// This is a simplified check - in production we might need more robust connection health checking
 	connection_cache.push_back(std::move(connection));
+	connection_available.notify_one();
 }
 
 void ODBCConnectionPool::SetMaximumConnections(idx_t new_max) {
@@ -124,6 +131,12 @@ void ODBCConnectionPool::SetMaximumConnections(idx_t new_max) {
 		}
 	}
 	maximum_connections = new_max;
+	connection_available.notify_all();
+}
+
+void ODBCConnectionPool::SetWaitTimeout(idx_t wait_timeout_millis_p) {
+	lock_guard<mutex> lock(connection_lock);
+	wait_timeout_millis = wait_timeout_millis_p;
 }
 
 } // namespace duckdb

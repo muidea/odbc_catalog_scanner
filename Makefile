@@ -1,8 +1,9 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 # Configuration of extension
-EXT_NAME=odbc_scanner
+EXT_NAME=odbc_catalog_scanner
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
+OVERRIDE_GIT_DESCRIBE ?= v1.5.3
 
 # ====== vcpkg Configuration ======
 # Auto-detect vcpkg installation path
@@ -42,16 +43,6 @@ else
     $(warning vcpkg not found. Set VCPKG_ROOT or install vcpkg in ../vcpkg or ./vcpkg)
 endif
 
-# ====== Linux FreeTDS Check ======
-ifneq ($(OS),Windows_NT)
-    FREETDS_HEADER := $(shell test -f /usr/include/tds.h && echo yes || test -f /usr/local/include/tds.h && echo yes)
-    ifeq ($(FREETDS_HEADER),yes)
-        $(info FreeTDS found in system)
-    else
-        $(warning FreeTDS not found. Install with: sudo apt install freetds-dev)
-    endif
-endif
-
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
@@ -60,7 +51,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 .PHONY: help init-vcpkg check-deps
 
 help:
-	@echo "odbc-scanner - DuckDB ODBC Extension"
+	@echo "odbc_catalog_scanner - DuckDB ODBC catalog scanner extension"
 	@echo ""
 	@echo "Available targets:"
 	@echo "  make release       - Build release version"
@@ -101,11 +92,6 @@ check-deps:
 	@echo "Checking dependencies..."
 	@echo ""
 	@echo "vcpkg: $(if $(VCPKG_ROOT),Found ($(VCPKG_ROOT)),Not found)"
-ifneq ($(OS),Windows_NT)
-	@echo "FreeTDS: $(if $(FREETDS_HEADER),Found in system,Not found - install with: sudo apt install freetds-dev)"
-else
-	@echo "FreeTDS: Will be installed via vcpkg"
-endif
 	@echo "ODBC: $(if $(OS),Windows_NT,System SDK,vcpkg unixodbc)"
 	@echo ""
 	@echo "Build configuration:"

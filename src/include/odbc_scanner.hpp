@@ -39,33 +39,9 @@ public:
 	}
 };
 
-struct ODBCQueryBindData : public FunctionData {
-	ODBCQueryBindData(Catalog &catalog, unique_ptr<ODBCResult> result_p, string query_p)
-	    : catalog(catalog), result(std::move(result_p)), query(std::move(query_p)) {
-	}
-
-	Catalog &catalog;
-	unique_ptr<ODBCResult> result;
-	string query;
-	ODBCResultStreaming streaming = ODBCResultStreaming::UNINITIALIZED;
-
-public:
-	unique_ptr<FunctionData> Copy() const override {
-		throw NotImplementedException("ODBCBindData copy not supported");
-	}
-	bool Equals(const FunctionData &other_p) const override {
-		return false;
-	}
-};
-
 class ODBCScanFunction : public TableFunction {
 public:
 	ODBCScanFunction();
-};
-
-class ODBCQueryFunction : public TableFunction {
-public:
-	ODBCQueryFunction();
 };
 
 class ODBCMetadataFunction : public TableFunction {
@@ -78,11 +54,6 @@ public:
 	ODBCClearCacheFunction();
 
 	static void ClearCacheOnSetting(ClientContext &context, SetScope scope, Value &parameter);
-};
-
-class ODBCExecuteFunction : public TableFunction {
-public:
-	ODBCExecuteFunction();
 };
 
 } // namespace duckdb

@@ -1,7 +1,6 @@
 #include "storage/odbc_optimizer.hpp"
 #include "storage/odbc_catalog.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/operator/logical_limit.hpp"
 #include "odbc_scanner.hpp"
 
 namespace duckdb {
@@ -20,63 +19,10 @@ void GatherODBCScans(LogicalOperator &op, ODBCOperators &result) {
 			auto &catalog = bind_data.table.ParentCatalog().Cast<ODBCCatalog>();
 			result.scans[catalog].push_back(get);
 		}
-		if (ODBCCatalog::IsODBCQuery(table_scan.name)) {
-			auto &bind_data = get.bind_data->Cast<ODBCQueryBindData>();
-			auto &catalog = bind_data.catalog.Cast<ODBCCatalog>();
-			result.scans[catalog].push_back(get);
-		}
 	}
 	// recurse into children
 	for (auto &child : op.children) {
 		GatherODBCScans(*child, result);
-	}
-}
-
-void OptimizeODBCScan(unique_ptr<LogicalOperator> &op) {
-	if (op->type == LogicalOperatorType::LOGICAL_LIMIT) {
-		auto &limit = op->Cast<LogicalLimit>();
-		reference<LogicalOperator> child = *op->children[0];
-		while (child.get().type == LogicalOperatorType::LOGICAL_PROJECTION) {
-			child = *child.get().children[0];
-		}
-		if (child.get().type != LogicalOperatorType::LOGICAL_GET) {
-			return;
-		}
-		auto &get = child.get().Cast<LogicalGet>();
-		if (!ODBCCatalog::IsODBCScan(get.function.name)) {
-			return;
-		}
-		switch (limit.limit_val.Type()) {
-		case LimitNodeType::CONSTANT_VALUE:
-		case LimitNodeType::UNSET:
-			break;
-		default:
-			// not a constant or unset limit
-			return;
-		}
-		switch (limit.offset_val.Type()) {
-		case LimitNodeType::CONSTANT_VALUE:
-		case LimitNodeType::UNSET:
-			break;
-		default:
-			// not a constant or unset offset
-			return;
-		}
-		if (limit.offset_val.Type() != LimitNodeType::UNSET) {
-			// SQL Server doesn't support OFFSET; let DuckDB handle it
-			return;
-		}
-		if (limit.limit_val.Type() != LimitNodeType::UNSET) {
-			auto &bind_data = get.bind_data->Cast<ODBCBindData>();
-			bind_data.limit = " TOP " + to_string(limit.limit_val.GetConstantValue());
-		}
-		// remove the limit
-		op = std::move(op->children[0]);
-		return;
-	}
-	// recurse into children
-	for (auto &child : op->children) {
-		OptimizeODBCScan(child);
 	}
 }
 
@@ -99,17 +45,8 @@ void ODBCOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalO
 					bind_data.streaming = result_streaming;
 				}
 			}
-			if (ODBCCatalog::IsODBCQuery(get.function.name)) {
-				auto &bind_data = get.bind_data->Cast<ODBCQueryBindData>();
-				if (bind_data.streaming == ODBCResultStreaming::UNINITIALIZED ||
-				    result_streaming == ODBCResultStreaming::FORCE_MATERIALIZATION) {
-					bind_data.streaming = result_streaming;
-				}
-			}
 		}
 	}
-
-	OptimizeODBCScan(plan);
 }
 
 } // namespace duckdb
