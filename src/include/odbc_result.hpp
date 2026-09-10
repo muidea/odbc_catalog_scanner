@@ -24,6 +24,10 @@ struct ODBCField {
 	LogicalType duckdb_type;
 
 	vector<char> bind_buffer;
+	// SQLBindCol keeps the address of bind_buffer for the lifetime of the cursor.
+	// Truncated variable-width values are completed into value_buffer so growing
+	// a value never invalidates the address owned by the ODBC driver.
+	vector<char> value_buffer;
 	SQLLEN bind_length = 0;
 	bool bind_is_null = false;
 	bool bind_error = false;
@@ -31,6 +35,8 @@ struct ODBCField {
 	ODBCField(void *field_info, LogicalType duckdb_type_p, const ODBCTypeConfig &type_config);
 
 	void ResetBind();
+	const char *ValueData() const;
+	size_t ValueBufferSize() const;
 };
 
 struct ODBCBind {

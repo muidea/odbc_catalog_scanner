@@ -79,6 +79,17 @@ static size_t GetBufferSize(SQLSMALLINT c_type, SQLULEN column_size) {
 	}
 }
 
+static size_t GetBoundPayloadCapacity(const ODBCField &field) {
+	auto capacity = field.bind_buffer.size();
+	if (field.c_type == SQL_C_CHAR && capacity > 0) {
+		return capacity - 1;
+	}
+	if (field.c_type == SQL_C_WCHAR && capacity >= sizeof(SQLWCHAR)) {
+		return capacity - sizeof(SQLWCHAR);
+	}
+	return capacity;
+}
+
 ODBCField::ODBCField(void *field_info, LogicalType duckdb_type_p, const ODBCTypeConfig &type_config)
     : duckdb_type(std::move(duckdb_type_p)) {
 	// For ODBC, we need to extract field information differently
@@ -90,6 +101,23 @@ void ODBCField::ResetBind() {
 	this->bind_is_null = false;
 	this->bind_length = 0;
 	this->bind_error = false;
+	this->value_buffer.clear();
+}
+
+const char *ODBCField::ValueData() const {
+	return value_buffer.empty() ? bind_buffer.data() : value_buffer.data();
+}
+
+size_t ODBCField::ValueBufferSize() const {
+	return value_buffer.empty() ? bind_buffer.size() : value_buffer.size();
+}
+
+static bool TransferNumericAsText(const string &type_name) {
+	auto normalized_type_name = StringUtil::Lower(type_name);
+	StringUtil::Trim(normalized_type_name);
+	return normalized_type_name == "decimal" || normalized_type_name == "numeric" ||
+	       normalized_type_name == "smalldecimal" || normalized_type_name == "decfloat" ||
+	       normalized_type_name == "money" || normalized_type_name == "smallmoney";
 }
 
 static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, const ODBCTypeConfig &type_config) {
@@ -139,7 +167,7 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 		} else if (lower_type_name == "datetimeoffset") {
 			// Preserve the UTC offset text; SQL_TIMESTAMP_STRUCT has no offset field.
 			field.c_type = SQL_C_CHAR;
-		} else if (ltype.id() == LogicalTypeId::DECIMAL || ltype.id() == LogicalTypeId::DOUBLE) {
+		} else if (ltype.id() == LogicalTypeId::DECIMAL || TransferNumericAsText(lower_type_name)) {
 			field.c_type = SQL_C_CHAR;
 		} else if (ltype.id() == LogicalTypeId::FLOAT) {
 			field.c_type = SQL_C_FLOAT;
@@ -313,13 +341,15 @@ void ODBCResult::HandleTruncatedData() {
 			continue;
 		}
 
+		auto bound_payload_capacity = GetBoundPayloadCapacity(f);
 		bool truncated = (f.bind_length == SQL_NO_TOTAL) ||
-		                 (f.bind_length > 0 && static_cast<size_t>(f.bind_length) > f.bind_buffer.size());
+		                 (f.bind_length > 0 && static_cast<size_t>(f.bind_length) > bound_payload_capacity);
 		if (!truncated) {
 			continue;
 		}
 
 		SQLSMALLINT c_type = f.c_type;
+		SQLLEN original_length = f.bind_length;
 
 		// Determine the full data length; double the buffer when length is unknown
 		size_t total_len;
@@ -337,26 +367,38 @@ void ODBCResult::HandleTruncatedData() {
 		// For character data, retrieve remaining bytes via SQLGetData.
 		// The bind buffer already contains the first portion (before truncation).
 		if (c_type == SQL_C_CHAR || c_type == SQL_C_BINARY || c_type == SQL_C_WCHAR) {
-			size_t already_have = f.bind_buffer.size();
-			if (c_type == SQL_C_CHAR && already_have > 0) {
-				already_have--;
-			} else if (c_type == SQL_C_WCHAR && already_have >= sizeof(SQLWCHAR)) {
-				already_have -= sizeof(SQLWCHAR);
-			}
+			size_t already_have = bound_payload_capacity;
 
-			size_t resize_target = total_len + 1;
+			size_t terminator_size = c_type == SQL_C_CHAR ? 1 : 0;
 			if (c_type == SQL_C_WCHAR) {
-				resize_target = total_len + sizeof(SQLWCHAR);
+				terminator_size = sizeof(SQLWCHAR);
 			}
-			f.bind_buffer.resize(resize_target);
+			size_t resize_target = total_len + terminator_size;
+			// Do not resize bind_buffer here. SQLBindCol retains bind_buffer.data()
+			// and will write to it again on the next SQLFetch. Growing that vector
+			// leaves the driver with a dangling pointer and corrupts the heap.
+			f.value_buffer.resize(resize_target);
+			if (already_have > 0) {
+				memcpy(f.value_buffer.data(), f.bind_buffer.data(), already_have);
+			}
 
 			SQLLEN remaining_len = 0;
 			SQLRETURN retcode =
-			    SQLGetData(stmt.get(), static_cast<SQLUSMALLINT>(i + 1), c_type, f.bind_buffer.data() + already_have,
-			               static_cast<SQLLEN>(f.bind_buffer.size() - already_have), &remaining_len);
+			    SQLGetData(stmt.get(), static_cast<SQLUSMALLINT>(i + 1), c_type, f.value_buffer.data() + already_have,
+			               static_cast<SQLLEN>(f.value_buffer.size() - already_have), &remaining_len);
 
-			if (SQL_SUCCEEDED(retcode) && remaining_len >= 0) {
-				f.bind_length = static_cast<SQLLEN>(already_have) + remaining_len;
+			if (SQL_SUCCEEDED(retcode) && original_length > 0) {
+				// SQLFetch already reported the complete payload length. Some drivers
+				// report that same total again from SQLGetData, while others report
+				// only the remainder, so do not add the two indicators together.
+				f.bind_length = MinValue<SQLLEN>(original_length, static_cast<SQLLEN>(total_len));
+			} else if (SQL_SUCCEEDED(retcode) && remaining_len >= 0) {
+				f.bind_length =
+				    MinValue<SQLLEN>(static_cast<SQLLEN>(already_have) + remaining_len, static_cast<SQLLEN>(total_len));
+			} else if (retcode == SQL_SUCCESS_WITH_INFO) {
+				// SQL_NO_TOTAL means the driver cannot state the remaining length. The
+				// continuation buffer is full when truncation is reported.
+				f.bind_length = static_cast<SQLLEN>(total_len);
 			} else {
 				// SQLGetData failed; keep what we have, clamp length to buffer
 				f.bind_length = static_cast<SQLLEN>(already_have);
@@ -600,12 +642,12 @@ static void WriteDecimal(ODBCField &f, Vector &vec, idx_t row) {
 		return;
 	}
 
-	if (f.bind_length < 0 || static_cast<size_t>(f.bind_length) > f.bind_buffer.size()) {
+	if (f.bind_length < 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
 		FlatVector::SetNull(vec, row, true);
 		return;
 	}
 
-	string decimal_str(f.bind_buffer.data(), static_cast<size_t>(f.bind_length));
+	string decimal_str(f.ValueData(), static_cast<size_t>(f.bind_length));
 
 	auto &vec_type = vec.GetType();
 	uint8_t precision = DecimalType::GetWidth(vec_type);
@@ -658,11 +700,11 @@ static void WriteDecimal(ODBCField &f, Vector &vec, idx_t row) {
 }
 
 static void WriteDoubleFromString(ODBCField &f, Vector &vec, idx_t row) {
-	if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.bind_buffer.size()) {
+	if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
 		FlatVector::SetNull(vec, row, true);
 		return;
 	}
-	string value(f.bind_buffer.data(), NumericCast<size_t>(f.bind_length));
+	string value(f.ValueData(), NumericCast<size_t>(f.bind_length));
 	try {
 		FlatVector::GetData<double>(vec)[row] = std::stod(value);
 	} catch (const std::exception &e) {
@@ -690,16 +732,16 @@ static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
 
 	SQLSMALLINT c_type = f.c_type;
 	if (c_type == SQL_C_WCHAR) {
-		if (f.bind_length <= 0 || f.bind_buffer.size() < sizeof(SQLWCHAR)) {
+		if (f.bind_length <= 0 || f.ValueBufferSize() < sizeof(SQLWCHAR)) {
 			FlatVector::SetNull(vec, row, true);
 			return;
 		}
 		size_t byte_len = static_cast<size_t>(f.bind_length);
-		if (byte_len > f.bind_buffer.size()) {
-			byte_len = f.bind_buffer.size();
+		if (byte_len > f.ValueBufferSize()) {
+			byte_len = f.ValueBufferSize();
 		}
 		size_t unit_len = byte_len / sizeof(SQLWCHAR);
-		auto *wdata = reinterpret_cast<const SQLWCHAR *>(f.bind_buffer.data());
+		auto *wdata = reinterpret_cast<const SQLWCHAR *>(f.ValueData());
 		while (unit_len > 0 && wdata[unit_len - 1] == 0) {
 			unit_len--;
 		}
@@ -710,11 +752,11 @@ static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
 		return;
 	}
 
-	if (static_cast<size_t>(f.bind_length) > f.bind_buffer.size()) {
-		f.bind_length = static_cast<SQLLEN>(f.bind_buffer.size());
+	if (static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
+		f.bind_length = static_cast<SQLLEN>(f.ValueBufferSize());
 	}
 
-	string_t st(f.bind_buffer.data(), f.bind_length);
+	string_t st(f.ValueData(), f.bind_length);
 	auto data = FlatVector::GetData<string_t>(vec);
 	data[row] = StringVector::AddStringOrBlob(vec, std::move(st));
 }
