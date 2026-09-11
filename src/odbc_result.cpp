@@ -154,6 +154,23 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 
 		LogicalType ltype =
 		    ODBCTypes::ODBCToLogicalType(type_config, data_type, column_size, decimal_digits, type_name);
+		// SQL_TINYINT is not uniformly unsigned across ODBC drivers. SQL Server
+		// reports it as unsigned, while Dameng reports a signed tinyint. Binding a
+		// signed source as SQL_C_UTINYINT makes the driver reject negative values
+		// (and some boundary values) during SQLFetch with "Data out of range".
+		// Prefer the driver's descriptor when it is available; retain the legacy
+		// unsigned fallback for drivers that do not expose SQL_DESC_UNSIGNED.
+		SQLLEN unsigned_attribute = SQL_TRUE;
+		bool tinyint_is_unsigned = true;
+		if (data_type == SQL_TINYINT) {
+			retcode = SQLColAttribute(stmt, i + 1, SQL_DESC_UNSIGNED, nullptr, 0, nullptr, &unsigned_attribute);
+			if (SQL_SUCCEEDED(retcode)) {
+				tinyint_is_unsigned = unsigned_attribute != SQL_FALSE;
+			}
+			if (!tinyint_is_unsigned) {
+				ltype = LogicalType::TINYINT;
+			}
+		}
 
 		// Create field with placeholder information
 		ODBCField field(nullptr, std::move(ltype), type_config);
@@ -161,6 +178,9 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 		field.type_name = type_name;
 		field.odbc_type = data_type;
 		field.c_type = ODBCTypes::GetCType(data_type);
+		if (data_type == SQL_TINYINT && !tinyint_is_unsigned) {
+			field.c_type = SQL_C_STINYINT;
+		}
 		auto lower_type_name = StringUtil::Lower(type_name);
 		if (ltype.id() == LogicalTypeId::TIMESTAMP) {
 			field.c_type = SQL_C_TYPE_TIMESTAMP;
