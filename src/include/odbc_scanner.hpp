@@ -49,6 +49,11 @@ public:
 	ODBCMetadataFunction();
 };
 
+class ODBCRelationalMetadataFunction : public TableFunction {
+public:
+	ODBCRelationalMetadataFunction();
+};
+
 class ODBCClearCacheFunction : public TableFunction {
 public:
 	ODBCClearCacheFunction();

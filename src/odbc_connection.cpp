@@ -114,7 +114,11 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	// 对于预编译语句接口，调用者负责清理语句句柄
 	// 我们只需要确保在失败时抛出适当的异常
 
-	retcode = SQLPrepareWithFallback(stmt, query);
+	if (params.empty()) {
+		retcode = SQLExecDirectWithFallback(stmt, query);
+	} else {
+		retcode = SQLPrepareWithFallback(stmt, query);
+	}
 	if (!SQL_SUCCEEDED(retcode)) {
 		// 获取详细的ODBC错误信息
 		SQLCHAR sqlstate[6] = {0};
@@ -131,6 +135,19 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	}
 
 	vector<ODBCParameter> odbc_params;
+	if (params.empty()) {
+		SQLLEN affected_rows = 0;
+		retcode = SQLRowCount(stmt, &affected_rows);
+		if (!SQL_SUCCEEDED(retcode)) {
+			affected_rows = -1;
+		}
+		SQLSMALLINT num_cols = 0;
+		SQLRETURN col_ret = SQLNumResultCols(stmt, &num_cols);
+		if (SQL_SUCCEEDED(col_ret) && num_cols > 0) {
+			affected_rows = -1;
+		}
+		return affected_rows >= 0 ? static_cast<idx_t>(affected_rows) : static_cast<idx_t>(-1);
+	}
 	if (params.size() > 0) {
 		SQLSMALLINT param_count;
 		retcode = SQLNumParams(stmt, &param_count);
@@ -250,7 +267,12 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 	bool basic_interface = con_interface == ODBCConnectorInterface::BASIC;
 
 	if (basic_interface) {
-		ODBCExecute(nullptr, query, params, result_streaming);
+		try {
+			ODBCExecute(nullptr, query, params, result_streaming);
+		} catch (...) {
+			ReleaseConnection();
+			throw;
+		}
 		// BASIC接口不创建ODBCResult，需要立即释放连接忙状态
 		ReleaseConnection();
 		return unique_ptr<ODBCResult>(nullptr);
@@ -295,10 +317,8 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 		                                    affected_rows, num_cols, shared_from_this(), streaming);
 		return result;
 	} catch (const std::exception &e) {
-		// ODBCResult构造函数失败，清理语句句柄
-		if (hstmt != SQL_NULL_HSTMT) {
-			SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-		}
+		// ODBCStatementPtr owns hstmt once result construction starts. Freeing
+		// the raw handle here would race its destructor and double free it.
 		// 释放连接忙状态
 		ReleaseConnection();
 		throw IOException("Failed to create ODBC result for query \"%s\": %s\n", query.c_str(), e.what());

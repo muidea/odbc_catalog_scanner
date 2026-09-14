@@ -8,11 +8,12 @@ LOAD 'build/release/extension/odbc_catalog_scanner/odbc_catalog_scanner.duckdb_e
 query T
 SELECT function_name
 FROM duckdb_functions()
-WHERE function_name LIKE 'odbc_catalog_%'
+WHERE function_name IN ('odbc_catalog_clear_cache', 'odbc_catalog_metadata', 'odbc_relational_metadata')
 ORDER BY function_name;
 ----
 odbc_catalog_clear_cache
 odbc_catalog_metadata
+odbc_relational_metadata
 
 statement error
 SET odbc_catalog_connection_limit = 0;

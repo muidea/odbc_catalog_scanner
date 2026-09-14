@@ -28,6 +28,7 @@ struct ODBCField {
 	// Truncated variable-width values are completed into value_buffer so growing
 	// a value never invalidates the address owned by the ODBC driver.
 	vector<char> value_buffer;
+	bool column_bound = true;
 	SQLLEN bind_length = 0;
 	bool bind_is_null = false;
 	bool bind_error = false;
@@ -74,6 +75,7 @@ private:
 	vector<SQLSMALLINT> bind_types;
 
 	DataChunk data_chunk;
+	DataChunk *current_row_chunk = nullptr;
 	idx_t row_idx = static_cast<idx_t>(-1);
 	bool connection_released = false;
 
@@ -86,10 +88,11 @@ private:
 
 	bool FetchNext();
 	void HandleTruncatedData();
-	void WriteToChunk(idx_t row);
+	void WriteToChunk(DataChunk &chunk, idx_t row);
 	void CheckColumnIdx(idx_t col);
 	void CheckNotNull(idx_t col);
 	void CheckType(idx_t col, LogicalTypeId type_id);
+	DataChunk &CurrentRowChunk();
 
 	// Materialized mode: read all data into cached_chunks
 	void ReadAllData();
