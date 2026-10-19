@@ -39,5 +39,21 @@ if(ODBC_INCLUDE_DIR)
 endif()
 
 # Link libraries
-target_link_libraries(${TARGET_NAME}_loadable_extension 
+target_link_libraries(${TARGET_NAME}_loadable_extension
                       ${ODBC_LIBRARY})
+
+option(ODBC_CATALOG_BUILD_RESOURCE_TESTS "构建无数据库资源生命周期测试" OFF)
+if(ODBC_CATALOG_BUILD_RESOURCE_TESTS)
+    add_executable(odbc_relational_reader_test
+                   test/odbc_relational_reader_test.cpp src/odbc_relational_reader.cpp)
+    target_include_directories(odbc_relational_reader_test PRIVATE src/include)
+    target_link_libraries(odbc_relational_reader_test duckdb)
+    add_executable(odbc_connection_resource_test
+                   test/odbc_connection_resource_test.cpp src/odbc_utils.cpp)
+    target_include_directories(odbc_connection_resource_test PRIVATE src/include)
+    target_link_libraries(odbc_connection_resource_test duckdb ${ODBC_LIBRARY})
+    add_executable(odbc_result_resource_test
+                   test/odbc_result_resource_test.cpp src/odbc_result.cpp src/odbc_types.cpp)
+    target_include_directories(odbc_result_resource_test PRIVATE src/include)
+    target_link_libraries(odbc_result_resource_test duckdb ${ODBC_LIBRARY})
+endif()

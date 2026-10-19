@@ -29,6 +29,8 @@ class ODBCResult;
 struct OwnedODBCConnection {
 	explicit OwnedODBCConnection(SQLHDBC conn = nullptr, SQLHENV env = nullptr) : connection(conn), environment(env) {
 	}
+	OwnedODBCConnection(const OwnedODBCConnection &) = delete;
+	OwnedODBCConnection &operator=(const OwnedODBCConnection &) = delete;
 	~OwnedODBCConnection() {
 		if (connection) {
 			SQLDisconnect(connection);

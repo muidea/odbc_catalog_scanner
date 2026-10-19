@@ -8,11 +8,32 @@ LOAD 'build/release/extension/odbc_catalog_scanner/odbc_catalog_scanner.duckdb_e
 query T
 SELECT function_name
 FROM duckdb_functions()
-WHERE function_name LIKE 'odbc_catalog_%'
+WHERE function_name LIKE 'odbc_catalog_%' OR function_name = 'odbc_relational_metadata'
 ORDER BY function_name;
 ----
 odbc_catalog_clear_cache
 odbc_catalog_metadata
+odbc_relational_metadata
+
+statement error
+SELECT * FROM odbc_relational_metadata('missing', 'columnProperties', '');
+----
+ODBC relational metadata schema cannot be empty
+
+statement error
+SELECT * FROM odbc_relational_metadata('missing', 'unknown', 'public');
+----
+Unsupported odbc_relational_metadata category
+
+statement error
+SELECT * FROM odbc_relational_metadata(NULL, 'indexes', 'public');
+----
+Parameters to odbc_relational_metadata cannot be NULL
+
+statement error
+SELECT * FROM odbc_relational_metadata('missing', 'constraints', 'public');
+----
+is not an ODBC catalog
 
 statement error
 SET odbc_catalog_connection_limit = 0;

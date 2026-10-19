@@ -1,4 +1,5 @@
 #include "odbc_connection.hpp"
+#include "odbc_handle_guard.hpp"
 
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/types/uuid.hpp"
@@ -70,9 +71,10 @@ ODBCConnection &ODBCConnection::operator=(ODBCConnection &&other) noexcept {
 }
 
 shared_ptr<ODBCConnection> ODBCConnection::Open(ODBCTypeConfig type_config, const string &connection_string) {
-	SQLHENV env = SQL_NULL_HENV;
-	SQLHDBC dbc = ODBCUtils::Connect(connection_string, env);
-	auto owned_connection = make_shared_ptr<OwnedODBCConnection>(dbc, env);
+	ODBCConnectGuard handles;
+	handles.connection = ODBCUtils::Connect(connection_string, handles.environment);
+	auto owned_connection = make_shared_ptr<OwnedODBCConnection>();
+	owned_connection->connection = handles.Release(owned_connection->environment);
 	return make_shared_ptr<ODBCConnection>(std::move(owned_connection), connection_string, std::move(type_config));
 }
 
@@ -87,26 +89,19 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 
 	if (!stmt) { // basic interface
 		auto hdbc = GetConn();
+		ODBCStatementPtr statement(nullptr, ODBCStatementDelete);
 		SQLHSTMT hstmt = SQL_NULL_HSTMT;
 		retcode = SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
+		statement.reset(hstmt);
 		if (!SQL_SUCCEEDED(retcode)) {
 			throw IOException("Failed to allocate statement handle for ODBC query \"%s\"\n", query.c_str());
 		}
 
-		try {
-			retcode = SQLExecDirectWithFallback(hstmt, query);
-			if (!SQL_SUCCEEDED(retcode)) {
-				throw IOException("Failed to run query \"%s\"\n", query.c_str());
-			}
-		} catch (const std::exception &) {
-			// 确保语句句柄被清理
-			if (hstmt != SQL_NULL_HSTMT) {
-				SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-			}
-			throw;
+		retcode = SQLExecDirectWithFallback(statement.get(), query);
+		if (!SQL_SUCCEEDED(retcode)) {
+			throw IOException("Failed to run query \"%s\"\n", query.c_str());
 		}
 
-		SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
 		return 0;
 	}
 
@@ -114,7 +109,11 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	// 对于预编译语句接口，调用者负责清理语句句柄
 	// 我们只需要确保在失败时抛出适当的异常
 
-	retcode = SQLPrepareWithFallback(stmt, query);
+	if (params.empty()) {
+		retcode = SQLExecDirectWithFallback(stmt, query);
+	} else {
+		retcode = SQLPrepareWithFallback(stmt, query);
+	}
 	if (!SQL_SUCCEEDED(retcode)) {
 		// 获取详细的ODBC错误信息
 		SQLCHAR sqlstate[6] = {0};
@@ -131,6 +130,19 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	}
 
 	vector<ODBCParameter> odbc_params;
+	if (params.empty()) {
+		SQLLEN affected_rows = 0;
+		retcode = SQLRowCount(stmt, &affected_rows);
+		if (!SQL_SUCCEEDED(retcode)) {
+			affected_rows = -1;
+		}
+		SQLSMALLINT num_cols = 0;
+		SQLRETURN col_ret = SQLNumResultCols(stmt, &num_cols);
+		if (SQL_SUCCEEDED(col_ret) && num_cols > 0) {
+			affected_rows = -1;
+		}
+		return affected_rows >= 0 ? static_cast<idx_t>(affected_rows) : static_cast<idx_t>(-1);
+	}
 	if (params.size() > 0) {
 		SQLSMALLINT param_count;
 		retcode = SQLNumParams(stmt, &param_count);
@@ -217,91 +229,60 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 		throw IOException("ODBC connection is busy executing another query \"%s\"\n", query.c_str());
 	}
 
-	// 检查连接健康状态
-	if (!CheckConnectionHealth()) {
-		ReleaseConnection();
-		throw IOException("ODBC connection is not healthy for query \"%s\"\n", query.c_str());
-	}
-
-	// 注意：我们不使用ConnectionBusyGuard，因为连接需要保持繁忙直到ODBCResult被销毁
-	// 连接繁忙状态由ODBCResult在析构时释放
-
-	// 使用递归互斥锁保护连接操作，防止多个查询同时使用同一个连接
-	// 使用 recursive_mutex 允许同一线程重入，避免死锁
-	lock_guard<std::recursive_mutex> l(query_lock);
-
-	auto hdbc = GetConn();
-
-	// 检查连接是否有效
-	if (!hdbc) {
-		ReleaseConnection();
-		throw IOException("ODBC connection is not open for query \"%s\"\n", query.c_str());
-	}
-
-	// 检查连接状态
-	SQLINTEGER conn_attr = SQL_CD_FALSE;
-	SQLRETURN status_ret = SQLGetConnectAttr(hdbc, SQL_ATTR_CONNECTION_DEAD, &conn_attr, 0, nullptr);
-	if (SQL_SUCCEEDED(status_ret) && conn_attr == SQL_CD_TRUE) {
-		ReleaseConnection();
-		throw IOException("ODBC connection is dead for query \"%s\"\n", query.c_str());
-	}
-
-	bool result_streaming = streaming == ODBCResultStreaming::ALLOW_STREAMING;
-	bool basic_interface = con_interface == ODBCConnectorInterface::BASIC;
-
-	if (basic_interface) {
-		ODBCExecute(nullptr, query, params, result_streaming);
-		// BASIC接口不创建ODBCResult，需要立即释放连接忙状态
-		ReleaseConnection();
-		return unique_ptr<ODBCResult>(nullptr);
-	}
-
-	SQLHSTMT hstmt = SQL_NULL_HSTMT;
-	SQLRETURN retcode = SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
-	if (!SQL_SUCCEEDED(retcode)) {
-		// 释放连接忙状态
-		ReleaseConnection();
-		throw IOException("Failed to initialize ODBC query \"%s\"\n", query.c_str());
-	}
-
-	idx_t affected_rows = 0;
+	// Keep all operations after claiming busy inside the catch-all, including
+	// health checks, locking, shared_from_this and result/owner construction.
 	try {
-		affected_rows = ODBCExecute(hstmt, query, params, result_streaming);
-	} catch (const std::exception &) {
-		// 执行失败，清理语句句柄
-		if (hstmt != SQL_NULL_HSTMT) {
-			SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
+		if (!CheckConnectionHealth()) {
+			throw IOException("ODBC connection is not healthy for query \"%s\"\n", query.c_str());
 		}
-		// 释放连接忙状态
+
+		lock_guard<std::recursive_mutex> l(query_lock);
+		auto hdbc = GetConn();
+		if (!hdbc) {
+			throw IOException("ODBC connection is not open for query \"%s\"\n", query.c_str());
+		}
+
+		SQLINTEGER conn_attr = SQL_CD_FALSE;
+		SQLRETURN status_ret = SQLGetConnectAttr(hdbc, SQL_ATTR_CONNECTION_DEAD, &conn_attr, 0, nullptr);
+		if (SQL_SUCCEEDED(status_ret) && conn_attr == SQL_CD_TRUE) {
+			throw IOException("ODBC connection is dead for query \"%s\"\n", query.c_str());
+		}
+
+		bool result_streaming = streaming == ODBCResultStreaming::ALLOW_STREAMING;
+		if (con_interface == ODBCConnectorInterface::BASIC) {
+			ODBCExecute(nullptr, query, params, result_streaming);
+			ReleaseConnection();
+			return unique_ptr<ODBCResult>(nullptr);
+		}
+
+		// Construct the owner before allocating a handle. From allocation until
+		// transfer to ODBCResult there is exactly one statement owner.
+		ODBCStatementPtr statement(nullptr, ODBCStatementDelete);
+		SQLHSTMT hstmt = SQL_NULL_HSTMT;
+		SQLRETURN retcode = SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
+		statement.reset(hstmt);
+		if (!SQL_SUCCEEDED(retcode)) {
+			throw IOException("Failed to initialize ODBC query \"%s\"\n", query.c_str());
+		}
+
+		idx_t affected_rows = ODBCExecute(statement.get(), query, params, result_streaming);
+		SQLSMALLINT num_cols = 0;
+		retcode = SQLNumResultCols(statement.get(), &num_cols);
+		if (!SQL_SUCCEEDED(retcode)) {
+			num_cols = 0;
+		}
+		if (affected_rows == static_cast<idx_t>(-1) && num_cols == 0) {
+			retcode = SQLNumResultCols(statement.get(), &num_cols);
+		}
+
+		auto self = shared_from_this();
+		return make_uniq<ODBCResult>(query, std::move(statement), type_config, affected_rows, num_cols, std::move(self),
+		                             streaming);
+	} catch (...) {
+		// Failed construction leaves busy cleanup here, not in ODBCResult, so
+		// another query cannot acquire busy between two releases.
 		ReleaseConnection();
 		throw;
-	}
-
-	// Get number of result columns
-	SQLSMALLINT num_cols = 0;
-	retcode = SQLNumResultCols(hstmt, &num_cols);
-	if (!SQL_SUCCEEDED(retcode)) {
-		num_cols = 0;
-	}
-
-	// For SELECT queries, affected_rows will be -1, but we still need to process the result set
-	if (affected_rows == static_cast<idx_t>(-1) && num_cols == 0) {
-		// Try to get column count again - some drivers might not set it immediately
-		retcode = SQLNumResultCols(hstmt, &num_cols);
-	}
-
-	try {
-		auto result = make_uniq<ODBCResult>(query, ODBCStatementPtr(hstmt, ODBCStatementDelete), type_config,
-		                                    affected_rows, num_cols, shared_from_this(), streaming);
-		return result;
-	} catch (const std::exception &e) {
-		// ODBCResult构造函数失败，清理语句句柄
-		if (hstmt != SQL_NULL_HSTMT) {
-			SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
-		}
-		// 释放连接忙状态
-		ReleaseConnection();
-		throw IOException("Failed to create ODBC result for query \"%s\": %s\n", query.c_str(), e.what());
 	}
 }
 

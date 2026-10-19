@@ -1,4 +1,5 @@
 #include "odbc_utils.hpp"
+#include "odbc_handle_guard.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -119,6 +120,43 @@ string EscapeODBCConnectionValue(const string &value) {
 }
 
 #ifndef _WIN32
+struct TemporaryODBCIniGuard {
+	explicit TemporaryODBCIniGuard(const char *path_p) : path(path_p) {
+	}
+	~TemporaryODBCIniGuard() {
+		if (path) {
+			std::remove(path);
+		}
+	}
+	TemporaryODBCIniGuard(const TemporaryODBCIniGuard &) = delete;
+	TemporaryODBCIniGuard &operator=(const TemporaryODBCIniGuard &) = delete;
+	const char *path;
+};
+
+struct ODBCIniEnvironmentGuard {
+	explicit ODBCIniEnvironmentGuard(const string &path) {
+		auto previous = std::getenv("ODBCINI");
+		had_previous = previous != nullptr;
+		if (previous) {
+			previous_value = previous;
+		}
+		if (setenv("ODBCINI", path.c_str(), 1) != 0) {
+			throw IOException("Failed to set temporary ODBC configuration");
+		}
+	}
+	~ODBCIniEnvironmentGuard() {
+		if (had_previous) {
+			setenv("ODBCINI", previous_value.c_str(), 1);
+		} else {
+			unsetenv("ODBCINI");
+		}
+	}
+	ODBCIniEnvironmentGuard(const ODBCIniEnvironmentGuard &) = delete;
+	ODBCIniEnvironmentGuard &operator=(const ODBCIniEnvironmentGuard &) = delete;
+	bool had_previous;
+	string previous_value;
+};
+
 bool HasExtraParam(const vector<string> &extra_params, const string &name) {
 	auto lower_name = StringUtil::Lower(name);
 	for (auto &extra : extra_params) {
@@ -144,6 +182,7 @@ string CreateTemporaryODBCIni(const ODBCConnectionParameters &config, string &ds
 	if (fd < 0) {
 		throw IOException("Failed to create temporary ODBC ini file");
 	}
+	TemporaryODBCIniGuard cleanup(path_template);
 	close(fd);
 
 	string path = path_template;
@@ -184,6 +223,7 @@ string CreateTemporaryODBCIni(const ODBCConnectionParameters &config, string &ds
 		std::remove(path.c_str());
 		throw IOException("Failed to write temporary ODBC ini file \"%s\"", path);
 	}
+	cleanup.path = nullptr;
 	return path;
 }
 
@@ -196,24 +236,11 @@ SQLRETURN SQLConnectWithTemporaryDSN(SQLHDBC dbc, const ODBCConnectionParameters
 	string dsn_name;
 	auto odbc_ini_path = CreateTemporaryODBCIni(config, dsn_name);
 
+	TemporaryODBCIniGuard cleanup(odbc_ini_path.c_str());
 	lock_guard<std::mutex> lock(odbc_ini_mutex);
-	auto old_odbc_ini = std::getenv("ODBCINI");
-	string old_odbc_ini_value;
-	if (old_odbc_ini) {
-		old_odbc_ini_value = old_odbc_ini;
-	}
-	setenv("ODBCINI", odbc_ini_path.c_str(), 1);
-
-	auto ret = SQLConnect(dbc, (SQLCHAR *)dsn_name.c_str(), SQL_NTS, (SQLCHAR *)config.uid.c_str(), SQL_NTS,
-	                      (SQLCHAR *)config.pwd.c_str(), SQL_NTS);
-
-	if (old_odbc_ini) {
-		setenv("ODBCINI", old_odbc_ini_value.c_str(), 1);
-	} else {
-		unsetenv("ODBCINI");
-	}
-	std::remove(odbc_ini_path.c_str());
-	return ret;
+	ODBCIniEnvironmentGuard environment(odbc_ini_path);
+	return SQLConnect(dbc, (SQLCHAR *)dsn_name.c_str(), SQL_NTS, (SQLCHAR *)config.uid.c_str(), SQL_NTS,
+	                  (SQLCHAR *)config.pwd.c_str(), SQL_NTS);
 }
 #endif
 
@@ -367,8 +394,9 @@ string ODBCUtils::BuildConnectionString(const string &dsn) {
 }
 
 SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env) {
-	SQLHENV env = SQL_NULL_HENV;
-	SQLHDBC dbc = SQL_NULL_HDBC;
+	ODBCConnectGuard handles;
+	auto &env = handles.environment;
+	auto &dbc = handles.connection;
 	SQLRETURN ret;
 
 	ret = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &env);
@@ -378,20 +406,16 @@ SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env) {
 
 	ret = SQLSetEnvAttr(env, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
 	if (!SQL_SUCCEEDED(ret)) {
-		SQLFreeHandle(SQL_HANDLE_ENV, env);
 		throw IOException("Failed to set ODBC version");
 	}
 
 	ret = SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc);
 	if (!SQL_SUCCEEDED(ret)) {
-		SQLFreeHandle(SQL_HANDLE_ENV, env);
 		throw IOException("Failed to allocate ODBC connection handle");
 	}
 
 	ret = SQLSetConnectAttr(dbc, SQL_ATTR_ACCESS_MODE, reinterpret_cast<SQLPOINTER>(SQL_MODE_READ_ONLY), 0);
 	if (!SQL_SUCCEEDED(ret)) {
-		SQLFreeHandle(SQL_HANDLE_DBC, dbc);
-		SQLFreeHandle(SQL_HANDLE_ENV, env);
 		throw IOException("ODBC driver does not support read-only connections");
 	}
 
@@ -422,14 +446,10 @@ SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env) {
 		SQLGetDiagRec(SQL_HANDLE_DBC, dbc, 1, sqlstate, &native_error, message_text, SQL_MAX_MESSAGE_LENGTH,
 		              &text_length);
 
-		SQLFreeHandle(SQL_HANDLE_DBC, dbc);
-		SQLFreeHandle(SQL_HANDLE_ENV, env);
-
 		throw IOException("Failed to connect to ODBC catalog through ODBC: %s", (char *)message_text);
 	}
 
-	out_env = env;
-	return dbc;
+	return handles.Release(out_env);
 }
 
 static string ReadCatalogString(SQLHSTMT statement, SQLUSMALLINT column) {

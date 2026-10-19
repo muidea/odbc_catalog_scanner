@@ -129,6 +129,7 @@ static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk
 	for (idx_t c = 0; c < output.ColumnCount(); c++) {
 		Vector &output_vec = output.data[c];
 		Vector &res_vec = res_chunk.data[c];
+		error.clear();
 
 		// 检查向量有效性
 		if (output_vec.GetType().id() == LogicalTypeId::INVALID) {
@@ -138,8 +139,14 @@ static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk
 			throw InternalException("ODBCScan: result vector %lu has invalid type", c);
 		}
 
-		// 总是使用 TryCast 进行安全的数据复制，避免引用生命周期问题
-		VectorOperations::TryCast(context, res_vec, output_vec, res_chunk.size(), &error);
+		if (res_vec.GetType() == output_vec.GetType()) {
+			// A same-type TryCast is DuckDB's NopCast and only references the
+			// source vector. Materialized ODBC chunks are owned by the function
+			// state, so the output must receive an independent copy.
+			VectorOperations::Copy(res_vec, output_vec, res_chunk.size(), 0, 0);
+		} else {
+			VectorOperations::TryCast(context, res_vec, output_vec, res_chunk.size(), &error);
+		}
 
 		// throw an error in case of TryCast fails
 		if (!error.empty()) {
