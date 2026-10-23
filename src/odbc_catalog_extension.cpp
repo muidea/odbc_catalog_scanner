@@ -109,7 +109,14 @@ void SetODBCSecretParameters(CreateSecretFunction &function) {
 	function.named_parameters["database"] = LogicalType::VARCHAR;
 }
 
+namespace duckdb {
+void RegisterDb2GuardedCRUD(ExtensionLoader &loader);
+void RegisterDamengGuardedCRUD(ExtensionLoader &loader);
+} // namespace duckdb
+
 static void LoadInternal(ExtensionLoader &loader) {
+	RegisterDb2GuardedCRUD(loader);
+	RegisterDamengGuardedCRUD(loader);
 	// ODBC doesn't require explicit library initialization like MySQL
 	// The ODBC driver manager handles initialization automatically
 	ODBCClearCacheFunction clear_cache_func;

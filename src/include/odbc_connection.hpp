@@ -60,7 +60,8 @@ public:
 	ODBCConnection &operator=(ODBCConnection &&) noexcept;
 
 public:
-	static shared_ptr<ODBCConnection> Open(ODBCTypeConfig type_config, const string &connection_string);
+	static shared_ptr<ODBCConnection> Open(ODBCTypeConfig type_config, const string &connection_string,
+	                                       uint32_t login_timeout = 0);
 	void Execute(const string &query);
 	void Execute(const string &query, vector<Value> params);
 	unique_ptr<ODBCResult> Query(const string &query, ODBCResultStreaming streaming);

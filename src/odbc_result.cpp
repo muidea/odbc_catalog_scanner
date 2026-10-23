@@ -3,6 +3,8 @@
 #include "storage/odbc_connection_pool.hpp"
 
 #include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/operator/decimal_cast_operators.hpp"
+#include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "odbc_types.hpp"
@@ -97,9 +99,40 @@ ODBCField::ODBCField(void *field_info, LogicalType duckdb_type_p, const ODBCType
 	bind_buffer.resize(DEFAULT_BIND_BUFFER_SIZE);
 }
 
+// A CLI driver may write a 32-bit SQLLEN through the driver manager's
+// 64-bit slot. Poison padding proves that width without mistaking narrow -1
+// (NULL) for a multi-gigabyte positive value. Never accept an unwritten slot.
+static SQLLEN UnwrittenIndicator() {
+	SQLLEN value;
+	std::memset(&value, 0xa5, sizeof(value));
+	return value;
+}
+
+static SQLLEN DecodeIndicator(SQLLEN value) {
+	if (value == UnwrittenIndicator()) {
+		throw IOException("ODBC driver did not write a result length indicator");
+	}
+	if (sizeof(SQLLEN) == 8) {
+		auto bytes = reinterpret_cast<const unsigned char *>(&value);
+		bool narrow = true;
+		for (idx_t i = 4; i < 8; i++) {
+			narrow = narrow && bytes[i] == 0xa5;
+		}
+		if (narrow) {
+			int32_t low;
+			std::memcpy(&low, bytes, sizeof(low));
+			value = low;
+		}
+	}
+	if (value < 0 && value != SQL_NULL_DATA && value != SQL_NO_TOTAL) {
+		throw IOException("ODBC driver returned an invalid result length indicator");
+	}
+	return value;
+}
+
 void ODBCField::ResetBind() {
 	this->bind_is_null = false;
-	this->bind_length = 0;
+	this->bind_length = UnwrittenIndicator();
 	this->bind_error = false;
 	this->value_buffer.clear();
 }
@@ -133,9 +166,12 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 	for (SQLSMALLINT i = 0; i < num_cols; i++) {
 		SQLCHAR col_name[256];
 		SQLCHAR type_name_buffer[256] = {};
-		SQLSMALLINT name_len, data_type, decimal_digits, nullable;
+		SQLSMALLINT name_len = 0, data_type = 0, decimal_digits = 0, nullable = 0;
 		SQLSMALLINT type_name_len = 0;
-		SQLULEN column_size;
+		// Some deployed CLI drivers write a 32-bit size through SQLULEN*.
+		// Zero the complete output slot so high stack bytes cannot change an
+		// exact DECIMAL descriptor into the out-of-range DOUBLE fallback.
+		SQLULEN column_size = 0;
 		SQLLEN unused_numeric_attribute = 0;
 
 		retcode = SQLDescribeCol(stmt, i + 1, col_name, sizeof(col_name), &name_len, &data_type, &column_size,
@@ -199,6 +235,13 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 
 		// Resize buffer based on ODBC type
 		size_t buf_size = GetBufferSize(field.c_type, column_size);
+		if (field.c_type == SQL_C_CHAR && TransferNumericAsText(lower_type_name)) {
+			// Precision counts digits only. Driver text may also contain a sign,
+			// decimal point and a leading zero when scale == precision. Reserving
+			// a small fixed minimum avoids truncating valid DECIMAL values or
+			// relying on SQLGetData continuation for already-bound numeric data.
+			buf_size = MaxValue<size_t>(buf_size, DEFAULT_BIND_BUFFER_SIZE);
+		}
 		field.bind_buffer.resize(buf_size);
 
 		fields.emplace_back(std::move(field));
@@ -246,9 +289,12 @@ static void ReadUnboundVariableData(vector<ODBCField> &fields, SQLHSTMT stmt, co
 		field.value_buffer.clear();
 		while (true) {
 			memset(buffer.data(), 0, buffer.size());
-			SQLLEN indicator = 0;
+			SQLLEN indicator = UnwrittenIndicator();
 			auto retcode = SQLGetData(stmt, static_cast<SQLUSMALLINT>(i + 1), field.c_type, buffer.data(),
 			                          static_cast<SQLLEN>(buffer.size()), &indicator);
+			if (SQL_SUCCEEDED(retcode)) {
+				indicator = DecodeIndicator(indicator);
+			}
 			if (indicator == SQL_NULL_DATA) {
 				field.bind_length = SQL_NULL_DATA;
 				field.value_buffer.clear();
@@ -436,9 +482,12 @@ void ODBCResult::HandleTruncatedData() {
 		vector<char> buffer(8192);
 		while (true) {
 			std::fill(buffer.begin(), buffer.end(), 0);
-			SQLLEN indicator = 0;
+			SQLLEN indicator = UnwrittenIndicator();
 			auto status = SQLGetData(stmt.get(), static_cast<SQLUSMALLINT>(i + 1), field.c_type, buffer.data(),
 			                         static_cast<SQLLEN>(buffer.size()), &indicator);
+			if (SQL_SUCCEEDED(status)) {
+				indicator = DecodeIndicator(indicator);
+			}
 			if (status == SQL_NO_DATA) {
 				break;
 			}
@@ -547,6 +596,11 @@ bool ODBCResult::FetchNext() {
 		return false;
 	}
 
+	for (auto &field : fields) {
+		if (field.column_bound) {
+			field.bind_length = DecodeIndicator(field.bind_length);
+		}
+	}
 	HandleTruncatedData();
 
 	for (size_t i = 0; i < fields.size(); i++) {
@@ -702,66 +756,59 @@ static void WriteTimeAsString(ODBCField &f, Vector &vec, idx_t row) {
 	data[row] = StringVector::AddStringOrBlob(vec, std::move(st));
 }
 
+template <class T>
+static void WriteExactDecimal(const string &text, Vector &vec, idx_t row, uint8_t precision, uint8_t scale) {
+	T value;
+	string error;
+	CastParameters parameters(true, &error);
+	if (!TryCastToDecimal::Operation(string_t(text), value, parameters, precision, scale)) {
+		throw ConversionException("ODBC DECIMAL value does not fit the declared precision/scale");
+	}
+	FlatVector::GetData<T>(vec)[row] = value;
+}
+
 static void WriteDecimal(ODBCField &f, Vector &vec, idx_t row) {
 	if (f.bind_length == SQL_NULL_DATA) {
 		FlatVector::SetNull(vec, row, true);
 		return;
 	}
-
-	if (f.bind_length < 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
-		FlatVector::SetNull(vec, row, true);
-		return;
+	if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
+		throw ConversionException("ODBC DECIMAL value has an invalid transfer length");
 	}
-
-	string decimal_str(f.ValueData(), static_cast<size_t>(f.bind_length));
-
-	auto &vec_type = vec.GetType();
-	uint8_t precision = DecimalType::GetWidth(vec_type);
-	uint8_t scale = DecimalType::GetScale(vec_type);
-
-	try {
-		size_t dot_pos = decimal_str.find('.');
-		string int_part, frac_part;
-
-		if (dot_pos != string::npos) {
-			int_part = decimal_str.substr(0, dot_pos);
-			frac_part = decimal_str.substr(dot_pos + 1);
-		} else {
-			int_part = decimal_str;
+	string text(f.ValueData(), static_cast<size_t>(f.bind_length));
+	auto precision = DecimalType::GetWidth(vec.GetType());
+	auto scale = DecimalType::GetScale(vec.GetType());
+	idx_t pos = (text[0] == '+' || text[0] == '-') ? 1 : 0;
+	bool dot = false, digits = false;
+	idx_t fractional = 0;
+	for (; pos < text.size(); pos++) {
+		auto c = text[pos];
+		if (c == '.' && !dot) {
+			dot = true;
+			continue;
 		}
-
-		if (frac_part.length() < scale) {
-			frac_part.append(scale - frac_part.length(), '0');
-		} else if (frac_part.length() > scale) {
-			frac_part = frac_part.substr(0, scale);
+		if (c < '0' || c > '9') {
+			throw ConversionException("ODBC DECIMAL value has an invalid numeric representation");
 		}
-
-		string scaled_str = int_part + frac_part;
-
-		// DuckDB DECIMAL internal storage depends on precision:
-		//   1-4   → int16_t
-		//   5-9   → int32_t
-		//   10-18 → int64_t
-		//   19-38 → hugeint_t
-		if (precision <= 4) {
-			FlatVector::GetData<int16_t>(vec)[row] = static_cast<int16_t>(std::stoi(scaled_str));
-		} else if (precision <= 9) {
-			FlatVector::GetData<int32_t>(vec)[row] = static_cast<int32_t>(std::stol(scaled_str));
-		} else if (precision <= 18) {
-			FlatVector::GetData<int64_t>(vec)[row] = std::stoll(scaled_str);
-		} else if (precision <= 38) {
-			hugeint_t huge_val;
-			if (!Hugeint::TryConvert(scaled_str.c_str(), huge_val)) {
-				throw InternalException("Decimal value out of hugeint range: %s", scaled_str.c_str());
-			}
-			FlatVector::GetData<hugeint_t>(vec)[row] = huge_val;
-		} else {
-			throw InternalException("Unsupported DECIMAL precision %u for column %s (max: 38)", precision,
-			                        f.name.c_str());
+		digits = true;
+		if (dot && ++fractional > scale && c != '0') {
+			throw ConversionException("ODBC DECIMAL value exceeds its declared scale");
 		}
-	} catch (const std::exception &e) {
-		throw InternalException("Failed to parse decimal value '%s' for column %s: %s", decimal_str.c_str(),
-		                        f.name.c_str(), e.what());
+	}
+	if (!digits) {
+		throw ConversionException("ODBC DECIMAL value has no digits");
+	}
+	// Use DuckDB's checked decimal parser for all physical widths. Concatenating
+	// integer/fractional strings and parsing as an integer rejects leading zeros
+	// in strict HUGEINT conversion and can silently truncate fractional digits.
+	if (precision <= 4) {
+		WriteExactDecimal<int16_t>(text, vec, row, precision, scale);
+	} else if (precision <= 9) {
+		WriteExactDecimal<int32_t>(text, vec, row, precision, scale);
+	} else if (precision <= 18) {
+		WriteExactDecimal<int64_t>(text, vec, row, precision, scale);
+	} else {
+		WriteExactDecimal<hugeint_t>(text, vec, row, precision, scale);
 	}
 }
 

@@ -70,9 +70,10 @@ ODBCConnection &ODBCConnection::operator=(ODBCConnection &&other) noexcept {
 	return *this;
 }
 
-shared_ptr<ODBCConnection> ODBCConnection::Open(ODBCTypeConfig type_config, const string &connection_string) {
+shared_ptr<ODBCConnection> ODBCConnection::Open(ODBCTypeConfig type_config, const string &connection_string,
+                                                uint32_t login_timeout) {
 	ODBCConnectGuard handles;
-	handles.connection = ODBCUtils::Connect(connection_string, handles.environment);
+	handles.connection = ODBCUtils::Connect(connection_string, handles.environment, login_timeout);
 	auto owned_connection = make_shared_ptr<OwnedODBCConnection>();
 	owned_connection->connection = handles.Release(owned_connection->environment);
 	return make_shared_ptr<ODBCConnection>(std::move(owned_connection), connection_string, std::move(type_config));

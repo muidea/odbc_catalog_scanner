@@ -393,7 +393,7 @@ string ODBCUtils::BuildConnectionString(const string &dsn) {
 	return connection_string;
 }
 
-SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env) {
+SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env, uint32_t login_timeout) {
 	ODBCConnectGuard handles;
 	auto &env = handles.environment;
 	auto &dbc = handles.connection;
@@ -414,6 +414,11 @@ SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env) {
 		throw IOException("Failed to allocate ODBC connection handle");
 	}
 
+	if (login_timeout &&
+	    SQLSetConnectAttr(dbc, SQL_LOGIN_TIMEOUT, reinterpret_cast<SQLPOINTER>(static_cast<uintptr_t>(login_timeout)),
+	                      0) != SQL_SUCCESS) {
+		throw IOException("ODBC driver does not support the guarded login timeout");
+	}
 	ret = SQLSetConnectAttr(dbc, SQL_ATTR_ACCESS_MODE, reinterpret_cast<SQLPOINTER>(SQL_MODE_READ_ONLY), 0);
 	if (!SQL_SUCCEEDED(ret)) {
 		throw IOException("ODBC driver does not support read-only connections");

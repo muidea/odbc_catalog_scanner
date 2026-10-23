@@ -14,6 +14,8 @@ namespace {
 int environments = 0;
 int connections = 0;
 bool fail_attribute = false;
+bool fail_login_timeout = false;
+bool login_timeout_seen = false;
 bool fail_driver = false;
 bool throw_connect = false;
 string temporary_path;
@@ -24,11 +26,11 @@ void Require(bool value, const char *message) {
 void Empty() {
 	Require(environments == 0 && connections == 0, "native connection handles leaked");
 }
-void Fail(const string &dsn) {
+void Fail(const string &dsn, uint32_t timeout = 0) {
 	bool threw = false;
 	SQLHENV env = SQL_NULL_HENV;
 	try {
-		ODBCUtils::Connect(dsn, env);
+		ODBCUtils::Connect(dsn, env, timeout);
 	} catch (const std::exception &) {
 		threw = true;
 	}
@@ -65,7 +67,12 @@ SQLRETURN SQL_API SQLDisconnect(SQLHDBC) {
 SQLRETURN SQL_API SQLSetEnvAttr(SQLHENV, SQLINTEGER, SQLPOINTER, SQLINTEGER) {
 	return SQL_SUCCESS;
 }
-SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC, SQLINTEGER, SQLPOINTER, SQLINTEGER) {
+SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC, SQLINTEGER attribute, SQLPOINTER value, SQLINTEGER) {
+	if (attribute == SQL_LOGIN_TIMEOUT) {
+		Require(reinterpret_cast<uintptr_t>(value) == 5, "guarded login budget lost");
+		login_timeout_seen = true;
+		return fail_login_timeout ? SQL_ERROR : SQL_SUCCESS;
+	}
 	return fail_attribute ? SQL_ERROR : SQL_SUCCESS;
 }
 SQLRETURN SQL_API SQLDriverConnect(SQLHDBC, SQLHWND, SQLCHAR *, SQLSMALLINT, SQLCHAR *, SQLSMALLINT, SQLSMALLINT *,
@@ -115,8 +122,12 @@ int main() {
 		Fail("DRIVER={test\ninvalid};SERVER=local;UID=test;PWD={x}}};");
 		unsetenv("ODBCINI");
 #endif
+		fail_login_timeout = true;
+		Fail("DRIVER=test;SERVER=local;", 5);
+		fail_login_timeout = false;
+		Require(login_timeout_seen, "guarded connect omitted login timeout");
 		SQLHENV env = SQL_NULL_HENV;
-		auto connection = ODBCUtils::Connect("DRIVER=test;SERVER=local;", env);
+		auto connection = ODBCUtils::Connect("DRIVER=test;SERVER=local;", env, 5);
 		Require(environments == 1 && connections == 1, "success transfer invalid");
 		SQLDisconnect(connection);
 		SQLFreeHandle(SQL_HANDLE_DBC, connection);

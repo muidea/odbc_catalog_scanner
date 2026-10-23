@@ -44,6 +44,9 @@ target_link_libraries(${TARGET_NAME}_loadable_extension
 
 option(ODBC_CATALOG_BUILD_RESOURCE_TESTS "构建无数据库资源生命周期测试" OFF)
 if(ODBC_CATALOG_BUILD_RESOURCE_TESTS)
+    add_executable(odbc_guarded_row_count_test test/odbc_guarded_row_count_test.cpp)
+    target_include_directories(odbc_guarded_row_count_test PRIVATE src/include)
+    target_link_libraries(odbc_guarded_row_count_test duckdb)
     add_executable(odbc_relational_reader_test
                    test/odbc_relational_reader_test.cpp src/odbc_relational_reader.cpp)
     target_include_directories(odbc_relational_reader_test PRIVATE src/include)
