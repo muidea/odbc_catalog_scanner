@@ -336,15 +336,18 @@ static string Info(SQLHDBC dbc, SQLUSMALLINT key) {
 		Reject();
 	return string(reinterpret_cast<char *>(value), len);
 }
+// Version is an opaque source identity. Capability is proved by the live
+// session/catalog checks below, never by a fixed release interval.
 static bool Compatible(const string &v) {
-	auto parts = StringUtil::Split(v, '.');
-	if (parts.size() != 3)
+	if (v.empty() || v.size() > 1024 || StringUtil::CharacterIsSpace(v.front()) ||
+	    StringUtil::CharacterIsSpace(v.back()))
 		return false;
-	for (auto &p : parts)
-		if (p.empty() || p.size() > 4 || p.find_first_not_of("0123456789") != string::npos)
+	for (auto c : v)
+		if (static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) == 127)
 			return false;
-	return (parts[0] == "11" && parts[1] == "05") || (parts[0] == "12" && parts[1] == "01");
+	return true;
 }
+
 static void Writable(SQLHDBC dbc) {
 	if (SQLSetConnectAttr(dbc, SQL_ATTR_ACCESS_MODE, reinterpret_cast<SQLPOINTER>(SQL_MODE_READ_WRITE), 0) !=
 	        SQL_SUCCESS ||
