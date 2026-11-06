@@ -6,6 +6,7 @@
 // Restricted Db2 mutations on an isolated scanner-owned session.
 //===----------------------------------------------------------------------===//
 #include "duckdb.hpp"
+#include "guarded_odbc_source_error.hpp"
 #include "odbc_guarded_row_count.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -19,7 +20,7 @@
 namespace duckdb {
 namespace {
 static void Reject() {
-	throw InvalidInputException("guarded Db2 operation rejected");
+	throw GuardedODBCLocalRejection("guarded Db2 operation rejected");
 }
 static string JSON(const string &s) {
 	string out = "\"";
@@ -97,9 +98,11 @@ public:
 			watcher.join();
 	}
 	string error;
+	GuardedODBCSourceError source;
 	void Check(SQLRETURN rc) {
 		if (rc == SQL_SUCCESS)
 			return;
+		source = ReadGuardedODBCSourceError(SQL_HANDLE_STMT, stmt.get(), "db2");
 		SQLCHAR state[6] = {0};
 		SQLINTEGER native = 0;
 		SQLSMALLINT len = 0;
@@ -108,7 +111,7 @@ public:
 		if (cancelled.load() || ctx.IsInterrupted())
 			error = "57014";
 		else
-			error = state[0] ? string(reinterpret_cast<char *>(state)) : "08006";
+			error = state[0] ? string(reinterpret_cast<char *>(state)) : "XX000";
 		Reject();
 	}
 	void Start(bool cleanup = false) {
@@ -258,6 +261,7 @@ struct Data : TableFunctionData {
 	string schema, table, expected, version, sql;
 	vector<Value> params;
 	bool execute;
+	bool diagnostics = false;
 	Data(ODBCCatalog &c, bool e) : catalog(c), execute(e) {
 	}
 };
@@ -303,9 +307,19 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
 		if (d->params.size() > 2100)
 			Reject();
 	}
+	auto diagnostic = in.named_parameters.find("source_diagnostics");
+	if (diagnostic != in.named_parameters.end()) {
+		if (diagnostic->second.IsNull())
+			Reject();
+		d->diagnostics = diagnostic->second.GetValue<bool>();
+	}
 	names = {"status", "affected_rows", "sqlstate", "stage", "version", "descriptor"};
 	types = {LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::VARCHAR,
 	         LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	if (d->diagnostics) {
+		names.push_back("source_error");
+		types.push_back(LogicalType::VARCHAR);
+	}
 	return std::move(d);
 }
 static string JSONRows(const vector<vector<string>> &rows) {
@@ -449,8 +463,9 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	state.done = true;
 	auto &d = in.bind_data->Cast<Data>();
 	string status = "CONFIRMED_NOT_EXECUTED", error, stage = "source_metadata", version, descriptor;
+	string source_error;
 	int64_t affected = -1;
-	bool sent = false, commit_started = false;
+	bool sent = false, commit_started = false, local_rejection = false;
 	shared_ptr<ODBCConnection> connection;
 	unique_ptr<Session> session;
 	try {
@@ -489,8 +504,25 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			stage.clear();
 		}
 	} catch (...) {
+		try {
+			throw;
+		} catch (const GuardedODBCLocalRejection &) {
+			local_rejection = true;
+		} catch (const GuardedODBCConnectionFailure &failure) {
+			auto source = failure.diagnostic;
+			source.product = "db2";
+			source_error = source.JSON();
+			error = source.state;
+			stage = "source_connection";
+		} catch (...) {
+		}
+		// Snapshot before rollback/cancellation cleanup replaces handle diagnostics.
+		if (session && source_error.empty())
+			source_error = session->source.JSON();
 		if (error.empty())
-			error = session && !session->error.empty() ? session->error : (ctx.IsInterrupted() ? "57014" : "08006");
+			error = session && !session->error.empty()
+			            ? session->error
+			            : (ctx.IsInterrupted() ? "57014" : (local_rejection ? "0A000" : "XX000"));
 		if (session)
 			try {
 				session->Exec("ROLLBACK", true);
@@ -511,6 +543,8 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	out.SetValue(3, 0, Value(stage));
 	out.SetValue(4, 0, Value(version));
 	out.SetValue(5, 0, Value(descriptor));
+	if (d.diagnostics)
+		out.SetValue(6, 0, Value(source_error));
 }
 struct AdminData : TableFunctionData {
 	ODBCCatalog &catalog;
@@ -570,10 +604,12 @@ static void AdminScan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out
 void RegisterDb2GuardedCRUD(ExtensionLoader &loader) {
 	loader.RegisterFunction(
 	    TableFunction("odbc_execute", vector<LogicalType>(2, LogicalType::VARCHAR), AdminScan, AdminBind, Init));
-	loader.RegisterFunction(
-	    TableFunction("db2_crud_metadata_v1", vector<LogicalType>(3, LogicalType::VARCHAR), Scan, Bind, Init));
+	TableFunction metadata("db2_crud_metadata_v1", vector<LogicalType>(3, LogicalType::VARCHAR), Scan, Bind, Init);
+	metadata.named_parameters["source_diagnostics"] = LogicalType::BOOLEAN;
+	loader.RegisterFunction(metadata);
 	TableFunction exec("db2_guarded_mutation_v1", vector<LogicalType>(6, LogicalType::VARCHAR), Scan, Bind, Init);
 	exec.named_parameters["params"] = LogicalType::ANY;
+	exec.named_parameters["source_diagnostics"] = LogicalType::BOOLEAN;
 	loader.RegisterFunction(exec);
 }
 } // namespace duckdb

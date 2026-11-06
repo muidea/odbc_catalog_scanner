@@ -38,7 +38,7 @@ LogicalType ODBCTypes::TypeToLogicalType(const ODBCTypeConfig &type_config, cons
 	if (type_name == "decimal" || type_name == "numeric" || type_name == "smalldecimal" || type_name == "decfloat" ||
 	    type_name == "money" || type_name == "smallmoney") {
 		auto precision = type_info.precision;
-		auto scale = type_info.scale < 0 ? 0 : type_info.scale;
+		auto scale = type_info.scale;
 		if (type_name == "money") {
 			precision = 19;
 			scale = 4;
@@ -47,12 +47,12 @@ LogicalType ODBCTypes::TypeToLogicalType(const ODBCTypeConfig &type_config, cons
 			scale = 4;
 		}
 		if (type_name == "decfloat") {
-			return LogicalType::DOUBLE;
+			return LogicalType::VARCHAR_COLLATION("odbc_exact_numeric");
 		}
 		if (precision > 0 && precision <= 38 && scale >= 0 && scale <= precision) {
 			return LogicalType::DECIMAL(NumericCast<uint8_t>(precision), NumericCast<uint8_t>(scale));
 		}
-		return LogicalType::DOUBLE;
+		return LogicalType::VARCHAR_COLLATION("odbc_exact_numeric");
 	}
 	if (type_name == "real") {
 		return LogicalType::FLOAT;

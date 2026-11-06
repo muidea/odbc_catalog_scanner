@@ -41,6 +41,10 @@ void Fail(const string &dsn, uint32_t timeout = 0) {
 } // namespace
 
 extern "C" {
+SQLRETURN SQL_API SQLGetDiagRecW(SQLSMALLINT, SQLHANDLE, SQLSMALLINT, SQLWCHAR *, SQLINTEGER *, SQLWCHAR *, SQLSMALLINT,
+                                 SQLSMALLINT *) {
+	return SQL_ERROR;
+}
 SQLRETURN SQL_API SQLAllocHandle(SQLSMALLINT type, SQLHANDLE, SQLHANDLE *output) {
 	*output = new int(type);
 	if (type == SQL_HANDLE_ENV)

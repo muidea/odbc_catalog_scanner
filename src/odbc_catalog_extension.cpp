@@ -1,5 +1,6 @@
 #define DUCKDB_BUILD_LOADABLE_EXTENSION
 #include "duckdb.hpp"
+#include "odbc_exact_numeric.hpp"
 
 #include "odbc_scanner.hpp"
 #include "odbc_storage.hpp"
@@ -115,6 +116,7 @@ void RegisterDamengGuardedCRUD(ExtensionLoader &loader);
 } // namespace duckdb
 
 static void LoadInternal(ExtensionLoader &loader) {
+	RegisterODBCExactNumericCollation(loader, "odbc_exact_numeric");
 	RegisterDb2GuardedCRUD(loader);
 	RegisterDamengGuardedCRUD(loader);
 	// ODBC doesn't require explicit library initialization like MySQL

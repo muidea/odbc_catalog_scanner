@@ -1,3 +1,4 @@
+#include "guarded_odbc_source_error.hpp"
 #include "odbc_utils.hpp"
 #include "odbc_handle_guard.hpp"
 
@@ -443,15 +444,10 @@ SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env, uint32_t login_t
 	}
 
 	if (!SQL_SUCCEEDED(ret)) {
-		SQLCHAR sqlstate[6] = {0};
-		SQLINTEGER native_error = 0;
-		SQLCHAR message_text[SQL_MAX_MESSAGE_LENGTH] = {0};
-		SQLSMALLINT text_length = 0;
-
-		SQLGetDiagRec(SQL_HANDLE_DBC, dbc, 1, sqlstate, &native_error, message_text, SQL_MAX_MESSAGE_LENGTH,
-		              &text_length);
-
-		throw IOException("Failed to connect to ODBC catalog through ODBC: %s", (char *)message_text);
+		auto source = ReadGuardedODBCSourceError(SQL_HANDLE_DBC, dbc, "");
+		if (!source.message.empty())
+			throw GuardedODBCConnectionFailure(std::move(source));
+		throw IOException("ODBC connection failed without a source diagnostic");
 	}
 
 	return handles.Release(out_env);
