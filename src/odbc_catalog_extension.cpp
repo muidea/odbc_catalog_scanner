@@ -128,6 +128,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(metadata_function);
 	ODBCRelationalMetadataFunction relational_metadata_function;
 	loader.RegisterFunction(relational_metadata_function);
+	ODBCRelationalMetadataFunction vendor_metadata_function(true);
+	loader.RegisterFunction(vendor_metadata_function);
+	ODBCRelationalMetadataFunction scoped_vendor_metadata_function(true, true);
+	loader.RegisterFunction(scoped_vendor_metadata_function);
 
 	SecretType secret_type;
 	secret_type.name = "odbc_catalog";

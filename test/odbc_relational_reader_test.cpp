@@ -17,6 +17,10 @@ struct FakeStatement {
 	bool truncated = false;
 };
 idx_t handles = 0;
+bool fail_execute = false;
+bool wrong_columns = false;
+bool extra_results = false;
+string vendor_value = "  expression('默认')  ";
 bool fail_timeout = false;
 bool fail_fetch = false;
 bool wrong_identity = false;
@@ -63,6 +67,20 @@ vector<string> Columns(const string &name, const string &ordinal) {
 } // namespace
 
 extern "C" {
+SQLRETURN SQL_API SQLExecDirect(SQLHSTMT stmt, SQLCHAR *text, SQLINTEGER) {
+	Require(string(reinterpret_cast<char *>(text)) == "fixed vendor metadata", "unexpected vendor query");
+	if (fail_execute)
+		return SQL_ERROR;
+	Stmt(stmt).rows = {{"APP", vendor_value}};
+	return SQL_SUCCESS;
+}
+SQLRETURN SQL_API SQLNumResultCols(SQLHSTMT, SQLSMALLINT *columns) {
+	*columns = wrong_columns ? 3 : 2;
+	return SQL_SUCCESS;
+}
+SQLRETURN SQL_API SQLMoreResults(SQLHSTMT) {
+	return extra_results ? SQL_SUCCESS : SQL_NO_DATA;
+}
 SQLRETURN SQL_API SQLAllocHandle(SQLSMALLINT type, SQLHANDLE, SQLHANDLE *output) {
 	Require(type == SQL_HANDLE_STMT, "unexpected handle type");
 	*output = new FakeStatement();
@@ -187,6 +205,23 @@ int main() {
 		Require(indexes.size() == 2 && indexes[0].values.size() == 10, "index ABI mismatch");
 		Require(indexes[0].values[5] == "true" && indexes[0].values[6] == "1", "index uniqueness or order changed");
 		Require(handles == 0, "statement leaked on success");
+		auto vendor = reader.ReadQuery("fixed vendor metadata", 2);
+		Require(vendor.size() == 1 && vendor[0].values[1] == vendor_value, "vendor expression changed");
+		Require(handles == 0, "vendor statement leaked on success");
+		fail_execute = true;
+		ExpectFailure([&] { reader.ReadQuery("fixed vendor metadata", 2); }, "vendor execute failure ignored");
+		fail_execute = false;
+		wrong_columns = true;
+		ExpectFailure([&] { reader.ReadQuery("fixed vendor metadata", 2); }, "vendor column mismatch ignored");
+		wrong_columns = false;
+		extra_results = true;
+		ExpectFailure([&] { reader.ReadQuery("fixed vendor metadata", 2); }, "vendor extra results ignored");
+		extra_results = false;
+		vendor_value = string(18000, 'x');
+		vendor = reader.ReadQuery("fixed vendor metadata", 2);
+		Require(vendor[0].values[1] == vendor_value, "chunked vendor expression truncated");
+		vendor_value = string(ODBCRelationalReader::WINDOW_LIMIT / 3 + 1, 'x');
+		ExpectFailure([&] { reader.ReadQuery("fixed vendor metadata", 2); }, "oversized vendor expression accepted");
 		fail_timeout = true;
 		ExpectFailure([&] { reader.Objects("a_%"); }, "timeout setup failure ignored");
 		fail_timeout = false;

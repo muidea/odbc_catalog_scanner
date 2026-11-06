@@ -149,6 +149,36 @@ void ODBCRelationalReader::ReadCatalog(SQLHSTMT statement, SQLRETURN status, con
 	}
 }
 
+vector<ODBCRelationalRow> ODBCRelationalReader::ReadQuery(const string &sql, SQLUSMALLINT columns) {
+	auto statement = Statement();
+	vector<ODBCRelationalRow> result;
+	idx_t used = 0;
+	auto status = SQLExecDirect(statement.get(), ODBCText(sql), SQL_NTS);
+	if (!SQL_SUCCEEDED(status)) {
+		CatalogError(statement.get(), "vendor metadata execute");
+	}
+	SQLSMALLINT actual = 0;
+	if (!SQL_SUCCEEDED(SQLNumResultCols(statement.get(), &actual)) || actual != columns) {
+		throw IOException("ODBC vendor catalog returned an unexpected column contract");
+	}
+	ReadCatalog(statement.get(), SQL_SUCCESS, "vendor metadata", [&](SQLHSTMT stmt) {
+		vector<string> values;
+		idx_t remaining = WINDOW_LIMIT / 3;
+		for (SQLUSMALLINT column = 1; column <= columns; column++) {
+			auto value = ReadString(stmt, column, remaining);
+			remaining -= value.size();
+			Account(used, value.size() + sizeof(string));
+			values.push_back(std::move(value));
+		}
+		Account(used, sizeof(ODBCRelationalRow));
+		result.push_back({std::move(values)});
+	});
+	if (SQLMoreResults(statement.get()) != SQL_NO_DATA) {
+		throw IOException("ODBC vendor catalog returned unexpected extra results");
+	}
+	return result;
+}
+
 vector<ODBCRelationalObject> ODBCRelationalReader::Objects(const string &schema) {
 	auto statement = Statement();
 	auto schema_pattern = Pattern(schema);

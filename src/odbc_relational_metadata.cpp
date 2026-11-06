@@ -1,5 +1,6 @@
 #include "odbc_scanner.hpp"
 #include "odbc_relational_reader.hpp"
+#include "odbc_vendor_metadata.hpp"
 
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -11,17 +12,22 @@ struct ODBCRelationalBindData : public FunctionData {
 	string database;
 	string category;
 	string schema;
+	bool vendor = false;
+	vector<string> tables;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<ODBCRelationalBindData>();
 		copy->database = database;
 		copy->category = category;
 		copy->schema = schema;
+		copy->vendor = vendor;
+		copy->tables = tables;
 		return std::move(copy);
 	}
 	bool Equals(const FunctionData &other) const override {
 		auto &bind = other.Cast<ODBCRelationalBindData>();
-		return database == bind.database && category == bind.category && schema == bind.schema;
+		return database == bind.database && category == bind.category && schema == bind.schema &&
+		       vendor == bind.vendor && tables == bind.tables;
 	}
 };
 
@@ -58,10 +64,37 @@ static unique_ptr<FunctionData> ODBCRelationalBind(ClientContext &context, Table
 	result->database = input.inputs[0].GetValue<string>();
 	result->category = input.inputs[1].GetValue<string>();
 	result->schema = input.inputs[2].GetValue<string>();
+	result->vendor = input.table_function.name != "odbc_relational_metadata";
+	if (input.inputs.size() == 4) {
+		for (const auto &value : ListValue::GetChildren(input.inputs[3])) {
+			if (value.IsNull() || value.GetValue<string>().empty() ||
+			    value.GetValue<string>().find('\0') != string::npos)
+				throw BinderException("ODBC metadata table scope is invalid");
+			if (std::find(result->tables.begin(), result->tables.end(), value.GetValue<string>()) !=
+			    result->tables.end())
+				throw BinderException("ODBC metadata table scope contains duplicate names");
+			result->tables.push_back(value.GetValue<string>());
+		}
+		if (result->tables.empty() || result->tables.size() > 128)
+			throw BinderException("ODBC metadata table scope must contain 1 to 128 names");
+	}
 	if (result->schema.empty()) {
 		throw BinderException("ODBC relational metadata schema cannot be empty");
 	}
-	if (result->category == "columnProperties") {
+	if (result->category == "capabilities" && result->vendor) {
+		names = {"catalog_name", "column_name"};
+	} else if (result->vendor && result->category == "columnDetails") {
+		names = {"table_schema",   "table_name", "column_name",       "identity_kind",
+		         "generated_kind", "expression", "default_definition"};
+	} else if (result->vendor && result->category == "constraintDetails") {
+		names = {"table_schema",     "table_name",    "constraint_name", "constraint_type",
+		         "ordinal_position", "column_name",   "definition",      "enforced",
+		         "validated",        "backing_index", "deferrable",      "initially_deferred"};
+	} else if (result->vendor && result->category == "indexDetails") {
+		names = {"table_schema", "table_name", "index_name", "ordinal_position", "column_name",
+		         "expression",   "included",   "direction",  "nulls_order",      "valid",
+		         "enabled",      "method",     "is_unique",  "is_primary",       "definition"};
+	} else if (result->category == "columnProperties") {
 		names = {"table_schema",     "table_name",  "column_name",        "source_id",
 		         "ordinal_position", "is_nullable", "default_definition", "source_type"};
 	} else if (result->category == "constraints") {
@@ -101,7 +134,38 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 			    }
 		    },
 		    deadline);
-		state.objects = state.reader->Objects(bind.schema);
+		if (bind.vendor && bind.category == "capabilities") {
+			string sql;
+			switch (RelationalCatalog(context, bind.database).GetDialect()) {
+			case ODBCDialect::DB2:
+				sql = "SELECT TABNAME,COLNAME FROM SYSCAT.COLUMNS WHERE TABSCHEMA='SYSCAT' AND TABNAME IN "
+				      "('TABCONST','COLUMNS','INDEXES','INDEXCOLUSE','CHECKS','KEYCOLUSE') ORDER BY TABNAME,COLNO";
+				break;
+			case ODBCDialect::DAMENG:
+				sql = "SELECT TABLE_NAME,COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE OWNER='SYS' AND TABLE_NAME IN "
+				      "('ALL_TAB_COLUMNS','ALL_CONSTRAINTS','ALL_INDEXES','ALL_IND_COLUMNS','ALL_IND_EXPRESSIONS') "
+				      "ORDER BY TABLE_NAME,COLUMN_ID";
+				break;
+			case ODBCDialect::HANA:
+				sql = "SELECT VIEW_NAME,COLUMN_NAME FROM SYS.VIEW_COLUMNS WHERE SCHEMA_NAME='SYS' AND VIEW_NAME IN "
+				      "('TABLE_COLUMNS','CONSTRAINTS','REFERENTIAL_CONSTRAINTS','INDEXES','INDEX_COLUMNS') "
+				      "ORDER BY VIEW_NAME,POSITION";
+				break;
+			}
+			state.rows = state.reader->ReadQuery(sql, 2);
+		} else {
+			state.objects = state.reader->Objects(bind.schema);
+			if (!bind.tables.empty()) {
+				state.objects.erase(std::remove_if(state.objects.begin(), state.objects.end(),
+				                                   [&](const ODBCRelationalObject &object) {
+					                                   return std::find(bind.tables.begin(), bind.tables.end(),
+					                                                    object.name) == bind.tables.end();
+				                                   }),
+				                    state.objects.end());
+				if (state.objects.size() != bind.tables.size())
+					throw IOException("ODBC metadata table scope changed during collection");
+			}
+		}
 		state.initialized = true;
 	}
 	idx_t count = 0;
@@ -117,7 +181,21 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 				break;
 			}
 			state.reader->Check();
-			state.rows = state.reader->ReadTable(state.objects[state.object_offset++], bind.category);
+			auto &object = state.objects[state.object_offset++];
+			if (bind.vendor && (bind.category == "columnDetails" || bind.category == "constraintDetails" ||
+			                    bind.category == "indexDetails")) {
+				auto columns = bind.category == "columnDetails" ? 7 : bind.category == "constraintDetails" ? 12 : 15;
+				state.rows = state.reader->ReadQuery(
+				    ODBCVendorMetadataSQL(RelationalCatalog(context, bind.database).GetDialect(), bind.category,
+				                          object),
+				    columns);
+			} else if (bind.vendor && bind.category == "columnProperties" &&
+			           RelationalCatalog(context, bind.database).GetDialect() == ODBCDialect::DAMENG) {
+				state.rows =
+				    state.reader->ReadQuery(ODBCVendorMetadataSQL(ODBCDialect::DAMENG, bind.category, object), 8);
+			} else {
+				state.rows = state.reader->ReadTable(object, bind.category);
+			}
 			continue;
 		}
 		state.reader->Check();
@@ -130,8 +208,13 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 	output.SetCardinality(count);
 }
 
-ODBCRelationalMetadataFunction::ODBCRelationalMetadataFunction()
-    : TableFunction("odbc_relational_metadata", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+ODBCRelationalMetadataFunction::ODBCRelationalMetadataFunction(bool vendor, bool scoped)
+    : TableFunction(scoped   ? "odbc_relational_metadata_scoped_v2"
+                    : vendor ? "odbc_relational_metadata_v2"
+                             : "odbc_relational_metadata",
+                    scoped ? vector<LogicalType> {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+                                                  LogicalType::LIST(LogicalType::VARCHAR)}
+                           : vector<LogicalType> {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
                     ODBCRelationalScan, ODBCRelationalBind, ODBCRelationalInit) {
 }
 
