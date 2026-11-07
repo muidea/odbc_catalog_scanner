@@ -38,6 +38,7 @@ struct ODBCRelationalGlobalState : public GlobalTableFunctionState {
 	vector<ODBCRelationalRow> rows;
 	idx_t object_offset = 0;
 	idx_t row_offset = 0;
+	bool batch_query = false;
 	bool initialized = false;
 	bool finished = false;
 	idx_t MaxThreads() const override {
@@ -154,21 +155,65 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 			}
 			state.rows = state.reader->ReadQuery(sql, 2);
 		} else {
-			state.objects = state.reader->Objects(bind.schema);
 			if (!bind.tables.empty()) {
-				state.objects.erase(std::remove_if(state.objects.begin(), state.objects.end(),
-				                                   [&](const ODBCRelationalObject &object) {
-					                                   return std::find(bind.tables.begin(), bind.tables.end(),
-					                                                    object.name) == bind.tables.end();
-				                                   }),
-				                    state.objects.end());
-				if (state.objects.size() != bind.tables.size())
-					throw IOException("ODBC metadata table scope changed during collection");
+				// Core discovery uses SQLTables. Vendor dictionaries can hide live
+				// objects (for example DM SREF tables), so they cannot certify
+				// deletion or invalidate the scope discovered by that same driver.
+				// Exact escaped lookups keep this bounded to the requested objects.
+				for (const auto &name : bind.tables) {
+					auto identities = state.reader->Objects(bind.schema, name);
+					if (identities.size() != 1)
+						throw IOException(
+						    "ODBC metadata table scope changed during collection: schema=%s table=%s matches=%llu",
+						    bind.schema, name, static_cast<unsigned long long>(identities.size()));
+					state.objects.push_back(std::move(identities[0]));
+				}
+			} else {
+				state.objects = state.reader->Objects(bind.schema);
+			}
+			if (!bind.tables.empty() && bind.vendor &&
+			    (bind.category == "columnDetails" || bind.category == "constraintDetails" ||
+			     bind.category == "indexDetails" ||
+			     (bind.category == "columnProperties" &&
+			      RelationalCatalog(context, bind.database).GetDialect() == ODBCDialect::DAMENG))) {
+				auto columns = bind.category == "columnDetails"       ? 7
+				               : bind.category == "constraintDetails" ? 12
+				               : bind.category == "indexDetails"      ? 15
+				                                                      : 8;
+				state.reader->StartQuery(
+				    ODBCVendorMetadataBatchSQL(RelationalCatalog(context, bind.database).GetDialect(), bind.category,
+				                               bind.schema, bind.tables),
+				    columns);
+				state.batch_query = true;
+				state.objects.clear();
 			}
 		}
 		state.initialized = true;
 	}
 	idx_t count = 0;
+	if (state.batch_query) {
+		idx_t chunk_bytes = 0;
+		ODBCRelationalRow row;
+		while (count < STANDARD_VECTOR_SIZE) {
+			if (!state.reader->ReadQueryRow(row)) {
+				state.reader.reset();
+				state.finished = true;
+				state.lease = ODBCPoolConnection();
+				break;
+			}
+			for (idx_t column = 0; column < row.values.size(); column++)
+				output.SetValue(column, count, Value(row.values[column]));
+			for (const auto &value : row.values)
+				chunk_bytes += value.size() + sizeof(string);
+			count++;
+			// Bound output bytes as well as row count; one oversized row is
+			// already bounded by the reader's 16 MiB estimated row limit.
+			if (chunk_bytes >= 1024 * 1024)
+				break;
+		}
+		output.SetCardinality(count);
+		return;
+	}
 	while (count < STANDARD_VECTOR_SIZE) {
 		if (state.row_offset == state.rows.size()) {
 			vector<ODBCRelationalRow>().swap(state.rows);

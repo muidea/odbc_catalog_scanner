@@ -13,15 +13,28 @@
 
 namespace duckdb {
 
-inline string ODBCVendorMetadataSQL(ODBCDialect dialect, const string &category, const ODBCRelationalObject &object) {
-	const auto schema = ODBCUtils::WriteLiteral(object.schema);
-	const auto table = ODBCUtils::WriteLiteral(object.name);
+inline string ODBCVendorTableList(const vector<string> &tables) {
+	if (tables.empty() || tables.size() > 128)
+		throw InvalidInputException("ODBC vendor scope requires 1..128 tables");
+	string result = "(";
+	for (idx_t i = 0; i < tables.size(); i++) {
+		if (i)
+			result += ",";
+		result += ODBCUtils::WriteLiteral(tables[i]);
+	}
+	return result + ")";
+}
+
+inline string ODBCVendorMetadataBatchSQL(ODBCDialect dialect, const string &category, const string &schema_name,
+                                         const vector<string> &tables) {
+	const auto schema = ODBCUtils::WriteLiteral(schema_name);
+	const auto table = ODBCVendorTableList(tables);
 	if (dialect == ODBCDialect::DB2) {
-		const auto scope = " WHERE c.TABSCHEMA=" + schema + " AND c.TABNAME=" + table;
+		const auto scope = " WHERE c.TABSCHEMA=" + schema + " AND c.TABNAME IN " + table;
 		if (category == "columnDetails") {
 			return "SELECT RTRIM(c.TABSCHEMA),c.TABNAME,c.COLNAME,c.IDENTITY,c.GENERATED,COALESCE(c.TEXT,''),"
 			       "COALESCE(c.DEFAULT,'') FROM SYSCAT.COLUMNS c" +
-			       scope + " ORDER BY c.COLNO";
+			       scope + " ORDER BY c.TABNAME,c.COLNO";
 		}
 		if (category == "constraintDetails") {
 			return "SELECT RTRIM(c.TABSCHEMA),c.TABNAME,c.CONSTNAME,c.TYPE,COALESCE(CAST(k.COLSEQ AS VARCHAR(20)),''),"
@@ -29,7 +42,7 @@ inline string ODBCVendorMetadataSQL(ODBCDialect dialect, const string &category,
 			       "FROM SYSCAT.TABCONST c LEFT JOIN SYSCAT.KEYCOLUSE k ON k.TABSCHEMA=c.TABSCHEMA "
 			       "AND k.TABNAME=c.TABNAME AND k.CONSTNAME=c.CONSTNAME LEFT JOIN SYSCAT.CHECKS ch "
 			       "ON ch.TABSCHEMA=c.TABSCHEMA AND ch.TABNAME=c.TABNAME AND ch.CONSTNAME=c.CONSTNAME" +
-			       scope + " AND c.TYPE IN ('P','U','F','K') ORDER BY c.CONSTNAME,k.COLSEQ";
+			       scope + " AND c.TYPE IN ('P','U','F','K') ORDER BY c.TABNAME,c.CONSTNAME,k.COLSEQ";
 		}
 		if (category == "indexDetails") {
 			return "SELECT RTRIM(i.TABSCHEMA),i.TABNAME,i.INDNAME,CAST(k.COLSEQ AS VARCHAR(20)),k.COLNAME,"
@@ -39,8 +52,8 @@ inline string ODBCVendorMetadataSQL(ODBCDialect dialect, const string &category,
 			       "CASE WHEN i.UNIQUERULE='P' THEN 'true' ELSE 'false' END,'' "
 			       "FROM SYSCAT.INDEXES i JOIN SYSCAT.INDEXCOLUSE k ON k.INDSCHEMA=i.INDSCHEMA "
 			       "AND k.INDNAME=i.INDNAME WHERE i.TABSCHEMA=" +
-			       schema + " AND i.TABNAME=" + table +
-			       " ORDER BY i.INDNAME,CASE WHEN k.COLORDER='I' THEN 1 ELSE 0 END,k.COLSEQ";
+			       schema + " AND i.TABNAME IN " + table +
+			       " ORDER BY i.TABNAME,i.INDNAME,CASE WHEN k.COLORDER='I' THEN 1 ELSE 0 END,k.COLSEQ";
 		}
 	}
 	if (dialect == ODBCDialect::DAMENG) {
@@ -49,7 +62,7 @@ inline string ODBCVendorMetadataSQL(ODBCDialect dialect, const string &category,
 			       "CASE WHEN NULLABLE='Y' THEN 'true' WHEN NULLABLE='N' THEN 'false' ELSE '' "
 			       "END,DATA_DEFAULT,DATA_TYPE "
 			       "FROM ALL_TAB_COLUMNS WHERE OWNER=" +
-			       schema + " AND TABLE_NAME=" + table + " ORDER BY COLUMN_ID";
+			       schema + " AND TABLE_NAME IN " + table + " ORDER BY TABLE_NAME,COLUMN_ID";
 		}
 		if (category == "constraintDetails") {
 			return "SELECT c.OWNER,c.TABLE_NAME,c.CONSTRAINT_NAME,c.CONSTRAINT_TYPE,"
@@ -57,8 +70,8 @@ inline string ODBCVendorMetadataSQL(ODBCDialect dialect, const string &category,
 			       "c.SEARCH_CONDITION,c.STATUS,c.VALIDATED,COALESCE(c.INDEX_NAME,''),c.DEFERRABLE,c.DEFERRED "
 			       "FROM ALL_CONSTRAINTS c LEFT JOIN ALL_CONS_COLUMNS k ON k.OWNER=c.OWNER "
 			       "AND k.CONSTRAINT_NAME=c.CONSTRAINT_NAME WHERE c.OWNER=" +
-			       schema + " AND c.TABLE_NAME=" + table +
-			       " AND c.CONSTRAINT_TYPE IN ('P','U','R','C') ORDER BY c.CONSTRAINT_NAME,k.POSITION";
+			       schema + " AND c.TABLE_NAME IN " + table +
+			       " AND c.CONSTRAINT_TYPE IN ('P','U','R','C') ORDER BY c.TABLE_NAME,c.CONSTRAINT_NAME,k.POSITION";
 		}
 		if (category == "indexDetails") {
 			return "SELECT i.TABLE_OWNER,i.TABLE_NAME,i.INDEX_NAME,CAST(ABS(k.COLUMN_POSITION) AS VARCHAR(20)),"
@@ -71,24 +84,25 @@ inline string ODBCVendorMetadataSQL(ODBCDialect dialect, const string &category,
 			       "FROM ALL_INDEXES i JOIN ALL_IND_COLUMNS k ON k.INDEX_OWNER=i.OWNER AND k.INDEX_NAME=i.INDEX_NAME "
 			       "LEFT JOIN ALL_IND_EXPRESSIONS e ON e.INDEX_OWNER=i.OWNER AND e.INDEX_NAME=i.INDEX_NAME "
 			       "AND e.COLUMN_POSITION=ABS(k.COLUMN_POSITION) WHERE i.TABLE_OWNER=" +
-			       schema + " AND i.TABLE_NAME=" + table + " ORDER BY i.INDEX_NAME,ABS(k.COLUMN_POSITION)";
+			       schema + " AND i.TABLE_NAME IN " + table +
+			       " ORDER BY i.TABLE_NAME,i.INDEX_NAME,ABS(k.COLUMN_POSITION)";
 		}
 	}
 	if (dialect == ODBCDialect::HANA) {
 		if (category == "columnDetails") {
 			return "SELECT SCHEMA_NAME,TABLE_NAME,COLUMN_NAME,GENERATION_TYPE,'',GENERATED_ALWAYS_AS,DEFAULT_VALUE "
 			       "FROM SYS.TABLE_COLUMNS WHERE SCHEMA_NAME=" +
-			       schema + " AND TABLE_NAME=" + table + " ORDER BY POSITION";
+			       schema + " AND TABLE_NAME IN " + table + " ORDER BY TABLE_NAME,POSITION";
 		}
 		if (category == "constraintDetails") {
 			return "SELECT SCHEMA_NAME,TABLE_NAME,CONSTRAINT_NAME,CASE WHEN IS_PRIMARY_KEY='TRUE' THEN 'P' "
 			       "WHEN IS_UNIQUE_KEY='TRUE' THEN 'U' ELSE 'C' END,POSITION,"
 			       "COLUMN_NAME,CHECK_CONDITION,'','','','','' FROM SYS.CONSTRAINTS WHERE SCHEMA_NAME=" +
-			       schema + " AND TABLE_NAME=" + table +
+			       schema + " AND TABLE_NAME IN " + table +
 			       " UNION ALL SELECT SCHEMA_NAME,TABLE_NAME,CONSTRAINT_NAME,'F',"
 			       "POSITION,COLUMN_NAME,'',IS_ENFORCED,IS_VALIDATED,'','','' "
 			       "FROM SYS.REFERENTIAL_CONSTRAINTS WHERE SCHEMA_NAME=" +
-			       schema + " AND TABLE_NAME=" + table + " ORDER BY 3,5";
+			       schema + " AND TABLE_NAME IN " + table + " ORDER BY 2,3,5";
 		}
 		if (category == "indexDetails") {
 			return "SELECT i.SCHEMA_NAME,i.TABLE_NAME,i.INDEX_NAME,CAST(k.POSITION AS VARCHAR(20)),"
@@ -97,10 +111,14 @@ inline string ODBCVendorMetadataSQL(ODBCDialect dialect, const string &category,
 			       "CASE WHEN i.CONSTRAINT='PRIMARY KEY' THEN 'true' ELSE 'false' END,'' "
 			       "FROM SYS.INDEXES i JOIN SYS.INDEX_COLUMNS k ON k.SCHEMA_NAME=i.SCHEMA_NAME "
 			       "AND k.TABLE_NAME=i.TABLE_NAME AND k.INDEX_NAME=i.INDEX_NAME WHERE i.SCHEMA_NAME=" +
-			       schema + " AND i.TABLE_NAME=" + table + " ORDER BY i.INDEX_NAME,k.POSITION";
+			       schema + " AND i.TABLE_NAME IN " + table + " ORDER BY i.TABLE_NAME,i.INDEX_NAME,k.POSITION";
 		}
 	}
 	throw NotImplementedException("ODBC vendor metadata category is unavailable");
+}
+
+inline string ODBCVendorMetadataSQL(ODBCDialect dialect, const string &category, const ODBCRelationalObject &object) {
+	return ODBCVendorMetadataBatchSQL(dialect, category, object.schema, {object.name});
 }
 
 } // namespace duckdb

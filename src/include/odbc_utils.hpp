@@ -40,6 +40,7 @@ public:
 	static std::tuple<ODBCConnectionParameters, unordered_set<string>> ParseConnectionParameters(const string &dsn);
 	static string BuildConnectionString(const string &dsn);
 	static SQLHDBC Connect(const string &dsn, SQLHENV &out_env, uint32_t login_timeout = 0);
+	static string CatalogPattern(SQLHDBC connection, const string &identifier);
 	static vector<ODBCCatalogObject> GetCatalogObjects(SQLHDBC connection, const string &schema = string(),
 	                                                   const string &table = string());
 

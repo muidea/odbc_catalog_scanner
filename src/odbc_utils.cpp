@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <tuple>
 
 #ifndef _WIN32
@@ -475,30 +476,58 @@ static string ReadCatalogString(SQLHSTMT statement, SQLUSMALLINT column) {
 	return result;
 }
 
+string ODBCUtils::CatalogPattern(SQLHDBC connection, const string &identifier) {
+	SQLCHAR escape[16] = {0};
+	SQLSMALLINT length = 0;
+	if (!SQL_SUCCEEDED(SQLGetInfo(connection, SQL_SEARCH_PATTERN_ESCAPE, escape, sizeof(escape), &length)) ||
+	    length < 0 || length >= static_cast<SQLSMALLINT>(sizeof(escape))) {
+		throw IOException("ODBC catalog cannot determine identifier pattern escaping");
+	}
+	string result;
+	for (auto c : identifier) {
+		if (c == '%' || c == '_' || (length == 1 && c == static_cast<char>(escape[0]))) {
+			if (length != 1)
+				throw IOException("ODBC catalog cannot match identifiers containing pattern characters");
+			result += static_cast<char>(escape[0]);
+		}
+		result += c;
+	}
+	return result;
+}
+
 vector<ODBCCatalogObject> ODBCUtils::GetCatalogObjects(SQLHDBC connection, const string &schema, const string &table) {
 	SQLHSTMT raw_statement = SQL_NULL_HSTMT;
 	if (!SQL_SUCCEEDED(SQLAllocHandle(SQL_HANDLE_STMT, connection, &raw_statement))) {
 		throw IOException("Failed to allocate ODBC catalog statement");
 	}
 	ODBCStatementPtr statement(raw_statement, ODBCStatementDelete);
-	auto schema_ptr = schema.empty() ? nullptr : reinterpret_cast<SQLCHAR *>(const_cast<char *>(schema.c_str()));
-	auto table_ptr = table.empty() ? reinterpret_cast<SQLCHAR *>(const_cast<char *>("%"))
-	                               : reinterpret_cast<SQLCHAR *>(const_cast<char *>(table.c_str()));
-	auto table_length = table.empty() ? SQL_NTS : SQL_NTS;
+	auto schema_pattern = schema.empty() ? string() : CatalogPattern(connection, schema);
+	auto table_pattern = table.empty() ? string("%") : CatalogPattern(connection, table);
+	auto schema_ptr = schema.empty() ? nullptr : reinterpret_cast<SQLCHAR *>(&schema_pattern[0]);
+	auto table_ptr = reinterpret_cast<SQLCHAR *>(&table_pattern[0]);
 	auto types = reinterpret_cast<SQLCHAR *>(const_cast<char *>("'TABLE','VIEW'"));
-	auto status = SQLTables(raw_statement, nullptr, 0, schema_ptr, schema.empty() ? 0 : SQL_NTS, table_ptr,
-	                        table_length, types, SQL_NTS);
+	auto status = SQLTables(raw_statement, nullptr, 0, schema_ptr, schema.empty() ? 0 : SQL_NTS, table_ptr, SQL_NTS,
+	                        types, SQL_NTS);
 	if (!SQL_SUCCEEDED(status)) {
 		throw IOException("ODBC driver failed to enumerate tables and views");
 	}
 
 	vector<ODBCCatalogObject> result;
+	std::set<std::pair<string, string>> identities;
 	while (SQL_SUCCEEDED(status = SQLFetch(raw_statement))) {
 		ODBCCatalogObject object;
 		object.schema = ReadCatalogString(raw_statement, 2);
 		object.name = ReadCatalogString(raw_statement, 3);
 		object.type = ReadCatalogString(raw_statement, 4);
+		StringUtil::Trim(object.type);
+		if ((!schema.empty() && object.schema != schema) || (!table.empty() && object.name != table) ||
+		    (object.type != "TABLE" && object.type != "VIEW")) {
+			throw IOException("ODBC catalog returned an unexpected table identity");
+		}
 		if (!object.schema.empty() && !object.name.empty()) {
+			if (!identities.emplace(object.schema, object.name).second) {
+				throw IOException("ODBC catalog returned ambiguous table identity");
+			}
 			result.push_back(std::move(object));
 		}
 	}

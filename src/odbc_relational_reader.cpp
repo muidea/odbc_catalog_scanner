@@ -110,23 +110,7 @@ string ODBCRelationalReader::ReadString(SQLHSTMT statement, SQLUSMALLINT column,
 }
 
 string ODBCRelationalReader::Pattern(const string &identifier) {
-	SQLCHAR escape[16] = {0};
-	SQLSMALLINT length = 0;
-	if (!SQL_SUCCEEDED(SQLGetInfo(connection, SQL_SEARCH_PATTERN_ESCAPE, escape, sizeof(escape), &length)) ||
-	    length < 0 || length >= static_cast<SQLSMALLINT>(sizeof(escape))) {
-		throw IOException("ODBC relational catalog cannot determine identifier pattern escaping");
-	}
-	string result;
-	for (auto c : identifier) {
-		if (c == '%' || c == '_' || (length == 1 && c == static_cast<char>(escape[0]))) {
-			if (length != 1) {
-				throw IOException("ODBC relational catalog cannot match identifiers containing pattern characters");
-			}
-			result += static_cast<char>(escape[0]);
-		}
-		result += c;
-	}
-	return result;
+	return ODBCUtils::CatalogPattern(connection, identifier);
 }
 
 void ODBCRelationalReader::ReadCatalog(SQLHSTMT statement, SQLRETURN status, const string &operation,
@@ -179,20 +163,65 @@ vector<ODBCRelationalRow> ODBCRelationalReader::ReadQuery(const string &sql, SQL
 	return result;
 }
 
-vector<ODBCRelationalObject> ODBCRelationalReader::Objects(const string &schema) {
+// Keep the source cursor open, but only one bounded row in native memory.
+// Go consumes and validates the complete category before publishing any facts.
+void ODBCRelationalReader::StartQuery(const string &sql, SQLUSMALLINT columns) {
+	query_statement.reset();
+	auto statement = Statement();
+	auto status = SQLExecDirect(statement.get(), ODBCText(sql), SQL_NTS);
+	if (!SQL_SUCCEEDED(status))
+		CatalogError(statement.get(), "vendor metadata execute");
+	SQLSMALLINT actual = 0;
+	if (!SQL_SUCCEEDED(SQLNumResultCols(statement.get(), &actual)) || actual != columns)
+		throw IOException("ODBC vendor catalog returned an unexpected column contract");
+	query_columns = columns;
+	query_statement = std::move(statement);
+}
+
+bool ODBCRelationalReader::ReadQueryRow(ODBCRelationalRow &row) {
+	if (!query_statement)
+		return false;
+	try {
+		Check();
+		auto status = SQLFetch(query_statement.get());
+		if (status == SQL_NO_DATA) {
+			if (SQLMoreResults(query_statement.get()) != SQL_NO_DATA)
+				throw IOException("ODBC vendor catalog returned unexpected extra results");
+			query_statement.reset();
+			return false;
+		}
+		if (!SQL_SUCCEEDED(status))
+			CatalogError(query_statement.get(), "vendor metadata fetch");
+		row.values.clear();
+		idx_t used = 0;
+		for (SQLUSMALLINT column = 1; column <= query_columns; column++) {
+			auto value = ReadString(query_statement.get(), column);
+			Account(used, value.size() + sizeof(string));
+			row.values.push_back(std::move(value));
+		}
+		return true;
+	} catch (...) {
+		query_statement.reset();
+		throw;
+	}
+}
+
+vector<ODBCRelationalObject> ODBCRelationalReader::Objects(const string &schema, const string &table) {
 	auto statement = Statement();
 	auto schema_pattern = Pattern(schema);
+	auto table_pattern = table.empty() ? string("%") : Pattern(table);
 	vector<ODBCRelationalObject> result;
 	idx_t used = 0;
-	auto status = SQLTables(statement.get(), nullptr, 0, ODBCText(schema_pattern), SQL_NTS, ODBCText("%"), SQL_NTS,
-	                        ODBCText("'TABLE','VIEW'"), SQL_NTS);
+	auto status = SQLTables(statement.get(), nullptr, 0, ODBCText(schema_pattern), SQL_NTS, ODBCText(table_pattern),
+	                        SQL_NTS, ODBCText("'TABLE','VIEW'"), SQL_NTS);
 	ReadCatalog(statement.get(), status, "SQLTables", [&](SQLHSTMT stmt) {
 		auto catalog = ReadString(stmt, 1, 4096);
 		auto actual_schema = ReadString(stmt, 2, 4096);
 		auto name = ReadString(stmt, 3, 4096);
 		auto type = ReadString(stmt, 4, 256);
 		StringUtil::Trim(type);
-		if (actual_schema != schema || name.empty() || (type != "TABLE" && type != "VIEW")) {
+		if (actual_schema != schema || name.empty() || (!table.empty() && name != table) ||
+		    (type != "TABLE" && type != "VIEW")) {
 			throw IOException("ODBC relational catalog returned an unexpected table identity");
 		}
 		Account(used, sizeof(ODBCRelationalObject) + catalog.size() + actual_schema.size() + name.size());

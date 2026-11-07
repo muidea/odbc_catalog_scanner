@@ -1,4 +1,5 @@
 #include "odbc_relational_reader.hpp"
+#include "odbc_vendor_metadata.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -17,6 +18,7 @@ struct FakeStatement {
 	bool truncated = false;
 };
 idx_t handles = 0;
+idx_t vendor_rows = 1;
 bool fail_execute = false;
 bool wrong_columns = false;
 bool extra_results = false;
@@ -28,6 +30,9 @@ bool large_default = false;
 bool repeated_rows = false;
 string observed_schema;
 string observed_table;
+string object_name = "t_%";
+bool missing_object = false;
+bool duplicate_object = false;
 
 void Require(bool value, const char *message) {
 	if (!value)
@@ -71,7 +76,8 @@ SQLRETURN SQL_API SQLExecDirect(SQLHSTMT stmt, SQLCHAR *text, SQLINTEGER) {
 	Require(string(reinterpret_cast<char *>(text)) == "fixed vendor metadata", "unexpected vendor query");
 	if (fail_execute)
 		return SQL_ERROR;
-	Stmt(stmt).rows = {{"APP", vendor_value}};
+	for (idx_t i = 0; i < vendor_rows; i++)
+		Stmt(stmt).rows.push_back({"APP", vendor_value});
 	return SQL_SUCCESS;
 }
 SQLRETURN SQL_API SQLNumResultCols(SQLHSTMT, SQLSMALLINT *columns) {
@@ -148,10 +154,15 @@ SQLRETURN SQL_API SQLGetData(SQLHSTMT stmt, SQLUSMALLINT column, SQLSMALLINT typ
 	*indicator = s.truncated ? SQL_NO_TOTAL : static_cast<SQLLEN>(count);
 	return s.truncated ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS;
 }
-SQLRETURN SQL_API SQLTables(SQLHSTMT stmt, SQLCHAR *, SQLSMALLINT, SQLCHAR *schema, SQLSMALLINT, SQLCHAR *, SQLSMALLINT,
-                            SQLCHAR *, SQLSMALLINT) {
+SQLRETURN SQL_API SQLTables(SQLHSTMT stmt, SQLCHAR *, SQLSMALLINT, SQLCHAR *schema, SQLSMALLINT, SQLCHAR *table,
+                            SQLSMALLINT, SQLCHAR *, SQLSMALLINT) {
 	observed_schema = reinterpret_cast<char *>(schema);
-	Stmt(stmt).rows = {{"db", "a_%", "t_%", "TABLE"}};
+	observed_table = reinterpret_cast<char *>(table);
+	if (!missing_object) {
+		Stmt(stmt).rows = {{"db", "a_%", object_name, "TABLE"}};
+		if (duplicate_object)
+			Stmt(stmt).rows.push_back(Stmt(stmt).rows[0]);
+	}
 	return SQL_SUCCESS;
 }
 SQLRETURN SQL_API SQLColumns(SQLHSTMT stmt, SQLCHAR *, SQLSMALLINT, SQLCHAR *schema, SQLSMALLINT, SQLCHAR *table,
@@ -193,6 +204,26 @@ int main() {
 		    nullptr, [] {}, deadline());
 		auto objects = reader.Objects("a_%");
 		Require(objects.size() == 1 && observed_schema == "a\\_\\%", "schema pattern not escaped");
+		auto exact = reader.Objects("a_%", "t_%");
+		Require(exact.size() == 1 && observed_table == "t\\_\\%", "exact scope not escaped");
+		auto core = ODBCUtils::GetCatalogObjects(nullptr, "a_%", "t_%");
+		Require(core.size() == 1 && core[0].name == exact[0].name && observed_table == "t\\_\\%",
+		        "core/attribute object identity differs");
+		object_name = "SREF_CON_TAB134218913_LEVEL";
+		auto special = reader.Objects("a_%", object_name);
+		Require(special.size() == 1 && special[0].name == object_name, "driver-visible object was filtered");
+		missing_object = true;
+		Require(reader.Objects("a_%", object_name).empty(), "deleted object stayed visible");
+		missing_object = false;
+		object_name = "other";
+		ExpectFailure([&] { reader.Objects("a_%", "t_%"); }, "unexpected scoped object accepted");
+		ExpectFailure([&] { ODBCUtils::GetCatalogObjects(nullptr, "a_%", "t_%"); }, "core scope mismatch accepted");
+		object_name = "t_%";
+		duplicate_object = true;
+		ExpectFailure([&] { ODBCUtils::GetCatalogObjects(nullptr, "a_%", object_name); },
+		              "core duplicate identity accepted");
+		ExpectFailure([&] { reader.Objects("a_%", "t_%"); }, "ambiguous scoped object accepted");
+		duplicate_object = false;
 		auto columns = reader.ReadTable(objects[0], "columnProperties");
 		Require(columns.size() == 2 && columns[0].values.size() == 8, "column ABI mismatch");
 		Require(columns[0].values[2] == "first" && columns[0].values[6] == "  '默认值'  ",
@@ -208,6 +239,38 @@ int main() {
 		auto vendor = reader.ReadQuery("fixed vendor metadata", 2);
 		Require(vendor.size() == 1 && vendor[0].values[1] == vendor_value, "vendor expression changed");
 		Require(handles == 0, "vendor statement leaked on success");
+		// A source result much larger than the native window streams row by row.
+		vendor_rows = 12000;
+		vendor_value = string(1024, 'x');
+		reader.StartQuery("fixed vendor metadata", 2);
+		ODBCRelationalRow streamed;
+		idx_t streamed_rows = 0;
+		while (reader.ReadQueryRow(streamed)) {
+			Require(streamed.values[1] == vendor_value, "streamed value changed");
+			streamed_rows++;
+		}
+		Require(streamed_rows == vendor_rows && handles == 0, "streamed cursor truncated or leaked");
+		vendor_rows = 1;
+		reader.StartQuery("fixed vendor metadata", 2);
+		fail_fetch = true;
+		ExpectFailure([&] { reader.ReadQueryRow(streamed); }, "streaming fetch failure ignored");
+		Require(handles == 0, "streaming failure leaked statement");
+		fail_fetch = false;
+		reader.StartQuery("fixed vendor metadata", 2);
+		Require(reader.ReadQueryRow(streamed), "stream first row absent");
+		extra_results = true;
+		ExpectFailure([&] { reader.ReadQueryRow(streamed); }, "stream extra results ignored");
+		Require(handles == 0, "extra results leaked streaming statement");
+		extra_results = false;
+		vendor_value = "  expression('默认')  ";
+		for (auto dialect : {ODBCDialect::DB2, ODBCDialect::DAMENG, ODBCDialect::HANA}) {
+			auto scoped = ODBCVendorMetadataBatchSQL(dialect, "indexDetails", "A'B", {"t_%", "x'y"});
+			Require(scoped.find(" IN ('t_%','x''y')") != string::npos, "batch table scope was not literal escaped");
+			Require(scoped.find("'A''B'") != string::npos, "batch schema was not literal escaped");
+		}
+		ExpectFailure([&] { ODBCVendorTableList({}); }, "empty scope accepted");
+		ExpectFailure([&] { ODBCVendorTableList(vector<string>(129, "a")); }, "unbounded scope accepted");
+
 		fail_execute = true;
 		ExpectFailure([&] { reader.ReadQuery("fixed vendor metadata", 2); }, "vendor execute failure ignored");
 		fail_execute = false;
