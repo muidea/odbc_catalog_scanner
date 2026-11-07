@@ -127,7 +127,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ODBCMetadataFunction metadata_function;
 	loader.RegisterFunction(metadata_function);
 	ODBCRelationalMetadataFunction relational_metadata_function;
-	loader.RegisterFunction(relational_metadata_function);
+	TableFunctionSet relational_metadata("odbc_relational_metadata");
+	relational_metadata.AddFunction(relational_metadata_function);
+	relational_metadata_function.arguments.push_back(LogicalType::LIST(LogicalType::VARCHAR));
+	relational_metadata.AddFunction(relational_metadata_function);
+	loader.RegisterFunction(relational_metadata);
 	ODBCRelationalMetadataFunction vendor_metadata_function(true);
 	loader.RegisterFunction(vendor_metadata_function);
 	ODBCRelationalMetadataFunction scoped_vendor_metadata_function(true, true);
