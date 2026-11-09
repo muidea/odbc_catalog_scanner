@@ -88,13 +88,25 @@ static unique_ptr<FunctionData> ODBCRelationalBind(ClientContext &context, Table
 		names = {"table_schema",   "table_name", "column_name",       "identity_kind",
 		         "generated_kind", "expression", "default_definition"};
 	} else if (result->vendor && result->category == "constraintDetails") {
-		names = {"table_schema",     "table_name",    "constraint_name", "constraint_type",
-		         "ordinal_position", "column_name",   "definition",      "enforced",
-		         "validated",        "backing_index", "deferrable",      "initially_deferred"};
+		names = {"table_schema",
+		         "table_name",
+		         "constraint_name",
+		         "constraint_type",
+		         "ordinal_position",
+		         "column_name",
+		         "definition",
+		         "enforced",
+		         "validated",
+		         "backing_index",
+		         "deferrable",
+		         "initially_deferred",
+		         "backing_index_schema",
+		         "backing_index_matches"};
 	} else if (result->vendor && result->category == "indexDetails") {
-		names = {"table_schema", "table_name", "index_name", "ordinal_position", "column_name",
-		         "expression",   "included",   "direction",  "nulls_order",      "valid",
-		         "enabled",      "method",     "is_unique",  "is_primary",       "definition"};
+		names = {"table_schema", "table_name", "index_name", "ordinal_position",
+		         "column_name",  "expression", "included",   "direction",
+		         "nulls_order",  "valid",      "enabled",    "method",
+		         "is_unique",    "is_primary", "definition", "index_schema"};
 	} else if (result->category == "columnProperties") {
 		names = {"table_schema",     "table_name",  "column_name",        "source_id",
 		         "ordinal_position", "is_nullable", "default_definition", "source_type"};
@@ -140,7 +152,8 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 			switch (RelationalCatalog(context, bind.database).GetDialect()) {
 			case ODBCDialect::DB2:
 				sql = "SELECT TABNAME,COLNAME FROM SYSCAT.COLUMNS WHERE TABSCHEMA='SYSCAT' AND TABNAME IN "
-				      "('TABCONST','COLUMNS','INDEXES','INDEXCOLUSE','CHECKS','KEYCOLUSE') ORDER BY TABNAME,COLNO";
+				      "('TABCONST','COLUMNS','INDEXES','INDEXCOLUSE','CHECKS','KEYCOLUSE','CONSTDEP') ORDER BY "
+				      "TABNAME,COLNO";
 				break;
 			case ODBCDialect::DAMENG:
 				sql = "SELECT TABLE_NAME,COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE OWNER='SYS' AND TABLE_NAME IN "
@@ -177,8 +190,8 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 			     (bind.category == "columnProperties" &&
 			      RelationalCatalog(context, bind.database).GetDialect() == ODBCDialect::DAMENG))) {
 				auto columns = bind.category == "columnDetails"       ? 7
-				               : bind.category == "constraintDetails" ? 12
-				               : bind.category == "indexDetails"      ? 15
+				               : bind.category == "constraintDetails" ? 14
+				               : bind.category == "indexDetails"      ? 16
 				                                                      : 8;
 				state.reader->StartQuery(
 				    ODBCVendorMetadataBatchSQL(RelationalCatalog(context, bind.database).GetDialect(), bind.category,
@@ -229,7 +242,7 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 			auto &object = state.objects[state.object_offset++];
 			if (bind.vendor && (bind.category == "columnDetails" || bind.category == "constraintDetails" ||
 			                    bind.category == "indexDetails")) {
-				auto columns = bind.category == "columnDetails" ? 7 : bind.category == "constraintDetails" ? 12 : 15;
+				auto columns = bind.category == "columnDetails" ? 7 : bind.category == "constraintDetails" ? 14 : 16;
 				state.rows = state.reader->ReadQuery(
 				    ODBCVendorMetadataSQL(RelationalCatalog(context, bind.database).GetDialect(), bind.category,
 				                          object),
