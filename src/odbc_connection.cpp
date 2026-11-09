@@ -1,3 +1,4 @@
+#include "query_odbc_source_error.hpp"
 #include "odbc_connection.hpp"
 #include "odbc_handle_guard.hpp"
 
@@ -95,12 +96,12 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 		retcode = SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
 		statement.reset(hstmt);
 		if (!SQL_SUCCEEDED(retcode)) {
-			throw IOException("Failed to allocate statement handle for ODBC query \"%s\"\n", query.c_str());
+			ThrowQueryODBCError(SQL_HANDLE_DBC, hdbc, GetConn(), "source_prepare", query);
 		}
 
 		retcode = SQLExecDirectWithFallback(statement.get(), query);
 		if (!SQL_SUCCEEDED(retcode)) {
-			throw IOException("Failed to run query \"%s\"\n", query.c_str());
+			ThrowQueryODBCError(SQL_HANDLE_STMT, statement.get(), GetConn(), "source_execute", query);
 		}
 
 		return 0;
@@ -116,18 +117,8 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 		retcode = SQLPrepareWithFallback(stmt, query);
 	}
 	if (!SQL_SUCCEEDED(retcode)) {
-		// 获取详细的ODBC错误信息
-		SQLCHAR sqlstate[6] = {0};
-		SQLCHAR message[SQL_MAX_MESSAGE_LENGTH] = {0};
-		SQLINTEGER native_error = 0;
-		SQLSMALLINT message_length = 0;
-
-		SQLGetDiagRec(SQL_HANDLE_STMT, stmt, 1, sqlstate, &native_error, message, SQL_MAX_MESSAGE_LENGTH,
-		              &message_length);
-
-		throw IOException("Failed to prepare ODBC query \"%s\": SQLState=%s, NativeError=%d, Message=%s\n",
-		                  query.c_str(), reinterpret_cast<const char *>(sqlstate), native_error,
-		                  reinterpret_cast<const char *>(message));
+		ThrowQueryODBCError(SQL_HANDLE_STMT, stmt, GetConn(), params.empty() ? "source_execute" : "source_prepare",
+		                    query);
 	}
 
 	vector<ODBCParameter> odbc_params;
@@ -148,19 +139,7 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 		SQLSMALLINT param_count;
 		retcode = SQLNumParams(stmt, &param_count);
 		if (!SQL_SUCCEEDED(retcode)) {
-			// 获取详细的ODBC错误信息
-			SQLCHAR sqlstate[6] = {0};
-			SQLCHAR message[SQL_MAX_MESSAGE_LENGTH] = {0};
-			SQLINTEGER native_error = 0;
-			SQLSMALLINT message_length = 0;
-
-			SQLGetDiagRec(SQL_HANDLE_STMT, stmt, 1, sqlstate, &native_error, message, SQL_MAX_MESSAGE_LENGTH,
-			              &message_length);
-
-			throw IOException(
-			    "Failed to get parameter count for ODBC query \"%s\": SQLState=%s, NativeError=%d, Message=%s\n",
-			    query.c_str(), reinterpret_cast<const char *>(sqlstate), native_error,
-			    reinterpret_cast<const char *>(message));
+			ThrowQueryODBCError(SQL_HANDLE_STMT, stmt, GetConn(), "source_describe", query);
 		}
 
 		if (param_count != params.size()) {
@@ -176,26 +155,14 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 			ODBCParameter &mp_ref = odbc_params.back();
 			SQLRETURN bind_ret = mp_ref.BindParameter(stmt, odbc_params.size());
 			if (!SQL_SUCCEEDED(bind_ret)) {
-				throw IOException("Failed to bind parameter %zu for ODBC query \"%s\"\n", odbc_params.size(),
-				                  query.c_str());
+				ThrowQueryODBCError(SQL_HANDLE_STMT, stmt, GetConn(), "source_bind", query);
 			}
 		}
 	}
 
 	retcode = SQLExecute(stmt);
 	if (!SQL_SUCCEEDED(retcode)) {
-		// 获取详细的ODBC错误信息
-		SQLCHAR sqlstate[6] = {0};
-		SQLCHAR message[SQL_MAX_MESSAGE_LENGTH] = {0};
-		SQLINTEGER native_error = 0;
-		SQLSMALLINT message_length = 0;
-
-		SQLGetDiagRec(SQL_HANDLE_STMT, stmt, 1, sqlstate, &native_error, message, SQL_MAX_MESSAGE_LENGTH,
-		              &message_length);
-
-		throw IOException("Failed to execute ODBC query \"%s\": SQLState=%s, NativeError=%d, Message=%s\n",
-		                  query.c_str(), reinterpret_cast<const char *>(sqlstate), native_error,
-		                  reinterpret_cast<const char *>(message));
+		ThrowQueryODBCError(SQL_HANDLE_STMT, stmt, GetConn(), "source_execute", query);
 	}
 
 	SQLLEN affected_rows = 0;
@@ -263,7 +230,7 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 		SQLRETURN retcode = SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
 		statement.reset(hstmt);
 		if (!SQL_SUCCEEDED(retcode)) {
-			throw IOException("Failed to initialize ODBC query \"%s\"\n", query.c_str());
+			ThrowQueryODBCError(SQL_HANDLE_DBC, hdbc, GetConn(), "source_prepare", query);
 		}
 
 		idx_t affected_rows = ODBCExecute(statement.get(), query, params, result_streaming);
