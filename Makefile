@@ -3,7 +3,7 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # Configuration of extension
 EXT_NAME=odbc_catalog_scanner
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
-OVERRIDE_GIT_DESCRIBE ?= v1.5.3
+OVERRIDE_GIT_DESCRIBE ?= v2.0.0
 
 # ====== vcpkg Configuration ======
 # Auto-detect vcpkg installation path

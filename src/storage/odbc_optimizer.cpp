@@ -13,7 +13,7 @@ void GatherODBCScans(LogicalOperator &op, ODBCOperators &result) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
 		auto &table_scan = get.function;
-		if (ODBCCatalog::IsODBCScan(table_scan.name)) {
+		if (ODBCCatalog::IsODBCScan(table_scan.GetName().GetIdentifierName())) {
 			// odbc table scan - add to the catalog
 			auto &bind_data = get.bind_data->Cast<ODBCBindData>();
 			auto &catalog = bind_data.table.ParentCatalog().Cast<ODBCCatalog>();
@@ -37,7 +37,7 @@ void ODBCOptimizer::Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalO
 		}
 		for (auto &logical_get : entry.second) {
 			auto &get = logical_get.get();
-			if (ODBCCatalog::IsODBCScan(get.function.name)) {
+			if (ODBCCatalog::IsODBCScan(get.function.GetName().GetIdentifierName())) {
 				// odbc table scan - add to the catalog
 				auto &bind_data = get.bind_data->Cast<ODBCBindData>();
 				if (bind_data.streaming == ODBCResultStreaming::UNINITIALIZED ||

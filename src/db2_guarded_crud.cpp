@@ -272,7 +272,7 @@ static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionI
 	return make_uniq<State>();
 }
 static ODBCCatalog &CatalogFor(ClientContext &ctx, const string &name, bool admin = false) {
-	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, name);
+	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, duckdb::Identifier(name));
 	if (!db || db->GetCatalog().GetCatalogType() != "odbc_catalog")
 		Reject();
 	auto &catalog = db->GetCatalog().Cast<ODBCCatalog>();
@@ -281,7 +281,7 @@ static ODBCCatalog &CatalogFor(ClientContext &ctx, const string &name, bool admi
 	return catalog;
 }
 static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                     vector<string> &names) {
+                                     vector<duckdb::Identifier> &names) {
 	for (auto &v : in.inputs)
 		if (v.IsNull())
 			Reject();
@@ -553,7 +553,7 @@ struct AdminData : TableFunctionData {
 	}
 };
 static unique_ptr<FunctionData> AdminBind(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                          vector<string> &names) {
+                                          vector<duckdb::Identifier> &names) {
 	if (in.inputs[0].IsNull() || in.inputs[1].IsNull())
 		Reject();
 	auto &catalog = CatalogFor(ctx, in.inputs[0].GetValue<string>(), true);
@@ -605,11 +605,14 @@ void RegisterDb2GuardedCRUD(ExtensionLoader &loader) {
 	loader.RegisterFunction(
 	    TableFunction("odbc_execute", vector<LogicalType>(2, LogicalType::VARCHAR), AdminScan, AdminBind, Init));
 	TableFunction metadata("db2_crud_metadata_v1", vector<LogicalType>(3, LogicalType::VARCHAR), Scan, Bind, Init);
-	metadata.named_parameters["source_diagnostics"] = LogicalType::BOOLEAN;
+	metadata.GetSignature().WithTypedKwargs(
+	    "options", [](TypedKwargs &options) { options.Add("source_diagnostics", LogicalType::BOOLEAN); });
 	loader.RegisterFunction(metadata);
 	TableFunction exec("db2_guarded_mutation_v1", vector<LogicalType>(6, LogicalType::VARCHAR), Scan, Bind, Init);
-	exec.named_parameters["params"] = LogicalType::ANY;
-	exec.named_parameters["source_diagnostics"] = LogicalType::BOOLEAN;
+	exec.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("params", LogicalType::ANY);
+		options.Add("source_diagnostics", LogicalType::BOOLEAN);
+	});
 	loader.RegisterFunction(exec);
 }
 } // namespace duckdb

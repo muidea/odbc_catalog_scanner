@@ -7,6 +7,7 @@
 #include "storage/odbc_connection_pool.hpp"
 #include "storage/odbc_table_set.hpp"
 #include "odbc_filter_pushdown.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -35,7 +36,7 @@ struct ODBCGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> ODBCBind(ClientContext &context, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	throw InternalException("ODBCBind");
 }
 
@@ -61,15 +62,15 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 				col_name = bind_data.remote_names[column_id];
 			} else {
 				auto &col = bind_data.table.GetColumn(LogicalIndex(column_id));
-				col_name = col.GetName();
+				col_name = col.GetName().GetIdentifierName();
 			}
 			select += ODBCUtils::WriteIdentifier(col_name);
 		}
 	}
 	select += " FROM ";
-	select += ODBCUtils::WriteIdentifier(bind_data.table.schema.name);
+	select += ODBCUtils::WriteIdentifier(bind_data.table.schema.name.GetIdentifierName());
 	select += ".";
-	select += ODBCUtils::WriteIdentifier(bind_data.table.name);
+	select += ODBCUtils::WriteIdentifier(bind_data.table.name.GetIdentifierName());
 	auto &filter_names = bind_data.remote_names.empty() ? bind_data.names : bind_data.remote_names;
 	string filter_string = ODBCFilterPushdown::TransformFilters(input.column_ids, input.filters, filter_names);
 	if (!filter_string.empty()) {
@@ -85,7 +86,8 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 	// 检查查询结果是否为空
 	if (!query_result) {
 		throw InternalException("ODBCInitGlobalState: Query returned null result for table %s.%s",
-		                        bind_data.table.schema.name.c_str(), bind_data.table.name.c_str());
+		                        bind_data.table.schema.name.GetIdentifierName().c_str(),
+		                        bind_data.table.name.GetIdentifierName().c_str());
 	}
 
 	auto result = make_uniq<ODBCGlobalState>(std::move(query_result));
@@ -159,24 +161,26 @@ static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk
 static InsertionOrderPreservingMap<string> ODBCScanToString(TableFunctionToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	auto &bind_data = input.bind_data->Cast<ODBCBindData>();
-	result["Table"] = bind_data.table.name;
+	result["Table"] = bind_data.table.name.GetIdentifierName();
 	return result;
 }
 
 static void ODBCScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
-                              const TableFunction &function) {
+                              const BoundTableFunction &function) {
 	throw NotImplementedException("ODBCScanSerialize");
 }
 
-static unique_ptr<FunctionData> ODBCScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+static unique_ptr<FunctionData> ODBCScanDeserialize(Deserializer &deserializer, BoundTableFunction &function) {
 	throw NotImplementedException("ODBCScanDeserialize");
 }
 
-static BindInfo ODBCGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
+static optional_ptr<TableCatalogEntry> ODBCGetTableEntry(optional_ptr<const FunctionData> bind_data_p) {
 	auto &bind_data = bind_data_p->Cast<ODBCBindData>();
-	BindInfo info(ScanType::EXTERNAL);
-	info.table = bind_data.table;
-	return info;
+	return &bind_data.table;
+}
+
+static BindInfo ODBCGetBindInfo(TableFunctionGetBindInfoInput &input) {
+	return BindInfo(ScanType::EXTERNAL);
 }
 
 ODBCScanFunction::ODBCScanFunction()
@@ -186,6 +190,7 @@ ODBCScanFunction::ODBCScanFunction()
 	serialize = ODBCScanSerialize;
 	deserialize = ODBCScanDeserialize;
 	get_bind_info = ODBCGetBindInfo;
+	get_table_entry = ODBCGetTableEntry;
 	projection_pushdown = true;
 }
 

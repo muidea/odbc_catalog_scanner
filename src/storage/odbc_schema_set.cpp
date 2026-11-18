@@ -14,7 +14,8 @@ ODBCSchemaSet::ODBCSchemaSet(Catalog &catalog) : ODBCCatalogSet(catalog) {
 void ODBCSchemaSet::LoadEntries(ClientContext &context) {
 	auto &odbc_catalog = catalog.Cast<ODBCCatalog>();
 	auto &connection = ODBCTransaction::Get(context, catalog).GetConnection();
-	auto default_schema = odbc_catalog.GetDefaultSchema();
+	auto default_schema_opt = odbc_catalog.GetDefaultSchema();
+	string default_schema = default_schema_opt.has_value() ? default_schema_opt->GetIdentifierName() : string();
 	auto objects = ODBCUtils::GetCatalogObjects(connection.GetConn(), default_schema);
 
 	unordered_set<string> created;
@@ -27,7 +28,7 @@ void ODBCSchemaSet::LoadEntries(ClientContext &context) {
 			continue;
 		}
 		CreateSchemaInfo info;
-		info.schema = object.schema;
+		info.SetSchema(Identifier(object.schema));
 		info.internal = false;
 		CreateEntry(make_uniq<ODBCSchemaEntry>(catalog, info));
 	}

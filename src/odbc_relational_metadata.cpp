@@ -47,7 +47,7 @@ struct ODBCRelationalGlobalState : public GlobalTableFunctionState {
 };
 
 static ODBCCatalog &RelationalCatalog(ClientContext &context, const string &name) {
-	auto database = DatabaseManager::Get(context).GetDatabase(context, name);
+	auto database = DatabaseManager::Get(context).GetDatabase(context, Identifier(name));
 	if (!database || database->GetCatalog().GetCatalogType() != "odbc_catalog") {
 		throw BinderException("Attached database %s is not an ODBC catalog", name);
 	}
@@ -55,7 +55,7 @@ static ODBCCatalog &RelationalCatalog(ClientContext &context, const string &name
 }
 
 static unique_ptr<FunctionData> ODBCRelationalBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	for (auto &value : input.inputs) {
 		if (value.IsNull()) {
 			throw BinderException("Parameters to odbc_relational_metadata cannot be NULL");
@@ -65,7 +65,7 @@ static unique_ptr<FunctionData> ODBCRelationalBind(ClientContext &context, Table
 	result->database = input.inputs[0].GetValue<string>();
 	result->category = input.inputs[1].GetValue<string>();
 	result->schema = input.inputs[2].GetValue<string>();
-	result->vendor = input.table_function.name != "odbc_relational_metadata";
+	result->vendor = input.table_function.GetName().GetIdentifierName() != "odbc_relational_metadata";
 	if (input.inputs.size() == 4) {
 		for (const auto &value : ListValue::GetChildren(input.inputs[3])) {
 			if (value.IsNull() || value.GetValue<string>().empty() ||

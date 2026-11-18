@@ -22,11 +22,11 @@ ODBCCatalog::ODBCCatalog(AttachedDatabase &db_p, string connection_string_p, str
 	StringUtil::Trim(default_schema);
 	Value connection_limit;
 	auto &db_instance = db_p.GetDatabase();
-	if (db_instance.TryGetCurrentSetting("odbc_catalog_connection_limit", connection_limit)) {
+	if (db_instance.TryGetCurrentSetting(Identifier("odbc_catalog_connection_limit"), connection_limit)) {
 		connection_pool.SetMaximumConnections(UBigIntValue::Get(connection_limit));
 	}
 	Value wait_timeout;
-	if (db_instance.TryGetCurrentSetting("odbc_catalog_pool_wait_timeout_millis", wait_timeout)) {
+	if (db_instance.TryGetCurrentSetting(Identifier("odbc_catalog_pool_wait_timeout_millis"), wait_timeout)) {
 		connection_pool.SetWaitTimeout(UBigIntValue::Get(wait_timeout));
 	}
 	ODBCTypeConfig type_config;
@@ -46,7 +46,7 @@ static unique_ptr<SecretEntry> GetSecret(ClientContext &context, const string &s
 }
 
 static string GetSecretString(const KeyValueSecret &secret, const string &name) {
-	auto value = secret.TryGetValue(name);
+	auto value = secret.TryGetValue(Identifier(name));
 	return value.IsNull() ? string() : value.ToString();
 }
 
@@ -128,7 +128,7 @@ bool ODBCCatalog::IsODBCScan(const string &name) {
 void ODBCCatalog::MaterializeODBCScans(PhysicalOperator &op) {
 	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
 		auto &table_scan = op.Cast<PhysicalTableScan>();
-		if (IsODBCScan(table_scan.function.name)) {
+		if (IsODBCScan(table_scan.function.GetName().GetIdentifierName())) {
 			table_scan.bind_data->Cast<ODBCBindData>().streaming = ODBCResultStreaming::FORCE_MATERIALIZATION;
 		}
 	}
