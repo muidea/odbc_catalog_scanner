@@ -569,11 +569,11 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 }
 } // namespace
 void RegisterDamengGuardedCRUD(ExtensionLoader &loader) {
-	TableFunction metadata("dameng_crud_metadata_v1", vector<LogicalType>(3, LogicalType::VARCHAR), Scan, Bind, Init);
+	TableFunction metadata("dameng_crud_metadata", vector<LogicalType>(3, LogicalType::VARCHAR), Scan, Bind, Init);
 	metadata.GetSignature().WithTypedKwargs(
 	    "options", [](TypedKwargs &options) { options.Add("source_diagnostics", LogicalType::BOOLEAN); });
 	loader.RegisterFunction(metadata);
-	TableFunction exec("dameng_guarded_mutation_v1", vector<LogicalType>(6, LogicalType::VARCHAR), Scan, Bind, Init);
+	TableFunction exec("dameng_guarded_mutation", vector<LogicalType>(6, LogicalType::VARCHAR), Scan, Bind, Init);
 	exec.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
 		options.Add("params", LogicalType::ANY);
 		options.Add("source_diagnostics", LogicalType::BOOLEAN);

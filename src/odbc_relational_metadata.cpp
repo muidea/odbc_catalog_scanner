@@ -65,7 +65,7 @@ static unique_ptr<FunctionData> ODBCRelationalBind(ClientContext &context, Table
 	result->database = input.inputs[0].GetValue<string>();
 	result->category = input.inputs[1].GetValue<string>();
 	result->schema = input.inputs[2].GetValue<string>();
-	result->vendor = input.table_function.GetName().GetIdentifierName() != "odbc_relational_metadata";
+	result->vendor = true;
 	if (input.inputs.size() == 4) {
 		for (const auto &value : ListValue::GetChildren(input.inputs[3])) {
 			if (value.IsNull() || value.GetValue<string>().empty() ||
@@ -267,9 +267,7 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 }
 
 ODBCRelationalMetadataFunction::ODBCRelationalMetadataFunction(bool vendor, bool scoped)
-    : TableFunction(scoped   ? "odbc_relational_metadata_scoped_v2"
-                    : vendor ? "odbc_relational_metadata_v2"
-                             : "odbc_relational_metadata",
+    : TableFunction("odbc_relational_metadata",
                     scoped ? vector<LogicalType> {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
                                                   LogicalType::LIST(LogicalType::VARCHAR)}
                            : vector<LogicalType> {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
