@@ -536,7 +536,6 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	session.reset();
 	if (connection)
 		connection->Close();
-	out.SetCardinality(1);
 	out.SetValue(0, 0, Value(status));
 	out.SetValue(1, 0, Value::BIGINT(affected));
 	out.SetValue(2, 0, Value(error));
@@ -545,6 +544,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	out.SetValue(5, 0, Value(descriptor));
 	if (d.diagnostics)
 		out.SetValue(6, 0, Value(source_error));
+	out.SetChildCardinality(1);
 }
 struct AdminData : TableFunctionData {
 	ODBCCatalog &catalog;
@@ -597,8 +597,8 @@ static void AdminScan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out
 	}
 	session.reset();
 	connection->Close();
-	out.SetCardinality(1);
 	out.SetValue(0, 0, Value(rows));
+	out.SetChildCardinality(1);
 }
 } // namespace
 void RegisterDb2GuardedCRUD(ExtensionLoader &loader) {

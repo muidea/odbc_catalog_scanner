@@ -133,7 +133,7 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 	auto &state = input.global_state->Cast<ODBCRelationalGlobalState>();
 	auto &bind = input.bind_data->Cast<ODBCRelationalBindData>();
 	if (state.finished) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	if (!state.initialized) {
@@ -224,7 +224,7 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 			if (chunk_bytes >= 1024 * 1024)
 				break;
 		}
-		output.SetCardinality(count);
+		output.SetChildCardinality(count);
 		return;
 	}
 	while (count < STANDARD_VECTOR_SIZE) {
@@ -263,7 +263,7 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 		}
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 ODBCRelationalMetadataFunction::ODBCRelationalMetadataFunction(bool vendor, bool scoped)
