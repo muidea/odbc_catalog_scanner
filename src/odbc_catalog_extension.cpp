@@ -113,12 +113,16 @@ void SetODBCSecretParameters(CreateSecretFunction &function) {
 namespace duckdb {
 void RegisterDb2GuardedCRUD(ExtensionLoader &loader);
 void RegisterDamengGuardedCRUD(ExtensionLoader &loader);
+void RegisterHanaGuardedCRUD(ExtensionLoader &loader);
+void RegisterODBCGuardedDDL(ExtensionLoader &loader);
 } // namespace duckdb
 
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterODBCExactNumericCollation(loader, "odbc_exact_numeric");
 	RegisterDb2GuardedCRUD(loader);
 	RegisterDamengGuardedCRUD(loader);
+	RegisterHanaGuardedCRUD(loader);
+	RegisterODBCGuardedDDL(loader);
 	// ODBC doesn't require explicit library initialization like MySQL
 	// The ODBC driver manager handles initialization automatically
 	ODBCClearCacheFunction clear_cache_func;

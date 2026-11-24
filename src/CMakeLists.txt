@@ -6,6 +6,8 @@ add_library(
   odbc_ext_library OBJECT
   db2_guarded_crud.cpp
   dameng_guarded_crud.cpp
+  hana_guarded_crud.cpp
+  odbc_guarded_ddl.cpp
   odbc_connection.cpp
   odbc_catalog_extension.cpp
   odbc_dialect.cpp

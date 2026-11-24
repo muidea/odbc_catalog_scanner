@@ -14,7 +14,9 @@
 #include "storage/odbc_catalog.hpp"
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 namespace duckdb {
@@ -181,6 +183,67 @@ public:
 			Reject();
 		return r[0][0];
 	}
+	void BindInputParams(const vector<Value> &params, vector<int64_t> &values, vector<int16_t> &bools,
+	                     vector<double> &doubles, vector<string> &text, vector<string> &blobs,
+	                     vector<SQLLEN> &lengths) {
+		static char empty_blob_byte = 0;
+		for (idx_t i = 0; i < params.size(); i++) {
+			auto &v = params[i];
+			auto t = v.type().id();
+			if (t == LogicalTypeId::BLOB) {
+				if (v.IsNull()) {
+					lengths[i] = SQL_NULL_DATA;
+				} else {
+					blobs[i] = StringValue::Get(v);
+					if (blobs[i].size() > 4 * 1024 * 1024)
+						Reject();
+					lengths[i] = static_cast<SQLLEN>(blobs[i].size());
+				}
+				SQLSMALLINT sql_type = blobs[i].size() > 4000 ? SQL_LONGVARBINARY : SQL_VARBINARY;
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_BINARY, sql_type,
+				                       MaxValue<idx_t>(1, blobs[i].size()), 0,
+				                       blobs[i].empty() ? &empty_blob_byte : const_cast<char *>(blobs[i].data()),
+				                       blobs[i].size(), &lengths[i]));
+				continue;
+			}
+			if (v.IsNull()) {
+				lengths[i] = SQL_NULL_DATA;
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 19, 0,
+				                       &values[i], sizeof(int64_t), &lengths[i]));
+				continue;
+			}
+			if (t == LogicalTypeId::VARCHAR) {
+				text[i] = v.GetValue<string>();
+				if (text[i].size() > 32672 || text[i].find('\0') != string::npos)
+					Reject();
+				lengths[i] = text[i].size();
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
+				                       MaxValue<idx_t>(1, text[i].size()), 0, const_cast<char *>(text[i].c_str()),
+				                       text[i].size() + 1, &lengths[i]));
+			} else if (t == LogicalTypeId::BOOLEAN) {
+				bools[i] = v.GetValue<bool>() ? 1 : 0;
+				lengths[i] = sizeof(int16_t);
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_SSHORT, SQL_SMALLINT, 5, 0,
+				                       &bools[i], sizeof(int16_t), &lengths[i]));
+			} else if (t == LogicalTypeId::FLOAT || t == LogicalTypeId::DOUBLE) {
+				double dval = t == LogicalTypeId::FLOAT ? static_cast<double>(v.GetValue<float>())
+				                                        : v.GetValue<double>();
+				if (!std::isfinite(dval))
+					Reject();
+				doubles[i] = dval;
+				lengths[i] = sizeof(double);
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_DOUBLE, SQL_DOUBLE, 53, 0,
+				                       &doubles[i], sizeof(double), &lengths[i]));
+			} else if (t == LogicalTypeId::SMALLINT || t == LogicalTypeId::INTEGER || t == LogicalTypeId::BIGINT) {
+				values[i] = v.GetValue<int64_t>();
+				lengths[i] = sizeof(int64_t);
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 19, 0,
+				                       &values[i], sizeof(int64_t), &lengths[i]));
+			} else {
+				Reject();
+			}
+		}
+	}
 	int64_t Execute(const string &sql, const vector<Value> &params, bool &sent, string &stage) {
 		stage = "source_prepare";
 		Start();
@@ -190,32 +253,12 @@ public:
 		if (count != params.size() || count > 2100)
 			Reject();
 		vector<int64_t> values(params.size(), 0);
+		vector<int16_t> bools(params.size(), 0);
+		vector<double> doubles(params.size(), 0.0);
 		vector<string> text(params.size());
+		vector<string> blobs(params.size());
 		vector<SQLLEN> lengths(params.size(), 0);
-		for (idx_t i = 0; i < params.size(); i++) {
-			auto &v = params[i];
-			if (!v.IsNull() && v.type().id() == LogicalTypeId::VARCHAR) {
-				// Exact DECIMAL payload; source CAST owns scale/range semantics.
-				text[i] = v.GetValue<string>();
-				if (text[i].empty() || text[i].size() > 128 ||
-				    text[i].find_first_not_of("+-0123456789.") != string::npos)
-					Reject();
-				lengths[i] = text[i].size();
-				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, text[i].size(), 0,
-				                       const_cast<char *>(text[i].c_str()), text[i].size() + 1, &lengths[i]));
-				continue;
-			}
-			if (v.IsNull())
-				lengths[i] = SQL_NULL_DATA;
-			else {
-				auto t = v.type().id();
-				if (t != LogicalTypeId::SMALLINT && t != LogicalTypeId::INTEGER && t != LogicalTypeId::BIGINT)
-					Reject();
-				values[i] = v.GetValue<int64_t>();
-			}
-			Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 19, 0, &values[i],
-			                       sizeof(int64_t), &lengths[i]));
-		}
+		BindInputParams(params, values, bools, doubles, text, blobs, lengths);
 
 		if (cancelled.load() || ctx.IsInterrupted()) {
 			error = "57014";
@@ -245,6 +288,67 @@ public:
 		}
 		return affected;
 	}
+	int64_t ExecuteReturning(const string &sql, const vector<Value> &params, bool &sent, string &stage,
+	                         string &returned_rows) {
+		stage = "source_prepare";
+		Start();
+		Check(SQLPrepare(stmt.get(), reinterpret_cast<SQLCHAR *>(const_cast<char *>(sql.c_str())), SQL_NTS));
+		SQLSMALLINT count = 0;
+		Check(SQLNumParams(stmt.get(), &count));
+		if (count != params.size() || count > 2100)
+			Reject();
+		vector<int64_t> values(params.size(), 0);
+		vector<int16_t> bools(params.size(), 0);
+		vector<double> doubles(params.size(), 0.0);
+		vector<string> text(params.size());
+		vector<string> blobs(params.size());
+		vector<SQLLEN> lengths(params.size(), 0);
+		BindInputParams(params, values, bools, doubles, text, blobs, lengths);
+
+		if (cancelled.load() || ctx.IsInterrupted()) {
+			error = "57014";
+			Reject();
+		}
+		stage = "source_execute";
+		sent = true;
+		auto rc = SQLExecute(stmt.get());
+		if (rc == SQL_NO_DATA) {
+			returned_rows = "[]";
+			return 0;
+		}
+		Check(rc);
+		SQLSMALLINT cols = 0;
+		Check(SQLNumResultCols(stmt.get(), &cols));
+		if (cols != 1)
+			Reject();
+		returned_rows = "[";
+		int64_t row_count = 0;
+		while ((rc = SQLFetch(stmt.get())) != SQL_NO_DATA) {
+			Check(rc);
+			if (++row_count > 4096)
+				Reject();
+			char buf[256] = {0};
+			SQLLEN len = 0;
+			Check(SQLGetData(stmt.get(), 1, SQL_C_CHAR, buf, sizeof(buf), &len));
+			if (len == SQL_NULL_DATA || len <= 0 || len >= static_cast<SQLLEN>(sizeof(buf)))
+				Reject();
+			string val(buf, static_cast<size_t>(len));
+			while (!val.empty() && val.back() == ' ')
+				val.pop_back();
+			if (val.empty() || val.size() > 20 || val.find_first_not_of("0123456789-") != string::npos)
+				Reject();
+			if (row_count > 1)
+				returned_rows += ",";
+			returned_rows += "[" + JSON(val) + "]";
+		}
+		returned_rows += "]";
+		rc = SQLMoreResults(stmt.get());
+		if (rc != SQL_NO_DATA) {
+			Check(rc);
+			Reject();
+		}
+		return row_count;
+	}
 
 private:
 	ClientContext &ctx;
@@ -262,6 +366,9 @@ struct Data : TableFunctionData {
 	vector<Value> params;
 	bool execute;
 	bool diagnostics = false;
+	bool returning = false;
+	string returning_name;
+	int64_t returning_oid = 0;
 	Data(ODBCCatalog &c, bool e) : catalog(c), execute(e) {
 	}
 };
@@ -307,6 +414,18 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
 		if (d->params.size() > 2100)
 			Reject();
 	}
+	d->returning = in.table_function.GetName().GetIdentifierName() == "db2_guarded_insert_returning";
+	if (d->returning) {
+		auto rname = in.named_parameters.find("returning_name"), roid = in.named_parameters.find("returning_oid");
+		if (rname == in.named_parameters.end() || roid == in.named_parameters.end() || rname->second.IsNull() ||
+		    roid->second.IsNull())
+			Reject();
+		d->returning_name = rname->second.GetValue<string>();
+		d->returning_oid = roid->second.GetValue<int64_t>();
+		if (!SimpleName(d->returning_name) ||
+		    (d->returning_oid != 20 && d->returning_oid != 21 && d->returning_oid != 23))
+			Reject();
+	}
 	auto diagnostic = in.named_parameters.find("source_diagnostics");
 	if (diagnostic != in.named_parameters.end()) {
 		if (diagnostic->second.IsNull())
@@ -316,6 +435,10 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
 	names = {"status", "affected_rows", "sqlstate", "stage", "version", "descriptor"};
 	types = {LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::VARCHAR,
 	         LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	if (d->returning) {
+		names.push_back("returned_rows");
+		types.push_back(LogicalType::VARCHAR);
+	}
 	if (d->diagnostics) {
 		names.push_back("source_error");
 		types.push_back(LogicalType::VARCHAR);
@@ -376,7 +499,7 @@ static string Trimmed(string v) {
 	StringUtil::Trim(v);
 	return v;
 }
-static string Metadata(Session &s, const Data &d, string &stage) {
+static string Metadata(Session &s, const Data &d, string &stage, int64_t *returning_col_oid = nullptr) {
 	const auto filter = "TABSCHEMA=" + Literal(d.schema) + " AND TABNAME=" + Literal(d.table);
 	stage = "source_metadata";
 	auto identity = s.Rows("SELECT RTRIM(CURRENT SERVER),RTRIM(CURRENT USER) FROM SYSIBM.SYSDUMMY1");
@@ -391,8 +514,7 @@ static string Metadata(Session &s, const Data &d, string &stage) {
 	if (table.size() != 1)
 		Reject();
 	auto &t = table[0];
-	if (t[0] != identity[0][1] || t[1] != "T" || t[2] != "N" || t[7] != " " || Trimmed(t[8]) != "0" ||
-	    Trimmed(t[9]) != "0" || Trimmed(t[10]) != "0" || Trimmed(t[11]) != "0" || t[12] != "F" ||
+	if (t[0] != identity[0][1] || t[1] != "T" || t[2] != "N" || t[7] != " " || t[12] != "F" ||
 	    Trimmed(t[13]) != "0" || t[14] != "N" || t[15] != "R" || !Trimmed(t[16]).empty())
 		Reject();
 	stage = "source_columns";
@@ -405,13 +527,16 @@ static string Metadata(Session &s, const Data &d, string &stage) {
 		Reject();
 	idx_t ordinal = 0;
 	for (auto &c : cols) {
-		if (!SimpleName(c[0]) || Trimmed(c[1]) != "SYSIBM" ||
-		    (c[2] != "SMALLINT" && c[2] != "INTEGER" && c[2] != "BIGINT" && c[2] != "DECIMAL") ||
-		    Trimmed(c[3]) != std::to_string(ordinal++) || (c[4] != "Y" && c[4] != "N") || !c[5].empty() ||
-		    c[6] != " " || c[7] != "N" || c[8] != " " || !c[9].empty() || c[10] != "N" || c[11] != "N" ||
-		    c[12] != "N" || c[13] != "N" || !c[14].empty())
+		const auto &ty = c[2];
+		bool scalar = ty == "SMALLINT" || ty == "INTEGER" || ty == "BIGINT" || ty == "DECIMAL" || ty == "DECFLOAT" ||
+		              ty == "REAL" || ty == "DOUBLE" || ty == "BOOLEAN" || ty == "CHARACTER" || ty == "CHAR" ||
+		              ty == "VARCHAR" || ty == "CLOB" || ty == "BLOB" || ty == "GRAPHIC" || ty == "VARGRAPHIC" ||
+		              ty == "DATE" || ty == "TIME" || ty == "TIMESTAMP" || ty == "BINARY" || ty == "VARBINARY";
+		if (!SimpleName(c[0]) || Trimmed(c[1]) != "SYSIBM" || !scalar || Trimmed(c[3]) != std::to_string(ordinal++) ||
+		    (c[4] != "Y" && c[4] != "N") || c[6] != " " || (c[7] != "N" && c[7] != "Y") || c[8] != " " ||
+		    !c[9].empty() || c[10] != "N" || c[11] != "N" || c[12] != "N" || c[13] != "N" || !c[14].empty())
 			Reject();
-		if (c[2] == "DECIMAL") {
+		if (ty == "DECIMAL") {
 			auto precision = std::stoi(Trimmed(c[15])), scale = std::stoi(Trimmed(c[16]));
 			if (precision < 1 || precision > 31 || scale < 0 || scale > precision)
 				Reject();
@@ -421,11 +546,9 @@ static string Metadata(Session &s, const Data &d, string &stage) {
 	auto constraints = s.Rows("SELECT CONSTNAME,TYPE,ENFORCED,TRUSTED,CHECKEXISTINGDATA FROM SYSCAT.TABCONST WHERE " +
 	                          filter + " ORDER BY CONSTNAME");
 	for (auto &c : constraints)
-		if ((c[1] != "P" && c[1] != "U") || c[2] != "Y" || c[3] != " " || c[4] != "I")
+		if ((c[1] != "P" && c[1] != "U" && c[1] != "F" && c[1] != "K") || c[2] != "Y")
 			Reject();
 	if (s.Scalar("SELECT VARCHAR(COUNT(*)) FROM SYSCAT.TRIGGERS WHERE " + filter) != "0" ||
-	    s.Scalar("SELECT VARCHAR(COUNT(*)) FROM SYSCAT.REFERENCES WHERE (" + filter +
-	             ") OR (REFTABSCHEMA=" + Literal(d.schema) + " AND REFTABNAME=" + Literal(d.table) + ")") != "0" ||
 	    s.Scalar("SELECT VARCHAR(COUNT(*)) FROM SYSCAT.CONTROLS WHERE " + filter) != "0")
 		Reject();
 	stage = "source_indexes";
@@ -445,8 +568,22 @@ static string Metadata(Session &s, const Data &d, string &stage) {
 		if (!first)
 			result += ",";
 		first = false;
+		auto upper_ty = StringUtil::Upper(Trimmed(c[2]));
+		int64_t type_oid = 0;
+		if (upper_ty == "SMALLINT")
+			type_oid = 21;
+		else if (upper_ty == "INTEGER" || upper_ty == "INT")
+			type_oid = 23;
+		else if (upper_ty == "BIGINT")
+			type_oid = 20;
+		if (returning_col_oid && c[0] == d.returning_name)
+			*returning_col_oid = type_oid;
 		result += "{\"name\":" + JSON(c[0]) + ",\"data_type\":" + JSON(c[2]) +
-		          ",\"nullable\":" + (c[4] == "Y" ? "true" : "false");
+		          ",\"nullable\":" + (c[4] == "Y" ? "true" : "false") +
+		          ",\"has_default\":" + (!Trimmed(c[5]).empty() ? "true" : "false") +
+		          ",\"identity\":" + (c[7] == "Y" ? "true" : "false");
+		if (type_oid != 0)
+			result += ",\"type_oid\":" + std::to_string(type_oid);
 		if (c[2] == "DECIMAL")
 			result += ",\"precision\":" + Trimmed(c[15]) + ",\"scale\":" + Trimmed(c[16]);
 		result += "}";
@@ -463,8 +600,9 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	state.done = true;
 	auto &d = in.bind_data->Cast<Data>();
 	string status = "CONFIRMED_NOT_EXECUTED", error, stage = "source_metadata", version, descriptor;
-	string source_error;
+	string source_error, returned_rows;
 	int64_t affected = -1;
+	int64_t ret_oid = 0;
 	bool sent = false, commit_started = false, local_rejection = false;
 	shared_ptr<ODBCConnection> connection;
 	unique_ptr<Session> session;
@@ -484,15 +622,20 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		stage = "source_metadata";
 		s.Exec("SET CURRENT LOCK TIMEOUT 5");
 		s.Exec("LOCK TABLE " + Identifier(d.schema) + "." + Identifier(d.table) + " IN EXCLUSIVE MODE");
-		descriptor = Metadata(s, d, stage);
+		descriptor = Metadata(s, d, stage, d.returning ? &ret_oid : nullptr);
 		if (d.execute) {
 			stage = "source_descriptor";
 			if (descriptor != d.expected) {
 				error = "0A000";
 				Reject();
 			}
+			if (d.returning && (ret_oid == 0 || ret_oid != d.returning_oid)) {
+				error = "0A000";
+				Reject();
+			}
 			stage = "source_execute";
-			affected = s.Execute(d.sql, d.params, sent, stage);
+			affected = d.returning ? s.ExecuteReturning(d.sql, d.params, sent, stage, returned_rows)
+			                       : s.Execute(d.sql, d.params, sent, stage);
 			stage = "source_commit";
 			commit_started = true;
 			status = "COMMIT_STATUS_UNKNOWN";
@@ -542,8 +685,10 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	out.SetValue(3, 0, Value(stage));
 	out.SetValue(4, 0, Value(version));
 	out.SetValue(5, 0, Value(descriptor));
+	if (d.returning)
+		out.SetValue(6, 0, Value(status == "COMMITTED" ? returned_rows : ""));
 	if (d.diagnostics)
-		out.SetValue(6, 0, Value(source_error));
+		out.SetValue(6 + (d.returning ? 1 : 0), 0, Value(source_error));
 	out.SetChildCardinality(1);
 }
 struct AdminData : TableFunctionData {
@@ -614,5 +759,13 @@ void RegisterDb2GuardedCRUD(ExtensionLoader &loader) {
 		options.Add("source_diagnostics", LogicalType::BOOLEAN);
 	});
 	loader.RegisterFunction(exec);
+	TableFunction ret("db2_guarded_insert_returning", vector<LogicalType>(6, LogicalType::VARCHAR), Scan, Bind, Init);
+	ret.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("params", LogicalType::ANY);
+		options.Add("returning_name", LogicalType::VARCHAR);
+		options.Add("returning_oid", LogicalType::BIGINT);
+		options.Add("source_diagnostics", LogicalType::BOOLEAN);
+	});
+	loader.RegisterFunction(ret);
 }
 } // namespace duckdb
