@@ -84,6 +84,8 @@ static unique_ptr<FunctionData> ODBCRelationalBind(ClientContext &context, Table
 	}
 	if (result->category == "capabilities" && result->vendor) {
 		names = {"catalog_name", "column_name"};
+	} else if (result->vendor && result->category == "tableDetails") {
+		names = {"table_schema", "table_name", "table_type", "table_status", "reorg_pending", "num_reorg_rec_alters"};
 	} else if (result->vendor && result->category == "columnDetails") {
 		names = {"table_schema",   "table_name", "column_name",       "identity_kind",
 		         "generated_kind", "expression", "default_definition"};
@@ -152,17 +154,18 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 			switch (RelationalCatalog(context, bind.database).GetDialect()) {
 			case ODBCDialect::DB2:
 				sql = "SELECT TABNAME,COLNAME FROM SYSCAT.COLUMNS WHERE TABSCHEMA='SYSCAT' AND TABNAME IN "
-				      "('TABCONST','COLUMNS','INDEXES','INDEXCOLUSE','CHECKS','KEYCOLUSE','CONSTDEP') ORDER BY "
-				      "TABNAME,COLNO";
+				      "('TABCONST','COLUMNS','INDEXES','INDEXCOLUSE','CHECKS','KEYCOLUSE','CONSTDEP','TABLES') "
+				      "ORDER BY TABNAME,COLNO";
 				break;
 			case ODBCDialect::DAMENG:
 				sql = "SELECT TABLE_NAME,COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE OWNER='SYS' AND TABLE_NAME IN "
-				      "('ALL_TAB_COLUMNS','ALL_CONSTRAINTS','ALL_INDEXES','ALL_IND_COLUMNS','ALL_IND_EXPRESSIONS') "
+				      "('ALL_TAB_COLUMNS','ALL_TAB_COLS','SYSCOLUMNS','SYSOBJECTS','ALL_TABLES',"
+				      "'ALL_CONSTRAINTS','ALL_INDEXES','ALL_IND_COLUMNS','ALL_IND_EXPRESSIONS') "
 				      "ORDER BY TABLE_NAME,COLUMN_ID";
 				break;
 			case ODBCDialect::HANA:
 				sql = "SELECT VIEW_NAME,COLUMN_NAME FROM SYS.VIEW_COLUMNS WHERE SCHEMA_NAME='SYS' AND VIEW_NAME IN "
-				      "('TABLE_COLUMNS','CONSTRAINTS','REFERENTIAL_CONSTRAINTS','INDEXES','INDEX_COLUMNS') "
+				      "('TABLES','TABLE_COLUMNS','CONSTRAINTS','REFERENTIAL_CONSTRAINTS','INDEXES','INDEX_COLUMNS') "
 				      "ORDER BY VIEW_NAME,POSITION";
 				break;
 			}
@@ -185,13 +188,17 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 				state.objects = state.reader->Objects(bind.schema);
 			}
 			if (!bind.tables.empty() && bind.vendor &&
-			    (bind.category == "columnDetails" || bind.category == "constraintDetails" ||
-			     bind.category == "indexDetails" ||
+			    (bind.category == "tableDetails" || bind.category == "columnDetails" ||
+			     bind.category == "constraintDetails" || bind.category == "indexDetails" ||
 			     (bind.category == "columnProperties" &&
-			      RelationalCatalog(context, bind.database).GetDialect() == ODBCDialect::DAMENG))) {
-				auto columns = bind.category == "columnDetails"       ? 7
+			      RelationalCatalog(context, bind.database).GetDialect() == ODBCDialect::DAMENG) ||
+			     (bind.category == "constraints" &&
+			      RelationalCatalog(context, bind.database).GetDialect() == ODBCDialect::HANA))) {
+				auto columns = bind.category == "tableDetails"        ? 6
+				               : bind.category == "columnDetails"     ? 7
 				               : bind.category == "constraintDetails" ? 14
 				               : bind.category == "indexDetails"      ? 16
+				               : bind.category == "constraints"       ? 13
 				                                                      : 8;
 				state.reader->StartQuery(
 				    ODBCVendorMetadataBatchSQL(RelationalCatalog(context, bind.database).GetDialect(), bind.category,
@@ -240,9 +247,12 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 			}
 			state.reader->Check();
 			auto &object = state.objects[state.object_offset++];
-			if (bind.vendor && (bind.category == "columnDetails" || bind.category == "constraintDetails" ||
-			                    bind.category == "indexDetails")) {
-				auto columns = bind.category == "columnDetails" ? 7 : bind.category == "constraintDetails" ? 14 : 16;
+			if (bind.vendor && (bind.category == "tableDetails" || bind.category == "columnDetails" ||
+			                    bind.category == "constraintDetails" || bind.category == "indexDetails")) {
+				auto columns = bind.category == "tableDetails"        ? 6
+				               : bind.category == "columnDetails"     ? 7
+				               : bind.category == "constraintDetails" ? 14
+				                                                      : 16;
 				state.rows = state.reader->ReadQuery(
 				    ODBCVendorMetadataSQL(RelationalCatalog(context, bind.database).GetDialect(), bind.category,
 				                          object),
@@ -251,6 +261,10 @@ static void ODBCRelationalScan(ClientContext &context, TableFunctionInput &input
 			           RelationalCatalog(context, bind.database).GetDialect() == ODBCDialect::DAMENG) {
 				state.rows =
 				    state.reader->ReadQuery(ODBCVendorMetadataSQL(ODBCDialect::DAMENG, bind.category, object), 8);
+			} else if (bind.vendor && bind.category == "constraints" &&
+			           RelationalCatalog(context, bind.database).GetDialect() == ODBCDialect::HANA) {
+				state.rows =
+				    state.reader->ReadQuery(ODBCVendorMetadataSQL(ODBCDialect::HANA, bind.category, object), 13);
 			} else {
 				state.rows = state.reader->ReadTable(object, bind.category);
 			}

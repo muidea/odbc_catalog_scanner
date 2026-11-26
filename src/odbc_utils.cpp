@@ -1,8 +1,10 @@
 #include "guarded_odbc_source_error.hpp"
+#include "odbc_temporal_utils.hpp"
 #include "odbc_utils.hpp"
 #include "odbc_handle_guard.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -18,6 +20,7 @@
 #include <sqlext.h>
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 
 #include "storage/odbc_schema_entry.hpp"
 #include "storage/odbc_transaction.hpp"
@@ -573,17 +576,133 @@ static string TransformBlobToODBC(const string &val) {
 	return result;
 }
 
-string ODBCUtils::TransformConstant(const Value &val) {
-	if (val.type().IsNumeric() || val.type().id() == LogicalTypeId::BOOLEAN) {
-		return val.ToSQLString();
+bool ODBCUtils::TryTransformConstant(const Value &val, ODBCDialect dialect, const string &remote_type_name, string &out) {
+	if (val.IsNull()) {
+		out.clear();
+		return false;
+	}
+	if (val.type().id() == LogicalTypeId::BOOLEAN) {
+		if (dialect == ODBCDialect::DAMENG) {
+			out = BooleanValue::Get(val) ? "1" : "0";
+		} else {
+			out = val.ToSQLString();
+		}
+		return true;
+	}
+	if (val.type().id() == LogicalTypeId::FLOAT) {
+		if (!std::isfinite(FloatValue::Get(val))) {
+			out.clear();
+			return false;
+		}
+		out = val.ToSQLString();
+		return true;
+	}
+	if (val.type().id() == LogicalTypeId::DOUBLE) {
+		if (!std::isfinite(DoubleValue::Get(val))) {
+			out.clear();
+			return false;
+		}
+		out = val.ToSQLString();
+		return true;
+	}
+	if (val.type().IsNumeric()) {
+		out = val.ToSQLString();
+		return true;
 	}
 	if (val.type().id() == LogicalTypeId::BLOB) {
-		return TransformBlobToODBC(StringValue::Get(val));
+		out = TransformBlobToODBC(StringValue::Get(val));
+		return true;
+	}
+	if (val.type().id() == LogicalTypeId::DATE) {
+		date_t dd = DateValue::Get(val);
+		if (!dd.IsFinite()) {
+			out.clear();
+			return false;
+		}
+		int32_t year, month, day;
+		Date::Convert(dd, year, month, day);
+		if (!IsODBCYearInRange(year)) {
+			out.clear();
+			return false;
+		}
+		out = "DATE " + WriteLiteral(FormatODBCDateParts(year, month, day));
+		return true;
+	}
+	if (val.type().id() == LogicalTypeId::TIME) {
+		dtime_t dt = TimeValue::Get(val);
+		int32_t hour, minute, second, micros;
+		Time::Convert(dt, hour, minute, second, micros);
+		if (!IsODBCTimeInRange(hour, minute, second, micros)) {
+			out.clear();
+			return false;
+		}
+		if ((dialect == ODBCDialect::DB2 || dialect == ODBCDialect::HANA) && micros != 0) {
+			out.clear();
+			return false;
+		}
+		out = "TIME " + WriteLiteral(FormatODBCTimeParts(hour, minute, second, micros));
+		return true;
+	}
+	if (val.type().id() == LogicalTypeId::TIMESTAMP) {
+		timestamp_t ts = TimestampValue::Get(val);
+		if (!ts.IsFinite()) {
+			out.clear();
+			return false;
+		}
+		date_t dd;
+		dtime_t dt;
+		Timestamp::Convert(ts, dd, dt);
+		int32_t year, month, day, hour, minute, second, micros;
+		Date::Convert(dd, year, month, day);
+		if (!IsODBCYearInRange(year)) {
+			out.clear();
+			return false;
+		}
+		Time::Convert(dt, hour, minute, second, micros);
+		if (NormalizeODBCTypeName(remote_type_name) == "seconddate" && micros != 0) {
+			out.clear();
+			return false;
+		}
+		out = "TIMESTAMP " +
+		      WriteLiteral(FormatODBCDateParts(year, month, day) + " " + FormatODBCTimeParts(hour, minute, second, micros));
+		return true;
 	}
 	if (val.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
-		return val.DefaultCastAs(LogicalType::TIMESTAMP).DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+		if (dialect != ODBCDialect::DAMENG) {
+			out.clear();
+			return false;
+		}
+		timestamp_t ts(val.GetValueUnsafe<int64_t>());
+		if (!ts.IsFinite()) {
+			out.clear();
+			return false;
+		}
+		date_t dd;
+		dtime_t dt;
+		Timestamp::Convert(ts, dd, dt);
+		int32_t year, month, day;
+		Date::Convert(dd, year, month, day);
+		if (!IsODBCYearInRange(year)) {
+			out.clear();
+			return false;
+		}
+		out = "TIMESTAMP " + WriteLiteral(FormatODBCTimestampTZUTC(timestamp_tz_t(val.GetValueUnsafe<int64_t>()), false));
+		return true;
 	}
-	return val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+	out = val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+	return true;
+}
+
+string ODBCUtils::TransformConstant(const Value &val) {
+	return TransformConstant(val, ODBCDialect::DB2);
+}
+
+string ODBCUtils::TransformConstant(const Value &val, ODBCDialect dialect) {
+	string out;
+	if (!TryTransformConstant(val, dialect, "", out)) {
+		throw InvalidInputException("Unsupported constant value for ODBC filter pushdown: %s", val.ToString());
+	}
+	return out;
 }
 
 } // namespace duckdb

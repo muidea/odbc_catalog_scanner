@@ -16,10 +16,10 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
-#include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <thread>
-
+#include <unordered_set>
 namespace duckdb {
 namespace {
 static void Reject() {
@@ -61,11 +61,94 @@ static bool SimpleName(const string &s) {
 			return false;
 	return true;
 }
+static bool IsHanaSystemSchema(const string &schema) {
+	auto normalized = StringUtil::Lower(schema);
+	StringUtil::Trim(normalized);
+	// SYSTEM is the default user schema on standalone HANA tenants; only block metadata schemas here.
+	return normalized == "information_schema" || normalized == "sys" || StringUtil::StartsWith(normalized, "_sys_");
+}
 static string Identifier(const string &s) {
 	return ODBCUtils::WriteIdentifier(s);
 }
 static string Literal(const string &s) {
 	return ODBCUtils::WriteLiteral(s);
+}
+static string Trimmed(string v) {
+	StringUtil::Trim(v);
+	return v;
+}
+static bool IsSafeHanaDefault(const string &data_type, const string &raw) {
+	if (data_type == "VARCHAR" || data_type == "NVARCHAR" || data_type == "CHAR" || data_type == "NCHAR" ||
+	    data_type == "CLOB" || data_type == "NCLOB") {
+		if (raw.size() > 1024)
+			return false;
+		for (auto ch : raw) {
+			if (static_cast<unsigned char>(ch) < 0x20 || ch == '(' || ch == ')')
+				return false;
+		}
+		auto upper = StringUtil::Upper(Trimmed(raw));
+		static const char *const kVolatileRegisters[] = {
+		    "CURRENT_USER",    "CURRENT_SCHEMA",    "SESSION_USER",       "CURRENT_DATE",
+		    "CURRENT_TIME",    "CURRENT_TIMESTAMP", "CURRENT_UTCDATE",    "CURRENT_UTCTIME",
+		    "CURRENT_UTCTIMESTAMP", "SYSUUID"};
+		for (const auto *reg : kVolatileRegisters) {
+			if (upper == reg)
+				return false;
+		}
+		return true;
+	}
+	auto s = Trimmed(raw);
+	if (s.empty())
+		return false;
+	auto upper = StringUtil::Upper(s);
+	if (upper == "NULL")
+		return true;
+	if (data_type == "BOOLEAN")
+		return upper == "TRUE" || upper == "FALSE";
+	if (data_type == "TINYINT" || data_type == "SMALLINT" || data_type == "INTEGER" || data_type == "BIGINT" ||
+	    data_type == "DECIMAL" || data_type == "REAL" || data_type == "DOUBLE") {
+		if (s.size() > 64)
+			return false;
+		idx_t pos = (s[0] == '+' || s[0] == '-') ? 1 : 0;
+		if (pos >= s.size())
+			return false;
+		bool seen_dot = false;
+		bool seen_before = false;
+		bool seen_after = false;
+		for (; pos < s.size(); pos++) {
+			char ch = s[pos];
+			if (ch >= '0' && ch <= '9') {
+				if (seen_dot)
+					seen_after = true;
+				else
+					seen_before = true;
+			} else if (ch == '.' && !seen_dot) {
+				seen_dot = true;
+			} else {
+				return false;
+			}
+		}
+		return seen_before && (!seen_dot || seen_after);
+	}
+	if (data_type == "DATE" || data_type == "TIME" || data_type == "SECONDDATE" || data_type == "TIMESTAMP") {
+		if (s.size() < 4 || s.size() > 32 || s[0] < '0' || s[0] > '9')
+			return false;
+		for (auto ch : s) {
+			if (!(ch >= '0' && ch <= '9') && ch != '-' && ch != ':' && ch != ' ' && ch != '.' && ch != 'T')
+				return false;
+		}
+		return true;
+	}
+	return false;
+}
+static bool IsValidUint(const string &v) {
+	return !v.empty() && v.find_first_not_of("0123456789") == string::npos;
+}
+static bool IsAllowedHanaIndexType(const string &index_type) {
+	return index_type == "INVERTED VALUE" || index_type == "INVERTED VALUE UNIQUE" || index_type == "INVERTED HASH" ||
+	       index_type == "INVERTED HASH UNIQUE" || index_type == "INVERTED INDIVIDUAL" ||
+	       index_type == "INVERTED INDIVIDUAL UNIQUE" || index_type == "CPBTREE" || index_type == "CPBTREE UNIQUE" ||
+	       index_type == "BTREE" || index_type == "BTREE UNIQUE";
 }
 class Session {
 public:
@@ -74,6 +157,8 @@ public:
 		if (SQLAllocHandle(SQL_HANDLE_STMT, dbc, &h) != SQL_SUCCESS)
 			Reject();
 		stmt = ODBCStatementPtr(h, ODBCStatementDelete);
+		// Keep deadlines local to this session instead of relying on driver
+		// query timeouts that may install process-wide signal handlers.
 		watcher = std::thread([this] {
 			std::unique_lock<std::mutex> lock(mu);
 			auto end = std::chrono::steady_clock::now() + std::chrono::seconds(30);
@@ -109,6 +194,7 @@ public:
 		SQLSMALLINT len = 0;
 		SQLCHAR message[1] = {0};
 		SQLGetDiagRec(SQL_HANDLE_STMT, stmt.get(), 1, state, &native, message, sizeof(message), &len);
+
 		if (cancelled.load() || ctx.IsInterrupted()) {
 			error = "57014";
 		} else {
@@ -123,8 +209,23 @@ public:
 			case 462:
 				error = "23503";
 				break;
-			case 146:
+			case 456:
+			case 457:
+				error = "23514";
+				break;
+			case 293:
+			case 314:
+			case 339:
+				error = "22003";
+				break;
+			case 274:
+				error = "22001";
+				break;
+			case 303:
+				error = "22007";
+				break;
 			case 131:
+			case 146:
 				error = "55P03";
 				break;
 			default:
@@ -147,48 +248,51 @@ public:
 		}
 		cv.notify_all();
 		Check(SQLFreeStmt(stmt.get(), SQL_CLOSE));
+		Check(SQLFreeStmt(stmt.get(), SQL_UNBIND));
 		Check(SQLFreeStmt(stmt.get(), SQL_RESET_PARAMS));
 	}
 	void Exec(const string &sql, bool cleanup = false) {
 		Start(cleanup);
 		auto rc = SQLExecDirect(stmt.get(), reinterpret_cast<SQLCHAR *>(const_cast<char *>(sql.c_str())), SQL_NTS);
-		if (rc != SQL_NO_DATA)
+		if (rc == SQL_NO_DATA)
+			return;
+		Check(rc);
+		while ((rc = SQLMoreResults(stmt.get())) != SQL_NO_DATA)
 			Check(rc);
-		SQLSMALLINT cols = 0;
-		Check(SQLNumResultCols(stmt.get(), &cols));
-		if (cols != 0)
-			Reject();
-		rc = SQLMoreResults(stmt.get());
-		if (rc != SQL_NO_DATA) {
-			Check(rc);
-			Reject();
-		}
 	}
 	vector<vector<string>> Rows(const string &sql, bool cleanup = false) {
 		Start(cleanup);
 		Check(SQLExecDirect(stmt.get(), reinterpret_cast<SQLCHAR *>(const_cast<char *>(sql.c_str())), SQL_NTS));
 		SQLSMALLINT cols = 0;
 		Check(SQLNumResultCols(stmt.get(), &cols));
-		if (cols <= 0 || cols > 64)
+		if (cols < 1 || cols > 64)
 			Reject();
 		vector<vector<string>> rows;
-		while (true) {
-			auto rc = SQLFetch(stmt.get());
-			if (rc == SQL_NO_DATA)
-				break;
+		idx_t bytes = 0;
+		SQLRETURN rc;
+		while ((rc = SQLFetch(stmt.get())) != SQL_NO_DATA) {
 			Check(rc);
+			if (rows.size() >= 8192)
+				Reject();
 			vector<string> row;
 			for (SQLUSMALLINT col = 1; col <= cols; col++) {
-				SQLCHAR buffer[4096] = {0};
-				SQLLEN ind = 0;
-				Check(SQLGetData(stmt.get(), col, SQL_C_CHAR, buffer, sizeof(buffer), &ind));
-				if (ind == SQL_NULL_DATA || ind == SQL_NO_TOTAL || ind >= static_cast<SQLLEN>(sizeof(buffer)))
+				char value[4096] = {0};
+				SQLLEN len = 0;
+				Check(SQLGetData(stmt.get(), col, SQL_C_CHAR, value, sizeof(value), &len));
+				if (len == SQL_NULL_DATA || len < 0 || len >= sizeof(value))
 					Reject();
-				row.emplace_back(reinterpret_cast<char *>(buffer));
+				row.emplace_back(value, static_cast<size_t>(len));
+				bytes += row.back().size();
+				if (bytes > 1024 * 1024)
+					Reject();
 			}
 			rows.push_back(std::move(row));
-			if (rows.size() > 2048)
-				Reject();
+		}
+		// Metadata SELECTs must have exactly one result, fully consumed.
+		rc = SQLMoreResults(stmt.get());
+		if (rc != SQL_NO_DATA) {
+			Check(rc);
+			Reject();
 		}
 		return rows;
 	}
@@ -197,67 +301,6 @@ public:
 		if (r.size() != 1 || r[0].size() != 1)
 			Reject();
 		return r[0][0];
-	}
-	void BindInputParams(const vector<Value> &params, vector<int64_t> &values, vector<int16_t> &bools,
-	                     vector<double> &doubles, vector<string> &text, vector<string> &blobs,
-	                     vector<SQLLEN> &lengths) {
-		static char empty_blob_byte = 0;
-		for (idx_t i = 0; i < params.size(); i++) {
-			auto &v = params[i];
-			auto t = v.type().id();
-			if (t == LogicalTypeId::BLOB) {
-				if (v.IsNull()) {
-					lengths[i] = SQL_NULL_DATA;
-				} else {
-					blobs[i] = StringValue::Get(v);
-					if (blobs[i].size() > 4 * 1024 * 1024)
-						Reject();
-					lengths[i] = static_cast<SQLLEN>(blobs[i].size());
-				}
-				SQLSMALLINT sql_type = blobs[i].size() > 4000 ? SQL_LONGVARBINARY : SQL_VARBINARY;
-				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_BINARY, sql_type,
-				                       MaxValue<idx_t>(1, blobs[i].size()), 0,
-				                       blobs[i].empty() ? &empty_blob_byte : const_cast<char *>(blobs[i].data()),
-				                       blobs[i].size(), &lengths[i]));
-				continue;
-			}
-			if (v.IsNull()) {
-				lengths[i] = SQL_NULL_DATA;
-				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 19, 0,
-				                       &values[i], sizeof(int64_t), &lengths[i]));
-				continue;
-			}
-			if (t == LogicalTypeId::VARCHAR) {
-				text[i] = v.GetValue<string>();
-				if (text[i].size() > 65536 || text[i].find('\0') != string::npos)
-					Reject();
-				lengths[i] = text[i].size();
-				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
-				                       MaxValue<idx_t>(1, text[i].size()), 0, const_cast<char *>(text[i].c_str()),
-				                       text[i].size() + 1, &lengths[i]));
-			} else if (t == LogicalTypeId::BOOLEAN) {
-				bools[i] = v.GetValue<bool>() ? 1 : 0;
-				lengths[i] = sizeof(int16_t);
-				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_SSHORT, SQL_SMALLINT, 5, 0,
-				                       &bools[i], sizeof(int16_t), &lengths[i]));
-			} else if (t == LogicalTypeId::FLOAT || t == LogicalTypeId::DOUBLE) {
-				double dval = t == LogicalTypeId::FLOAT ? static_cast<double>(v.GetValue<float>())
-				                                        : v.GetValue<double>();
-				if (!std::isfinite(dval))
-					Reject();
-				doubles[i] = dval;
-				lengths[i] = sizeof(double);
-				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_DOUBLE, SQL_DOUBLE, 53, 0,
-				                       &doubles[i], sizeof(double), &lengths[i]));
-			} else if (t == LogicalTypeId::SMALLINT || t == LogicalTypeId::INTEGER || t == LogicalTypeId::BIGINT) {
-				values[i] = v.GetValue<int64_t>();
-				lengths[i] = sizeof(int64_t);
-				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 19, 0,
-				                       &values[i], sizeof(int64_t), &lengths[i]));
-			} else {
-				Reject();
-			}
-		}
 	}
 	int64_t Execute(const string &sql, const vector<Value> &params, bool &sent, string &stage) {
 		stage = "source_prepare";
@@ -268,12 +311,101 @@ public:
 		if (count != params.size() || count > 2100)
 			Reject();
 		vector<int64_t> values(params.size(), 0);
-		vector<int16_t> bools(params.size(), 0);
+		vector<uint8_t> bits(params.size(), 0);
+		vector<float> floats(params.size(), 0.0f);
 		vector<double> doubles(params.size(), 0.0);
-		vector<string> text(params.size());
+		vector<string> texts(params.size());
 		vector<string> blobs(params.size());
 		vector<SQLLEN> lengths(params.size(), 0);
-		BindInputParams(params, values, bools, doubles, text, blobs, lengths);
+		char empty_blob_sentinel = 0;
+		for (idx_t i = 0; i < params.size(); i++) {
+			auto &v = params[i];
+			switch (v.type().id()) {
+			case LogicalTypeId::BOOLEAN:
+				if (v.IsNull()) {
+					lengths[i] = SQL_NULL_DATA;
+				} else {
+					bits[i] = v.GetValue<bool>() ? 1 : 0;
+					lengths[i] = 1;
+				}
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_BIT, SQL_BIT, 1, 0, &bits[i],
+				                       sizeof(uint8_t), &lengths[i]));
+				continue;
+			case LogicalTypeId::FLOAT:
+				if (v.IsNull()) {
+					lengths[i] = SQL_NULL_DATA;
+				} else {
+					floats[i] = v.GetValue<float>();
+					if (!std::isfinite(floats[i]))
+						Reject();
+				}
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_FLOAT, SQL_REAL, 7, 0, &floats[i],
+				                       sizeof(float), &lengths[i]));
+				continue;
+			case LogicalTypeId::DOUBLE:
+				if (v.IsNull()) {
+					lengths[i] = SQL_NULL_DATA;
+				} else {
+					doubles[i] = v.GetValue<double>();
+					if (!std::isfinite(doubles[i]))
+						Reject();
+				}
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_DOUBLE, SQL_DOUBLE, 15, 0, &doubles[i],
+				                       sizeof(double), &lengths[i]));
+				continue;
+			case LogicalTypeId::VARCHAR:
+				if (v.IsNull()) {
+					lengths[i] = SQL_NULL_DATA;
+					Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, 1, 0, nullptr,
+					                       0, &lengths[i]));
+				} else {
+					// HDBODBC corrupts non-ASCII Unicode under SQL_C_WCHAR, whereas SQL_C_CHAR preserves UTF-8 cleanly.
+					texts[i] = v.GetValue<string>();
+					if (texts[i].size() > 1048576 || texts[i].find('\0') != string::npos)
+						Reject();
+					lengths[i] = static_cast<SQLLEN>(texts[i].size());
+					SQLSMALLINT sql_type = texts[i].size() > 5000 ? SQL_LONGVARCHAR : SQL_VARCHAR;
+					SQLULEN col_size = MaxValue<SQLULEN>(1, texts[i].size());
+					Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_CHAR, sql_type, col_size, 0,
+					                       const_cast<char *>(texts[i].c_str()), texts[i].size() + 1, &lengths[i]));
+				}
+				continue;
+			case LogicalTypeId::BLOB:
+				if (v.IsNull()) {
+					lengths[i] = SQL_NULL_DATA;
+					Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, 1, 0,
+					                       nullptr, 0, &lengths[i]));
+				} else {
+					blobs[i] = StringValue::Get(v);
+					if (blobs[i].size() > 1048576)
+						Reject();
+					lengths[i] = static_cast<SQLLEN>(blobs[i].size());
+					SQLSMALLINT sql_type = blobs[i].size() > 5000 ? SQL_LONGVARBINARY : SQL_VARBINARY;
+					SQLULEN col_size = MaxValue<SQLULEN>(1, blobs[i].size());
+					SQLPOINTER ptr = blobs[i].empty() ? static_cast<SQLPOINTER>(&empty_blob_sentinel)
+					                                  : static_cast<SQLPOINTER>(const_cast<char *>(blobs[i].data()));
+					Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_BINARY, sql_type, col_size, 0, ptr,
+					                       blobs[i].size(), &lengths[i]));
+				}
+				continue;
+			case LogicalTypeId::SMALLINT:
+			case LogicalTypeId::INTEGER:
+			case LogicalTypeId::BIGINT:
+				if (v.IsNull())
+					lengths[i] = SQL_NULL_DATA;
+				else
+					values[i] = v.GetValue<int64_t>();
+				break;
+			default:
+				if (v.IsNull())
+					lengths[i] = SQL_NULL_DATA;
+				else
+					Reject();
+				break;
+			}
+			Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_SBIGINT, SQL_BIGINT, 19, 0, &values[i],
+			                       sizeof(int64_t), &lengths[i]));
+		}
 
 		if (cancelled.load() || ctx.IsInterrupted()) {
 			error = "57014";
@@ -303,8 +435,8 @@ public:
 		}
 		return affected;
 	}
-	int64_t ExecuteReturning(const string &sql, const vector<Value> &params, bool &sent, string &stage,
-	                         string &returned_rows) {
+	int64_t ExecuteReturning(const string &sql, const vector<Value> &params, string &returned_rows, bool &sent,
+	                         string &stage) {
 		idx_t pos = 0;
 		while (pos < sql.size() && StringUtil::CharacterIsSpace(sql[pos]))
 			pos++;
@@ -318,8 +450,10 @@ public:
 			error = "0A000";
 			Reject();
 		}
-		auto val = Scalar("SELECT CAST(CURRENT_IDENTITY_VALUE() AS VARCHAR(64)) FROM DUMMY");
-		if (val.empty() || val.size() > 20 || val.find_first_not_of("0123456789-") != string::npos) {
+		auto val = Trimmed(Scalar("SELECT CAST(CURRENT_IDENTITY_VALUE() AS VARCHAR(64)) FROM DUMMY"));
+		idx_t digit_pos = (!val.empty() && (val[0] == '+' || val[0] == '-')) ? 1 : 0;
+		if (digit_pos >= val.size() || val.size() - digit_pos > 20 ||
+		    val.find_first_not_of("0123456789", digit_pos) != string::npos) {
 			error = "0A000";
 			Reject();
 		}
@@ -337,16 +471,15 @@ private:
 	std::atomic<bool> cancelled {false};
 	std::thread watcher;
 };
-
 struct Data : TableFunctionData {
 	ODBCCatalog &catalog;
 	string schema, table, expected, version, sql;
 	vector<Value> params;
 	bool execute;
-	bool diagnostics = false;
 	bool returning = false;
 	string returning_name;
 	int64_t returning_oid = 0;
+	bool diagnostics = false;
 	Data(ODBCCatalog &c, bool e) : catalog(c), execute(e) {
 	}
 };
@@ -365,16 +498,16 @@ static ODBCCatalog &CatalogFor(ClientContext &ctx, const string &name) {
 		Reject();
 	return catalog;
 }
-static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
-                                     vector<duckdb::Identifier> &names) {
+static unique_ptr<FunctionData> BindInternal(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
+                                             vector<duckdb::Identifier> &names, bool is_returning) {
 	for (auto &v : in.inputs)
 		if (v.IsNull())
 			Reject();
 	auto d = make_uniq<Data>(CatalogFor(ctx, in.inputs[0].GetValue<string>()), in.inputs.size() == 6);
+	d->returning = is_returning;
 	d->schema = in.inputs[1].GetValue<string>();
 	d->table = in.inputs[2].GetValue<string>();
-	if (!SimpleName(d->schema) || !SimpleName(d->table) ||
-	    ODBCDialectUtil::IsInternalSchema(ODBCDialect::HANA, d->schema))
+	if (!SimpleName(d->schema) || !SimpleName(d->table) || IsHanaSystemSchema(d->schema))
 		Reject();
 	if (d->execute) {
 		d->expected = in.inputs[3].GetValue<string>();
@@ -392,14 +525,17 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
 		if (d->params.size() > 2100)
 			Reject();
 	}
-	d->returning = in.table_function.GetName().GetIdentifierName() == "hana_guarded_insert_returning";
 	if (d->returning) {
-		auto rname = in.named_parameters.find("returning_name"), roid = in.named_parameters.find("returning_oid");
-		if (rname == in.named_parameters.end() || roid == in.named_parameters.end() || rname->second.IsNull() ||
-		    roid->second.IsNull())
+		if (!d->execute)
 			Reject();
-		d->returning_name = rname->second.GetValue<string>();
-		d->returning_oid = roid->second.GetValue<int64_t>();
+		auto name_it = in.named_parameters.find("returning_name");
+		auto oid_it = in.named_parameters.find("returning_oid");
+		if (name_it == in.named_parameters.end() || name_it->second.IsNull() ||
+		    name_it->second.type().id() != LogicalTypeId::VARCHAR || oid_it == in.named_parameters.end() ||
+		    oid_it->second.IsNull() || oid_it->second.type().id() != LogicalTypeId::BIGINT)
+			Reject();
+		d->returning_name = name_it->second.GetValue<string>();
+		d->returning_oid = oid_it->second.GetValue<int64_t>();
 		if (!SimpleName(d->returning_name) ||
 		    (d->returning_oid != 20 && d->returning_oid != 21 && d->returning_oid != 23))
 			Reject();
@@ -422,6 +558,14 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
 		types.push_back(LogicalType::VARCHAR);
 	}
 	return std::move(d);
+}
+static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput &in, vector<LogicalType> &types,
+                                     vector<duckdb::Identifier> &names) {
+	return BindInternal(ctx, in, types, names, false);
+}
+static unique_ptr<FunctionData> BindReturning(ClientContext &ctx, TableFunctionBindInput &in,
+                                              vector<LogicalType> &types, vector<duckdb::Identifier> &names) {
+	return BindInternal(ctx, in, types, names, true);
 }
 static string JSONRows(const vector<vector<string>> &rows) {
 	string out = "[";
@@ -451,6 +595,8 @@ static string Info(SQLHDBC dbc, SQLUSMALLINT key) {
 		Reject();
 	return string(reinterpret_cast<char *>(value), len);
 }
+// Version is an opaque source identity. Capability is proved by the live
+// session/catalog checks below, never by a fixed release interval.
 static bool Compatible(const string &v) {
 	if (v.empty() || v.size() > 1024 || StringUtil::CharacterIsSpace(v.front()) ||
 	    StringUtil::CharacterIsSpace(v.back()))
@@ -462,84 +608,131 @@ static bool Compatible(const string &v) {
 }
 static void Writable(SQLHDBC dbc) {
 	if (SQLSetConnectAttr(dbc, SQL_ATTR_ACCESS_MODE, reinterpret_cast<SQLPOINTER>(SQL_MODE_READ_WRITE), 0) !=
-	    SQL_SUCCESS)
+	        SQL_SUCCESS ||
+	    SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0) != SQL_SUCCESS)
 		Reject();
-	if (SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0) != SQL_SUCCESS)
-		Reject();
-	SQLULEN autocommit = SQL_AUTOCOMMIT_ON;
-	if (SQLGetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, &autocommit, sizeof(autocommit), nullptr) != SQL_SUCCESS ||
-	    autocommit != SQL_AUTOCOMMIT_OFF)
+	SQLULEN mode = SQL_AUTOCOMMIT_ON;
+	if (SQLGetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, &mode, sizeof(mode), nullptr) != SQL_SUCCESS ||
+	    mode != SQL_AUTOCOMMIT_OFF)
 		Reject();
 }
-static string Metadata(Session &s, const Data &d, string &stage, int64_t *returning_col_oid = nullptr) {
+static string Metadata(Session &s, const Data &d, string &stage, std::unordered_set<string> *column_names = nullptr) {
 	const auto filter = "SCHEMA_NAME=" + Literal(d.schema) + " AND TABLE_NAME=" + Literal(d.table);
 	stage = "source_metadata";
-	auto identity = s.Rows("SELECT DATABASE_NAME,VERSION FROM SYS.M_DATABASE");
-	if (identity.size() != 1 || identity[0].size() != 2)
+	auto identity = s.Rows("SELECT D.DATABASE_NAME,CURRENT_USER FROM SYS.M_DATABASE D");
+	if (identity.size() != 1 || identity[0].size() != 2 || identity[0][0].empty())
 		Reject();
 	stage = "source_table";
-	auto table =
-	    s.Rows("SELECT TABLE_OID,TABLE_TYPE,IS_TEMPORARY,IS_USER_DEFINED_TYPE,COALESCE(PARTITION_SPEC,'') "
-	           "FROM SYS.TABLES WHERE " +
-	           filter);
-	if (table.size() != 1 || table[0][2] != "FALSE" || table[0][3] != "FALSE" || !table[0][4].empty())
+	auto table = s.Rows("SELECT TO_VARCHAR(TABLE_OID),TABLE_TYPE,IS_COLUMN_TABLE,IS_LOGGED,IS_SYSTEM_TABLE,"
+	                    "IS_INSERT_ONLY,SESSION_TYPE,IS_TEMPORARY,IS_USER_DEFINED_TYPE,"
+	                    "COALESCE(TO_VARCHAR(PARTITION_SPEC),'_'),HAS_SCHEMA_FLEXIBILITY,IS_REPLICA,"
+	                    "HAS_STRUCTURED_PRIVILEGE_CHECK,IS_SERIES_TABLE,COALESCE(TEMPORAL_TYPE,'_'),"
+	                    "HAS_MASKED_COLUMNS,TO_VARCHAR(CREATE_TIME,'YYYY-MM-DD HH24:MI:SS.FF7') "
+	                    "FROM SYS.TABLES WHERE " +
+	                    filter);
+	if (table.size() != 1)
 		Reject();
-	if (s.Scalar("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM SYS.TRIGGERS WHERE SUBJECT_TABLE_SCHEMA=" +
-	             Literal(d.schema) + " AND SUBJECT_TABLE_NAME=" + Literal(d.table)) != "0")
+	auto &t = table[0];
+	if ((t[1] != "COLUMN" && t[1] != "ROW") || t[3] != "TRUE" || t[4] != "FALSE" || t[5] != "FALSE" ||
+	    (t[6] != "NONE" && t[6] != "SIMPLE") || t[7] != "FALSE" || t[8] != "FALSE" || t[9] != "_" ||
+	    t[10] != "FALSE" || t[11] != "FALSE" || t[12] != "FALSE" || t[13] != "FALSE" || t[14] != "_" ||
+	    t[15] != "FALSE")
 		Reject();
 	stage = "source_columns";
-	auto cols =
-	    s.Rows("SELECT COLUMN_NAME,DATA_TYPE_NAME,POSITION,IS_NULLABLE,COALESCE(CAST(LENGTH AS VARCHAR(20)),'0'),"
-	           "COALESCE(CAST(SCALE AS VARCHAR(20)),'0'),COALESCE(DEFAULT_VALUE,''),COALESCE(GENERATION_TYPE,'') "
-	           "FROM SYS.TABLE_COLUMNS WHERE " +
-	           filter + " ORDER BY POSITION");
+	auto cols = s.Rows("SELECT COLUMN_NAME,DATA_TYPE_NAME,TO_VARCHAR(LENGTH),COALESCE(TO_VARCHAR(SCALE),'-1'),"
+	                   "IS_NULLABLE,TO_VARCHAR(POSITION),COALESCE(DEFAULT_VALUE,''),"
+	                   "COALESCE(GENERATION_TYPE,''),COALESCE(GENERATED_ALWAYS_AS,''),"
+	                   "COALESCE(IS_HIDDEN,'FALSE'),COALESCE(IS_MASKED,'FALSE'),COALESCE(COLLATION,'_'),"
+	                   "CASE WHEN DEFAULT_VALUE IS NULL THEN '0' ELSE '1' END "
+	                   "FROM SYS.TABLE_COLUMNS WHERE " +
+	                   filter + " ORDER BY POSITION");
 	if (cols.empty() || cols.size() > 1024)
 		Reject();
-	for (auto &c : cols) {
-		const auto &ty = c[1];
-		bool scalar = ty == "TINYINT" || ty == "SMALLINT" || ty == "INTEGER" || ty == "BIGINT" || ty == "DECIMAL" ||
-		              ty == "SMALLDECIMAL" || ty == "REAL" || ty == "DOUBLE" || ty == "BOOLEAN" ||
-		              ty == "VARCHAR" || ty == "NVARCHAR" || ty == "ALPHANUM" || ty == "SHORTTEXT" ||
-		              ty == "CLOB" || ty == "NCLOB" || ty == "BLOB" || ty == "DATE" || ty == "TIME" ||
-		              ty == "TIMESTAMP" || ty == "SECONDDATE" || ty == "VARBINARY" || ty == "BINARY";
-		bool identity_gen = c[7] == "ALWAYS AS IDENTITY" || c[7] == "BY DEFAULT AS IDENTITY";
-		if (!SimpleName(c[0]) || !scalar || (c[3] != "TRUE" && c[3] != "FALSE") || (!c[7].empty() && !identity_gen))
+	for (idx_t i = 0; i < cols.size(); i++) {
+		auto &c = cols[i];
+		if (!SimpleName(c[0]) || c[1].empty() || (c[4] != "TRUE" && c[4] != "FALSE") ||
+		    c[5] != std::to_string(i + 1) || (c[12] != "0" && c[12] != "1") || !Trimmed(c[8]).empty() ||
+		    c[9] != "FALSE" || c[10] != "FALSE")
+			Reject();
+		if (!c[7].empty() && c[7] != "ALWAYS AS IDENTITY" && c[7] != "BY DEFAULT AS IDENTITY")
+			Reject();
+		if (!c[7].empty() && c[12] == "1")
 			Reject();
 	}
 	stage = "source_constraints";
 	auto constraints =
-	    s.Rows("SELECT CONSTRAINT_NAME,IS_PRIMARY_KEY,IS_UNIQUE_KEY,COALESCE(CHECK_CONDITION,'') "
-	           "FROM SYS.CONSTRAINTS WHERE " +
-	           filter + " ORDER BY CONSTRAINT_NAME");
-	auto indexes =
-	    s.Rows("SELECT INDEX_NAME,INDEX_TYPE,CONSTRAINT FROM SYS.INDEXES WHERE " + filter + " ORDER BY INDEX_NAME");
+	    s.Rows("SELECT CONSTRAINT_NAME,COLUMN_NAME,TO_VARCHAR(POSITION),IS_PRIMARY_KEY,IS_UNIQUE_KEY,"
+	           "COALESCE(CHECK_CONDITION,'_') FROM SYS.CONSTRAINTS WHERE " +
+	           filter + " ORDER BY CONSTRAINT_NAME,POSITION");
+	std::unordered_set<string> pk_names;
+	for (auto &c : constraints) {
+		if ((c[3] != "TRUE" && c[4] != "TRUE") || c[5] != "_")
+			Reject();
+		if (c[3] == "TRUE")
+			pk_names.insert(c[0]);
+	}
+	std::unordered_set<string> single_pk_cols;
+	for (const auto &pk_name : pk_names) {
+		vector<string> pk_cols;
+		for (const auto &c : constraints) {
+			if (c[0] == pk_name && c[3] == "TRUE")
+				pk_cols.push_back(c[1]);
+		}
+		if (pk_cols.size() == 1)
+			single_pk_cols.insert(pk_cols[0]);
+	}
+	if (s.Scalar("SELECT TO_VARCHAR(COUNT(*)) FROM SYS.TRIGGERS WHERE SUBJECT_TABLE_SCHEMA=" + Literal(d.schema) +
+	             " AND SUBJECT_TABLE_NAME=" + Literal(d.table)) != "0" ||
+	    s.Scalar("SELECT TO_VARCHAR(COUNT(*)) FROM SYS.REFERENTIAL_CONSTRAINTS WHERE (" + filter +
+	             ") OR (REFERENCED_SCHEMA_NAME=" + Literal(d.schema) +
+	             " AND REFERENCED_TABLE_NAME=" + Literal(d.table) + ")") != "0")
+		Reject();
+	stage = "source_indexes";
+	auto indexes = s.Rows("SELECT INDEX_NAME,TO_VARCHAR(INDEX_OID),INDEX_TYPE,COALESCE(CONSTRAINT,'_'),"
+	                      "COALESCE(STORAGE_TYPE,'_') FROM SYS.INDEXES WHERE " +
+	                      filter + " ORDER BY INDEX_NAME");
+	for (auto &i : indexes)
+		if (!IsAllowedHanaIndexType(i[2]))
+			Reject();
 	string revision = JSONRows(identity) + JSONRows(table) + JSONRows(cols) + JSONRows(constraints) + JSONRows(indexes);
 	string result = "{\"database\":" + JSON(identity[0][0]) + ",\"schema\":" + JSON(d.schema) +
-	                ",\"table\":" + JSON(d.table) + ",\"object_id\":" + JSON(table[0][0]) +
-	                ",\"revision\":" + JSON(revision) + ",\"columns\":[";
+	                ",\"table\":" + JSON(d.table) + ",\"table_type\":" + JSON(t[1]) +
+	                ",\"object_id\":" + JSON(t[0] + ":" + t[16]) + ",\"revision\":" + JSON(revision) +
+	                ",\"columns\":[";
 	bool first = true;
 	for (auto &c : cols) {
+		if (column_names)
+			column_names->insert(c[0]);
 		if (!first)
 			result += ",";
 		first = false;
-		auto upper_ty = StringUtil::Upper(c[1]);
-		int64_t type_oid = 0;
-		if (upper_ty == "SMALLINT")
-			type_oid = 21;
-		else if (upper_ty == "INTEGER" || upper_ty == "INT")
-			type_oid = 23;
-		else if (upper_ty == "BIGINT")
-			type_oid = 20;
-		if (returning_col_oid && c[0] == d.returning_name)
-			*returning_col_oid = type_oid;
-		bool identity_gen = c[7] == "ALWAYS AS IDENTITY" || c[7] == "BY DEFAULT AS IDENTITY";
 		result += "{\"name\":" + JSON(c[0]) + ",\"data_type\":" + JSON(c[1]) +
-		          ",\"nullable\":" + (c[3] == "TRUE" ? "true" : "false") +
-		          ",\"has_default\":" + (!c[6].empty() ? "true" : "false");
-		if (identity_gen)
-			result += ",\"identity\":true";
-		if (type_oid != 0)
-			result += ",\"type_oid\":" + std::to_string(type_oid);
+		          ",\"nullable\":" + (c[4] == "TRUE" ? "true" : "false");
+		if (!c[7].empty()) {
+			result += ",\"is_identity\":true";
+			if (c[7] == "ALWAYS AS IDENTITY")
+				result += ",\"identity_always\":true";
+		}
+		if (c[12] == "1") {
+			result += ",\"has_default\":true";
+			if (IsSafeHanaDefault(c[1], c[6]))
+				result += ",\"default_safe\":true";
+		}
+		if (single_pk_cols.count(c[0]))
+			result += ",\"single_column_primary_key\":true";
+		if (c[1] == "DECIMAL") {
+			if (IsValidUint(c[2]) && IsValidUint(c[3]))
+				result += ",\"precision\":" + c[2] + ",\"scale\":" + c[3];
+		} else if (c[1] == "TINYINT") {
+			result += ",\"precision\":3,\"scale\":0";
+		} else if (c[1] == "TIMESTAMP") {
+			if (IsValidUint(c[3]))
+				result += ",\"scale\":" + c[3];
+		} else if (c[1] == "VARCHAR" || c[1] == "NVARCHAR" || c[1] == "CHAR" || c[1] == "NCHAR" || c[1] == "CLOB" ||
+		           c[1] == "NCLOB" || c[1] == "VARBINARY" || c[1] == "BLOB") {
+			if (IsValidUint(c[2]))
+				result += ",\"max_length\":" + c[2];
+		}
 		result += "}";
 	}
 	result += "]}";
@@ -556,42 +749,38 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	string status = "CONFIRMED_NOT_EXECUTED", error, stage = "source_metadata", version, descriptor;
 	string source_error, returned_rows;
 	int64_t affected = -1;
-	int64_t ret_oid = 0;
 	bool sent = false, commit_started = false, local_rejection = false;
 	shared_ptr<ODBCConnection> connection;
 	unique_ptr<Session> session;
 	try {
 		if (ctx.IsInterrupted())
 			throw InterruptException();
-		connection = ODBCConnection::Open(ODBCTypeConfig(ctx), d.catalog.connection_string, 5);
+		connection = ODBCConnection::Open(ODBCTypeConfig(ctx, ODBCDialect::HANA), d.catalog.connection_string, 5);
 		auto dbc = connection->GetConn();
-		auto dbms = StringUtil::Lower(Info(dbc, SQL_DBMS_NAME));
-		if (dbms.find("hdb") == string::npos && dbms.find("hana") == string::npos)
+		if (Info(dbc, SQL_DBMS_NAME) != "HDB")
+			Reject();
+		version = Info(dbc, SQL_DBMS_VER);
+		if (!Compatible(version) || (d.execute && version != d.version))
 			Reject();
 		Writable(dbc);
 		session = make_uniq<Session>(ctx, dbc);
 		auto &s = *session;
-		version = s.Scalar("SELECT VERSION FROM SYS.M_DATABASE");
-		if (!Compatible(version) || (d.execute && version != d.version))
-			Reject();
-		if (s.Scalar("SELECT CAST(CURRENT_UPDATE_TRANSACTION() AS VARCHAR(32)) FROM DUMMY") != "0")
-			Reject();
 		stage = "source_metadata";
+		s.Exec("SET TRANSACTION LOCK WAIT TIMEOUT 5000");
 		s.Exec("LOCK TABLE " + Identifier(d.schema) + "." + Identifier(d.table) + " IN EXCLUSIVE MODE");
-		descriptor = Metadata(s, d, stage, d.returning ? &ret_oid : nullptr);
+		std::unordered_set<string> column_names;
+		descriptor = Metadata(s, d, stage, &column_names);
 		if (d.execute) {
 			stage = "source_descriptor";
-			if (descriptor != d.expected) {
-				error = "0A000";
-				Reject();
-			}
-			if (d.returning && (ret_oid == 0 || ret_oid != d.returning_oid)) {
+			if (descriptor != d.expected || (d.returning && column_names.count(d.returning_name) != 1)) {
 				error = "0A000";
 				Reject();
 			}
 			stage = "source_execute";
-			affected = d.returning ? s.ExecuteReturning(d.sql, d.params, sent, stage, returned_rows)
-			                       : s.Execute(d.sql, d.params, sent, stage);
+			if (d.returning)
+				affected = s.ExecuteReturning(d.sql, d.params, returned_rows, sent, stage);
+			else
+				affected = s.Execute(d.sql, d.params, sent, stage);
 			stage = "source_commit";
 			commit_started = true;
 			status = "COMMIT_STATUS_UNKNOWN";
@@ -615,66 +804,59 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			stage = "source_connection";
 		} catch (...) {
 		}
+		// Snapshot before rollback/cancellation cleanup replaces handle diagnostics.
 		if (session && source_error.empty())
 			source_error = session->source.JSON();
 		if (error.empty())
 			error = session && !session->error.empty()
 			            ? session->error
 			            : (ctx.IsInterrupted() ? "57014" : (local_rejection ? "0A000" : "XX000"));
-		if (session) {
+		if (session)
 			try {
 				session->Exec("ROLLBACK", true);
+				if (sent && !commit_started)
+					status = "CONFIRMED_ROLLED_BACK";
 			} catch (...) {
+				if (sent)
+					status = "COMMIT_STATUS_UNKNOWN";
 			}
-		}
-		if (sent && !commit_started)
-			status = "CONFIRMED_ROLLED_BACK";
-		else if (commit_started)
-			status = "COMMIT_STATUS_UNKNOWN";
 	}
-	if (connection) {
-		session.reset();
+	session.reset();
+	if (connection)
 		connection->Close();
-	}
 	out.SetValue(0, 0, Value(status));
 	out.SetValue(1, 0, Value::BIGINT(affected));
 	out.SetValue(2, 0, Value(error));
 	out.SetValue(3, 0, Value(stage));
 	out.SetValue(4, 0, Value(version));
 	out.SetValue(5, 0, Value(descriptor));
+	idx_t out_col = 6;
 	if (d.returning)
-		out.SetValue(6, 0, Value(status == "COMMITTED" ? returned_rows : ""));
+		out.SetValue(out_col++, 0, Value(status == "COMMITTED" ? returned_rows : ""));
 	if (d.diagnostics)
-		out.SetValue(6 + (d.returning ? 1 : 0), 0, Value(source_error));
+		out.SetValue(out_col++, 0, Value(source_error));
 	out.SetChildCardinality(1);
 }
 } // namespace
-
 void RegisterHanaGuardedCRUD(ExtensionLoader &loader) {
-	TableFunction meta("hana_crud_metadata",
-	                   {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, Scan, Bind, Init);
-	meta.GetSignature().WithTypedKwargs("options",
-	                                    [](TypedKwargs &options) { options.Add("source_diagnostics", LogicalType::BOOLEAN); });
-	loader.RegisterFunction(meta);
-	TableFunction exec("hana_guarded_mutation",
-	                   {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                    LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                   Scan, Bind, Init);
+	TableFunction metadata("hana_crud_metadata", vector<LogicalType>(3, LogicalType::VARCHAR), Scan, Bind, Init);
+	metadata.GetSignature().WithTypedKwargs(
+	    "options", [](TypedKwargs &options) { options.Add("source_diagnostics", LogicalType::BOOLEAN); });
+	loader.RegisterFunction(metadata);
+	TableFunction exec("hana_guarded_mutation", vector<LogicalType>(6, LogicalType::VARCHAR), Scan, Bind, Init);
 	exec.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
-		options.Add("source_diagnostics", LogicalType::BOOLEAN);
 		options.Add("params", LogicalType::ANY);
+		options.Add("source_diagnostics", LogicalType::BOOLEAN);
 	});
 	loader.RegisterFunction(exec);
-	TableFunction ret("hana_guarded_insert_returning",
-	                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                   LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                  Scan, Bind, Init);
-	ret.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
-		options.Add("source_diagnostics", LogicalType::BOOLEAN);
+	TableFunction exec_returning("hana_guarded_insert_returning", vector<LogicalType>(6, LogicalType::VARCHAR), Scan,
+	                             BindReturning, Init);
+	exec_returning.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
 		options.Add("params", LogicalType::ANY);
 		options.Add("returning_name", LogicalType::VARCHAR);
 		options.Add("returning_oid", LogicalType::BIGINT);
+		options.Add("source_diagnostics", LogicalType::BOOLEAN);
 	});
-	loader.RegisterFunction(ret);
+	loader.RegisterFunction(exec_returning);
 }
 } // namespace duckdb

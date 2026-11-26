@@ -21,6 +21,7 @@
 #endif
 
 #include "duckdb.hpp"
+#include "odbc_dialect.hpp"
 
 // Include ODBC headers
 #include <sql.h>
@@ -46,10 +47,14 @@ struct ODBCType {
 struct ODBCTypeConfig {
 	bool bit1_as_boolean = false;
 	bool tinyint1_as_boolean = false;
-	bool time_as_time = false;
+	bool time_as_time = true;
+	bool has_dialect = false;
+	ODBCDialect dialect = ODBCDialect::HANA;
 
 	ODBCTypeConfig();
-	ODBCTypeConfig(ClientContext &context);
+	explicit ODBCTypeConfig(ClientContext &context);
+	ODBCTypeConfig(ClientContext &context, ODBCDialect dialect_p);
+	ODBCTypeConfig(DatabaseInstance &db, ODBCDialect dialect_p);
 };
 
 class ODBCTypes {

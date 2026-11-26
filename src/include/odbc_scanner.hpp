@@ -26,6 +26,7 @@ struct ODBCBindData : public FunctionData {
 	vector<ODBCType> odbc_types;
 	vector<string> names;
 	vector<string> remote_names;
+	vector<string> remote_type_names;
 	vector<LogicalType> types;
 	string limit;
 	ODBCResultStreaming streaming = ODBCResultStreaming::UNINITIALIZED;
@@ -59,6 +60,11 @@ public:
 	ODBCClearCacheFunction();
 
 	static void ClearCacheOnSetting(ClientContext &context, SetScope scope, Value &parameter);
+};
+
+class ODBCClearCacheScopedFunction : public TableFunction {
+public:
+	ODBCClearCacheScopedFunction();
 };
 
 } // namespace duckdb

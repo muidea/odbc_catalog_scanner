@@ -57,7 +57,7 @@ ODBCPoolConnection ODBCConnectionPool::GetConnectionInternal() {
 
 	// no cached connections left but there is space to open a new one - open it
 	try {
-		ODBCTypeConfig type_config;
+		ODBCTypeConfig type_config(odbc_catalog.GetDatabase(), odbc_catalog.GetDialect());
 		return ODBCPoolConnection(this, ODBCConnection::Open(type_config, odbc_catalog.connection_string));
 	} catch (...) {
 		active_connections--;
@@ -96,25 +96,43 @@ ODBCPoolConnection ODBCConnectionPool::GetConnection() {
 }
 
 void ODBCConnectionPool::ReturnConnection(shared_ptr<ODBCConnection> connection) {
+	{
+		lock_guard<mutex> l(connection_lock);
+		if (active_connections <= 0) {
+			throw InternalException("ODBCConnectionPool::ReturnConnection called but active_connections is 0");
+		}
+		active_connections--;
+		if (active_connections >= maximum_connections ||
+		    !odbc_use_connection_cache.load(std::memory_order_relaxed) || !connection || !connection->IsOpen()) {
+			connection_available.notify_one();
+			return;
+		}
+	}
+
+	// Reset and verify health outside connection_lock so pooled queries are not blocked.
+	bool healthy = false;
+	try {
+		healthy = connection->CheckConnectionHealth();
+		if (healthy) {
+			connection->ResetSessionTemporalSettings();
+		}
+	} catch (...) {
+		healthy = false;
+	}
+	if (!healthy) {
+		connection->Close();
+		lock_guard<mutex> l(connection_lock);
+		connection_available.notify_one();
+		return;
+	}
+
 	lock_guard<mutex> l(connection_lock);
-	if (active_connections <= 0) {
-		throw InternalException("ODBCConnectionPool::ReturnConnection called but active_connections is 0");
+	if (active_connections < maximum_connections && odbc_use_connection_cache.load(std::memory_order_relaxed) &&
+	    connection->IsOpen()) {
+		connection_cache.push_back(std::move(connection));
+	} else {
+		connection->Close();
 	}
-	active_connections--;
-	if (active_connections >= maximum_connections) {
-		// if the maximum number of connections has been decreased by the user we might need to reclaim the connection
-		// immediately
-		connection_available.notify_one();
-		return;
-	}
-	if (!odbc_use_connection_cache.load(std::memory_order_relaxed)) {
-		connection_available.notify_one();
-		return;
-	}
-	// check if the underlying connection is still usable
-	// For ODBC, we need to check if the connection is still valid
-	// This is a simplified check - in production we might need more robust connection health checking
-	connection_cache.push_back(std::move(connection));
 	connection_available.notify_one();
 }
 

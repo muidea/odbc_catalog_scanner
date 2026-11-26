@@ -92,6 +92,10 @@ SQLRETURN SQL_API SQLFetch(SQLHSTMT stmt) {
 	}
 	auto &value = s.decimal ? s.decimal_value : (s.row == 0 ? first_value : second_value);
 	s.row++;
+	if (!s.buffer) {
+		s.offset = 0;
+		return SQL_SUCCESS;
+	}
 	auto length = std::min<idx_t>(value.size(), s.capacity - 1);
 	std::memcpy(s.buffer, value.data(), length);
 	s.buffer[length] = 0;
@@ -111,17 +115,20 @@ SQLRETURN SQL_API SQLGetData(SQLHSTMT stmt, SQLUSMALLINT, SQLSMALLINT, SQLPOINTE
 	auto &s = Get(stmt);
 	if (s.fail)
 		return SQL_ERROR;
-	auto length = std::min<idx_t>(first_value.size() - s.offset, capacity - 1);
-	std::memcpy(buffer, first_value.data() + s.offset, length);
+	auto &value = s.decimal ? s.decimal_value : (s.row == 1 ? first_value : second_value);
+	auto length = std::min<idx_t>(value.size() - s.offset, capacity - 1);
+	std::memcpy(buffer, value.data() + s.offset, length);
 	static_cast<char *>(buffer)[length] = 0;
 	s.offset += length;
-	if (s.narrow_indicator) {
-		int32_t narrow = length;
-		std::memcpy(indicator, &narrow, sizeof(narrow));
-	} else {
-		*indicator = length;
+	if (!s.unwritten) {
+		if (s.narrow_indicator) {
+			int32_t narrow = s.no_total && s.offset < value.size() ? SQL_NO_TOTAL : length;
+			std::memcpy(indicator, &narrow, sizeof(narrow));
+		} else {
+			*indicator = length;
+		}
 	}
-	return s.offset < first_value.size() ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS;
+	return s.offset < value.size() ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS;
 }
 SQLRETURN SQL_API SQLFreeStmt(SQLHSTMT, SQLUSMALLINT) {
 	return SQL_SUCCESS;
@@ -175,8 +182,9 @@ int main() {
 				ODBCTypeConfig config;
 				ODBCResult result("decimal", ODBCStatementPtr(&invalid, ODBCStatementDelete), config, idx_t(-1), 1,
 				                  nullptr);
-			} catch (const ConversionException &) {
-				threw = true;
+			} catch (const std::exception &err) {
+				string msg = err.what();
+				threw = msg.find("Conversion") != string::npos || msg.find("result_conversion") != string::npos;
 			}
 			Require(threw, "malformed or lossy DECIMAL transfer accepted");
 		}

@@ -3,7 +3,9 @@
 //
 // odbc_guarded_ddl.cpp
 //
-// Restricted native DDL and capability introspection for Dameng, Db2, and SAP HANA.
+// Restricted native DDL and capability/describe introspection for Dameng, Db2,
+// and SAP HANA with REORG_PENDING, lossless widening, dependency, and UTC
+// session timezone safety guards.
 //===----------------------------------------------------------------------===//
 
 #include "duckdb.hpp"
@@ -13,16 +15,36 @@
 #include "duckdb/parser/keyword_helper.hpp"
 #include "guarded_odbc_source_error.hpp"
 #include "odbc_dialect.hpp"
+#include "odbc_temporal_utils.hpp"
 #include "storage/odbc_catalog.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 namespace duckdb {
 namespace {
+
+struct DDLGuardReject : public std::runtime_error {
+	string sqlstate;
+	string stage;
+	DDLGuardReject(string state_p, string stage_p, const string &msg)
+	    : std::runtime_error(msg), sqlstate(std::move(state_p)), stage(std::move(stage_p)) {
+	}
+};
+
+[[noreturn]] static void RejectGuard(const string &sqlstate, const string &stage, const string &msg) {
+	throw DDLGuardReject(sqlstate, stage, msg);
+}
+
+static string Trimmed(string s) {
+	StringUtil::Trim(s);
+	return s;
+}
 
 static bool SimpleIntLiteral(const string &s) {
 	if (s.empty() || s.size() > 38)
@@ -35,6 +57,32 @@ static bool SimpleIntLiteral(const string &s) {
 			return false;
 	}
 	return true;
+}
+
+static bool IsSignedDecimalLiteral(const string &s) {
+	if (s.empty() || s == "-" || s == "+" || s == ".") {
+		return false;
+	}
+	idx_t i = 0;
+	if (s[0] == '-' || s[0] == '+') {
+		i = 1;
+		if (i >= s.size()) {
+			return false;
+		}
+	}
+	bool seen_digit = false;
+	bool seen_dot = false;
+	for (; i < s.size(); i++) {
+		char c = s[i];
+		if (c >= '0' && c <= '9') {
+			seen_digit = true;
+		} else if (c == '.' && !seen_dot) {
+			seen_dot = true;
+		} else {
+			return false;
+		}
+	}
+	return seen_digit;
 }
 
 static string Quote(const string &s) {
@@ -61,6 +109,127 @@ static string JSON(const string &s) {
 		}
 	}
 	return out + "\"";
+}
+
+static bool IsDamengSystemNotNullCheck(const string &col_name, const string &raw_expr) {
+	string norm = Trimmed(raw_expr);
+	while (norm.size() >= 2 && norm.front() == '(' && norm.back() == ')') {
+		int bal = 0;
+		bool in_quote = false;
+		bool wrapped = true;
+		for (idx_t idx = 0; idx < norm.size(); idx++) {
+			char ch = norm[idx];
+			if (in_quote) {
+				if (ch == '"') {
+					if (idx + 1 < norm.size() && norm[idx + 1] == '"') {
+						idx++;
+						continue;
+					}
+					in_quote = false;
+				}
+				continue;
+			}
+			if (ch == '"') {
+				in_quote = true;
+			} else if (ch == '(') {
+				bal++;
+			} else if (ch == ')') {
+				bal--;
+				if (bal == 0 && idx + 1 < norm.size()) {
+					wrapped = false;
+				}
+			}
+			if (!wrapped || bal < 0) {
+				wrapped = false;
+				break;
+			}
+		}
+		if (!wrapped || bal != 0 || in_quote) {
+			break;
+		}
+		norm = norm.substr(1, norm.size() - 2);
+		StringUtil::Trim(norm);
+	}
+	const string upper = StringUtil::Upper(norm);
+	const string suffix = " IS NOT NULL";
+	if (upper.size() <= suffix.size() || !StringUtil::EndsWith(upper, suffix)) {
+		return false;
+	}
+	string lhs = norm.substr(0, norm.size() - suffix.size());
+	StringUtil::Trim(lhs);
+	return lhs == col_name || lhs == Quote(col_name);
+}
+
+static int ExtractDamengParenPrecision(const string &dtype, const string &scale_str) {
+	auto lp = dtype.find('(');
+	auto rp = dtype.find(')');
+	if (lp != string::npos && rp != string::npos && rp == lp + 2 && dtype[lp + 1] >= '0' && dtype[lp + 1] <= '6') {
+		return dtype[lp + 1] - '0';
+	}
+	if (!scale_str.empty()) {
+		try {
+			int s = std::stoi(scale_str);
+			if (s >= 0 && s <= 6) {
+				return s;
+			}
+		} catch (...) {
+		}
+	}
+	return 0;
+}
+
+static bool HanaCheckExprMentionsColumn(const string &expr, const string &col) {
+	for (idx_t idx = 0; idx < expr.size();) {
+		char ch = expr[idx];
+		if (ch == '\'') {
+			idx++;
+			while (idx < expr.size()) {
+				if (expr[idx] == '\'') {
+					if (idx + 1 < expr.size() && expr[idx + 1] == '\'') {
+						idx += 2;
+						continue;
+					}
+					idx++;
+					break;
+				}
+				idx++;
+			}
+		} else if (ch == '"') {
+			idx++;
+			string ident;
+			while (idx < expr.size()) {
+				if (expr[idx] == '"') {
+					if (idx + 1 < expr.size() && expr[idx + 1] == '"') {
+						ident.push_back('"');
+						idx += 2;
+						continue;
+					}
+					idx++;
+					break;
+				}
+				ident.push_back(expr[idx]);
+				idx++;
+			}
+			if (ident == col) {
+				return true;
+			}
+		} else if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_') {
+			idx_t start = idx;
+			while (idx < expr.size() &&
+			       ((expr[idx] >= 'A' && expr[idx] <= 'Z') || (expr[idx] >= 'a' && expr[idx] <= 'z') ||
+			        (expr[idx] >= '0' && expr[idx] <= '9') || expr[idx] == '_' || expr[idx] == '$' ||
+			        expr[idx] == '#')) {
+				idx++;
+			}
+			string tok = expr.substr(start, idx - start);
+			if (tok == col || StringUtil::Upper(tok) == StringUtil::Upper(col)) {
+				return true;
+			}
+		} else {
+			idx++;
+		}
+	}
+	return false;
 }
 
 static bool ValidQuerySQL(const string &sql) {
@@ -107,11 +276,25 @@ static string DefaultLiteralSQL(ODBCDialect dialect, const string &kind, const s
 	throw BinderException("DDL default literal is unsupported");
 }
 
+struct DDLColumnSpec {
+	string name;
+	string type;
+	string native_type;
+	int32_t length = 0;
+	int32_t precision = 0;
+	int32_t scale = 0;
+	bool not_null = false;
+	bool primary_key = false;
+	bool unique = false;
+	string default_kind;
+	string default_value;
+};
+
 struct DDLIntent {
 	int32_t contract_version = 2;
 	bool conditional = false;
 	string database, schema, operation, action, name, index, owner, new_name, column_name, query_sql, sql;
-	vector<pair<string, string>> column_specs;
+	vector<DDLColumnSpec> column_specs;
 	vector<string> columns, constraints, keys;
 	string default_kind, default_value, constraint_name, constraint_kind, check_column, check_operator, check_value,
 	    reference_schema, reference_table, identity_mode;
@@ -129,7 +312,7 @@ struct DDLIntent {
 	                         int32_t scale, bool v5) {
 		if (v5) {
 			if (type == "numeric") {
-				int max_p = dialect == ODBCDialect::DB2 ? 31 : (dialect == ODBCDialect::HANA ? 34 : 38);
+				int max_p = dialect == ODBCDialect::DB2 ? 31 : 38;
 				if (length || precision < 1 || precision > max_p || scale < 0 || scale > precision)
 					throw BinderException("ODBC DDL numeric precision/scale is unsupported");
 				return "DECIMAL(" + std::to_string(precision) + "," + std::to_string(scale) + ")";
@@ -382,19 +565,21 @@ struct DDLIntent {
 			if (ct.size() != expected_fields || ct[0].first != "name" || ct[1].first != "type" ||
 			    ct[2].first != "length" || cv[2].IsNull() || cv[2].type().id() != LogicalTypeId::INTEGER)
 				throw BinderException("DDL column fields are invalid");
-			string n = Text(cv[0]), type = Text(cv[1]);
-			if (!Name(n) || std::find(seen.begin(), seen.end(), n) != seen.end())
+			DDLColumnSpec spec;
+			spec.name = Text(cv[0]);
+			spec.type = Text(cv[1]);
+			spec.length = cv[2].GetValue<int32_t>();
+			if (!Name(spec.name) || std::find(seen.begin(), seen.end(), spec.name) != seen.end())
 				throw BinderException("DDL duplicate column is invalid");
-			seen.push_back(n);
-			int32_t prec = 0, scale = 0;
+			seen.push_back(spec.name);
 			if (contract >= 5) {
 				if (ct[3].first != "precision" || ct[4].first != "scale" || cv[3].IsNull() || cv[4].IsNull() ||
 				    cv[3].type().id() != LogicalTypeId::INTEGER || cv[4].type().id() != LogicalTypeId::INTEGER)
 					throw BinderException("DDL numeric/time modifiers are invalid");
-				prec = cv[3].GetValue<int32_t>();
-				scale = cv[4].GetValue<int32_t>();
+				spec.precision = cv[3].GetValue<int32_t>();
+				spec.scale = cv[4].GetValue<int32_t>();
 			}
-			auto native = ColumnType(dialect, type, cv[2].GetValue<int32_t>(), prec, scale, contract >= 5);
+			spec.native_type = ColumnType(dialect, spec.type, spec.length, spec.precision, spec.scale, contract >= 5);
 			string extra;
 			if (contract == 6) {
 				if (ct[5].first != "not_null" || ct[6].first != "default_kind" || ct[7].first != "default_value" ||
@@ -402,20 +587,39 @@ struct DDLIntent {
 				    cv[9].IsNull() || cv[5].type().id() != LogicalTypeId::BOOLEAN ||
 				    cv[8].type().id() != LogicalTypeId::BOOLEAN || cv[9].type().id() != LogicalTypeId::BOOLEAN)
 					throw BinderException("DDL v6 column modifiers are invalid");
-				string dk = Text(cv[6]), dv = Text(cv[7]);
-				if (!dk.empty())
-					extra += " DEFAULT " + DefaultLiteralSQL(dialect, dk, dv);
-				else if (!dv.empty())
+				spec.not_null = cv[5].GetValue<bool>();
+				spec.default_kind = Text(cv[6]);
+				spec.default_value = Text(cv[7]);
+				spec.primary_key = cv[8].GetValue<bool>();
+				spec.unique = cv[9].GetValue<bool>();
+				if (!spec.default_kind.empty()) {
+					if ((spec.not_null || spec.primary_key) && spec.default_kind == "null")
+						throw BinderException("DDL NOT NULL column cannot default to NULL");
+				} else if (!spec.default_value.empty()) {
 					throw BinderException("DDL column default kind is missing");
-				if (cv[5].GetValue<bool>())
-					extra += " NOT NULL";
-				if (cv[8].GetValue<bool>())
-					extra += " PRIMARY KEY";
-				if (cv[9].GetValue<bool>())
-					extra += " UNIQUE";
+				}
+				if (dialect == ODBCDialect::DB2) {
+					if (spec.not_null || spec.primary_key)
+						extra += " NOT NULL";
+					if (!spec.default_kind.empty())
+						extra += " DEFAULT " + DefaultLiteralSQL(dialect, spec.default_kind, spec.default_value);
+					if (spec.primary_key)
+						extra += " PRIMARY KEY";
+					if (spec.unique)
+						extra += " UNIQUE";
+				} else {
+					if (!spec.default_kind.empty())
+						extra += " DEFAULT " + DefaultLiteralSQL(dialect, spec.default_kind, spec.default_value);
+					if (spec.not_null)
+						extra += " NOT NULL";
+					if (spec.primary_key)
+						extra += " PRIMARY KEY";
+					if (spec.unique)
+						extra += " UNIQUE";
+				}
 			}
-			d.columns.push_back(Quote(n) + " " + native + extra);
-			d.column_specs.emplace_back(n, native);
+			d.columns.push_back(Quote(spec.name) + " " + spec.native_type + extra);
+			d.column_specs.push_back(std::move(spec));
 		}
 		for (auto &k : keys) {
 			auto n = Text(k);
@@ -453,7 +657,7 @@ struct DDLIntent {
 			d.sql = string(d.action == "create_unique_index" ? "CREATE UNIQUE INDEX " : "CREATE INDEX ") +
 			        Quote(d.schema) + "." + Quote(d.index) + " ON " + target + " (" + StringUtil::Join(ks, ",") + ")";
 		} else if (d.action == "drop_index") {
-			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty() || !d.owner.empty())
+			if (!d.columns.empty() || !d.keys.empty() || !d.index.empty())
 				throw BinderException("DDL drop index options are invalid");
 			d.sql = "DROP INDEX " + target;
 		} else if (d.action == "rename_table") {
@@ -490,17 +694,19 @@ struct DDLIntent {
 			else
 				d.sql = "ALTER TABLE " + target + " RENAME COLUMN " + Quote(d.column_name) + " TO " + Quote(d.new_name);
 		} else if (d.action == "alter_column_type") {
-			if (d.column_specs.size() != 1 || d.column_name.empty() || d.column_specs[0].first != d.column_name)
+			if (d.column_specs.size() != 1 || d.column_name.empty() || d.column_specs[0].name != d.column_name)
 				throw BinderException("DDL alter column type options are invalid");
 			if (dialect == ODBCDialect::DAMENG)
-				d.sql = "ALTER TABLE " + target + " MODIFY " + Quote(d.column_name) + " " + d.column_specs[0].second;
+				d.sql =
+				    "ALTER TABLE " + target + " MODIFY " + Quote(d.column_name) + " " + d.column_specs[0].native_type;
 			else if (dialect == ODBCDialect::DB2)
 				d.sql = "ALTER TABLE " + target + " ALTER COLUMN " + Quote(d.column_name) + " SET DATA TYPE " +
-				        d.column_specs[0].second;
+				        d.column_specs[0].native_type;
 			else
-				d.sql = "ALTER TABLE " + target + " ALTER (" + Quote(d.column_name) + " " + d.column_specs[0].second + ")";
+				d.sql = "ALTER TABLE " + target + " ALTER (" + Quote(d.column_name) + " " +
+				        d.column_specs[0].native_type + ")";
 		} else if (d.action == "rename_index") {
-			if (!d.columns.empty() || !d.keys.empty() || !d.owner.empty() || d.new_name.empty() || d.new_name == d.name)
+			if (!d.columns.empty() || !d.keys.empty() || d.new_name.empty() || d.new_name == d.name)
 				throw BinderException("DDL rename index options are invalid");
 			if (dialect == ODBCDialect::DAMENG)
 				d.sql = "ALTER INDEX " + target + " RENAME TO " + Quote(d.new_name);
@@ -531,7 +737,7 @@ struct DDLIntent {
 			if (d.column_name.empty())
 				throw BinderException("DDL default column is missing");
 			if (dialect == ODBCDialect::DAMENG)
-				d.sql = "ALTER TABLE " + target + " MODIFY " + Quote(d.column_name) + " DEFAULT NULL";
+				d.sql = "ALTER TABLE " + target + " ALTER COLUMN " + Quote(d.column_name) + " DROP DEFAULT";
 			else if (dialect == ODBCDialect::DB2)
 				d.sql = "ALTER TABLE " + target + " ALTER COLUMN " + Quote(d.column_name) + " DROP DEFAULT";
 		} else if (d.action == "set_not_null" || d.action == "drop_not_null") {
@@ -631,6 +837,7 @@ public:
 	}
 	string product, sqlstate;
 	SQLINTEGER native_code = 0;
+	int64_t last_warning_count = 0;
 	GuardedODBCSourceError source;
 	std::atomic<bool> cancelled {false};
 
@@ -697,6 +904,9 @@ public:
 		SQLFreeStmt(stmt.get(), SQL_CLOSE);
 		SQLFreeStmt(stmt.get(), SQL_RESET_PARAMS);
 		auto rc = SQLExecDirect(stmt.get(), reinterpret_cast<SQLCHAR *>(const_cast<char *>(sql.c_str())), SQL_NTS);
+		if (rc == SQL_SUCCESS_WITH_INFO) {
+			last_warning_count++;
+		}
 		if (rc != SQL_NO_DATA && !CheckRC(rc))
 			throw IOException("ODBC DDL execution failed");
 	}
@@ -735,50 +945,142 @@ static ODBCDialect DialectFromFn(const string &fn_name) {
 }
 
 static string FormatHanaColumnType(const string &data_type, const string &len_s, const string &scale_s) {
-	auto u = StringUtil::Upper(data_type);
-	if (u == "VARCHAR" || u == "NVARCHAR" || u == "ALPHANUM" || u == "VARBINARY" || u == "BINARY")
-		return u + "(" + len_s + ")";
-	if (u == "DECIMAL")
-		return u + "(" + len_s + "," + scale_s + ")";
+	auto u = StringUtil::Upper(Trimmed(data_type));
+	if (u == "VARCHAR" || u == "NVARCHAR" || u == "ALPHANUM" || u == "VARBINARY" || u == "BINARY" || u == "CHAR" ||
+	    u == "NCHAR")
+		return u + "(" + Trimmed(len_s) + ")";
+	if (u == "DECIMAL") {
+		if (scale_s == "-1" || scale_s.empty()) {
+			RejectGuard("0A000", "source_definition", "unconstrained HANA DECIMAL alter is unsupported");
+		}
+		return u + "(" + Trimmed(len_s) + "," + Trimmed(scale_s) + ")";
+	}
 	return u;
 }
 
-static bool VerifyDialectIdentity(ODBCDialect dialect, SQLHDBC dbc, DDLSession &s, string &version, string &db_name) {
+struct ServerFacts {
+	string version;
+	string database_name;
+	string database_identity;
+	string server_identity;
+	string schema_id;
+	string session_user;
+	string current_schema;
+	bool read_only = false;
+};
+
+static bool QueryDialectFacts(ODBCDialect dialect, SQLHDBC dbc, DDLSession &s, const string &schema,
+                              ServerFacts &facts) {
 	auto dbms = Info(dbc, SQL_DBMS_NAME);
 	if (dialect == ODBCDialect::DAMENG) {
-		if (dbms != "DM DATABASE MANAGEMENT SYSTEM")
+		if (StringUtil::Upper(dbms) != "DM DATABASE MANAGEMENT SYSTEM")
 			return false;
-		version = Info(dbc, SQL_DBMS_VER);
-		try {
-			db_name = s.Scalar("SELECT NAME FROM V$DATABASE");
-		} catch (...) {
-			db_name = Info(dbc, SQL_DATABASE_NAME);
+		facts.version = Trimmed(Info(dbc, SQL_DBMS_VER));
+		if (facts.version.empty())
+			return false;
+		auto modes = s.Query("SELECT PARA_VALUE FROM V$DM_INI WHERE PARA_NAME='COMPATIBLE_MODE'");
+		if (modes.size() != 1 || Trimmed(modes[0][0]) != "0")
+			return false;
+		auto db_rows = s.Query("SELECT COALESCE(NAME,''), COALESCE(USER,''), "
+		                       "COALESCE(SYS_CONTEXT('USERENV','CURRENT_SCHEMA'),'') FROM V$DATABASE");
+		auto inst_rows =
+		    s.Query("SELECT COALESCE(INSTANCE_NAME,''), COALESCE(HOST_NAME,''), COALESCE(STATUS$,'') FROM V$INSTANCE");
+		if (db_rows.size() == 1 && db_rows[0].size() == 3) {
+			facts.database_name = Trimmed(db_rows[0][0]);
+			facts.session_user = Trimmed(db_rows[0][1]);
+			facts.current_schema = Trimmed(db_rows[0][2]);
+		} else {
+			facts.database_name = Trimmed(Info(dbc, SQL_DATABASE_NAME));
 		}
-		return !version.empty();
+		string inst_name, host_name;
+		if (inst_rows.size() == 1 && inst_rows[0].size() == 3) {
+			inst_name = Trimmed(inst_rows[0][0]);
+			host_name = Trimmed(inst_rows[0][1]);
+			facts.read_only = StringUtil::Upper(Trimmed(inst_rows[0][2])) != "OPEN";
+		}
+		facts.database_identity = inst_name.empty() ? facts.database_name : (facts.database_name + ":" + inst_name);
+		facts.server_identity = inst_name.empty() ? host_name : (host_name + ":" + inst_name);
+		auto sch_rows =
+		    s.Query("SELECT COALESCE(MAX(CAST(ID AS VARCHAR(32))),'') FROM SYS.SYSOBJECTS WHERE TYPE$='SCH' AND NAME=?",
+		            {schema});
+		if (sch_rows.size() == 1 && !sch_rows[0].empty())
+			facts.schema_id = Trimmed(sch_rows[0][0]);
+		return !facts.version.empty() && !facts.database_name.empty();
 	}
 	if (dialect == ODBCDialect::DB2) {
 		if (dbms.find("DB2/") != 0)
 			return false;
-		version = Info(dbc, SQL_DBMS_VER);
-		db_name = s.Scalar("SELECT RTRIM(CURRENT SERVER) FROM SYSIBM.SYSDUMMY1");
-		return !version.empty() && !db_name.empty();
+		facts.version = Trimmed(Info(dbc, SQL_DBMS_VER));
+		auto id_rows =
+		    s.Query("SELECT RTRIM(CURRENT SERVER), RTRIM(CURRENT USER), RTRIM(CURRENT SCHEMA) FROM SYSIBM.SYSDUMMY1");
+		if (id_rows.size() != 1 || id_rows[0].size() != 3)
+			return false;
+		facts.database_name = Trimmed(id_rows[0][0]);
+		facts.session_user = Trimmed(id_rows[0][1]);
+		facts.current_schema = Trimmed(id_rows[0][2]);
+		string inst_name, host_name;
+		try {
+			auto inst_rows = s.Query("SELECT RTRIM(INST_NAME), RTRIM(SERVICE_LEVEL) FROM SYSIBMADM.ENV_INST_INFO");
+			if (inst_rows.size() == 1 && inst_rows[0].size() == 2) {
+				inst_name = Trimmed(inst_rows[0][0]);
+				if (!Trimmed(inst_rows[0][1]).empty())
+					facts.version = Trimmed(inst_rows[0][1]);
+			}
+			auto sys_rows = s.Query("SELECT RTRIM(HOST_NAME) FROM SYSIBMADM.ENV_SYS_INFO");
+			if (sys_rows.size() == 1 && !sys_rows[0].empty())
+				host_name = Trimmed(sys_rows[0][0]);
+			auto hadr_rows = s.Query("SELECT COALESCE(VALUE,'') FROM SYSIBMADM.DBCFG WHERE NAME='hadr_db_role'");
+			if (!hadr_rows.empty() && StringUtil::Upper(Trimmed(hadr_rows[0][0])) == "STANDBY")
+				facts.read_only = true;
+		} catch (...) {
+		}
+		facts.database_identity = inst_name.empty() ? facts.database_name : (facts.database_name + ":" + inst_name);
+		facts.server_identity = inst_name.empty() ? host_name : (host_name + ":" + inst_name);
+		auto sch_rows =
+		    s.Query("SELECT RTRIM(SCHEMANAME), RTRIM(CHAR(CREATE_TIME)) FROM SYSCAT.SCHEMATA WHERE SCHEMANAME=?",
+		            {schema});
+		if (sch_rows.size() == 1 && sch_rows[0].size() == 2)
+			facts.schema_id = Trimmed(sch_rows[0][0]) + ":" + Trimmed(sch_rows[0][1]);
+		return !facts.version.empty() && !facts.database_name.empty();
 	}
 	auto lower = StringUtil::Lower(dbms);
 	if (lower.find("hdb") == string::npos && lower.find("hana") == string::npos)
 		return false;
-	auto rows = s.Query("SELECT DATABASE_NAME,VERSION FROM SYS.M_DATABASE");
-	if (rows.size() != 1 || rows[0].size() != 2)
+	auto db_rows = s.Query("SELECT SYSTEM_ID, DATABASE_NAME, HOST, VERSION FROM SYS.M_DATABASE");
+	if (db_rows.size() != 1 || db_rows[0].size() != 4)
 		return false;
-	db_name = rows[0][0];
-	version = rows[0][1];
-	return !version.empty();
+	string sys_id = Trimmed(db_rows[0][0]);
+	facts.database_name = Trimmed(db_rows[0][1]);
+	string host_name = Trimmed(db_rows[0][2]);
+	facts.version = Trimmed(db_rows[0][3]);
+	if (facts.version.empty())
+		facts.version = Trimmed(Info(dbc, SQL_DBMS_VER));
+	facts.database_identity = sys_id + ":" + facts.database_name;
+	facts.server_identity = host_name + ":" + sys_id;
+	try {
+		auto ctx_rows = s.Query("SELECT CURRENT_USER, CURRENT_SCHEMA FROM DUMMY");
+		if (ctx_rows.size() == 1 && ctx_rows[0].size() == 2) {
+			facts.session_user = Trimmed(ctx_rows[0][0]);
+			facts.current_schema = Trimmed(ctx_rows[0][1]);
+		}
+	} catch (...) {
+	}
+	auto sch_rows = s.Query("SELECT SCHEMA_NAME, TO_VARCHAR(CREATE_TIME,'YYYY-MM-DD HH24:MI:SS.FF7') "
+	                        "FROM SYS.SCHEMAS WHERE SCHEMA_NAME=?",
+	                        {schema});
+	if (sch_rows.size() == 1 && sch_rows[0].size() == 2)
+		facts.schema_id = Trimmed(sch_rows[0][0]) + ":" + Trimmed(sch_rows[0][1]);
+	return !facts.version.empty() && !facts.database_name.empty();
 }
 
-struct CapData : TableFunctionData {
+struct MetaData : TableFunctionData {
 	ODBCCatalog &catalog;
 	ODBCDialect dialect;
 	string schema;
-	CapData(ODBCCatalog &c, ODBCDialect d) : catalog(c), dialect(d) {
+	string kind;
+	string name;
+	bool describe = false;
+	MetaData(ODBCCatalog &c, ODBCDialect d, bool desc) : catalog(c), dialect(d), describe(desc) {
 	}
 };
 
@@ -799,10 +1101,14 @@ static unique_ptr<GlobalTableFunctionState> InitOne(ClientContext &, TableFuncti
 	return make_uniq<OneRowState>();
 }
 
-static unique_ptr<FunctionData> BindCapabilities(ClientContext &ctx, TableFunctionBindInput &in,
-                                                 vector<LogicalType> &types, vector<Identifier> &names) {
-	if (in.inputs.size() != 2 || in.inputs[0].IsNull() || in.inputs[1].IsNull())
-		throw BinderException("ODBC DDL capability input is incomplete");
+static unique_ptr<FunctionData> BindMetadata(ClientContext &ctx, TableFunctionBindInput &in,
+                                             vector<LogicalType> &types, vector<Identifier> &names) {
+	const bool describe = in.inputs.size() == 4;
+	if ((in.inputs.size() != 2 && !describe))
+		throw BinderException("ODBC DDL metadata input count is invalid");
+	for (auto &v : in.inputs)
+		if (v.IsNull())
+			throw BinderException("ODBC DDL metadata input is incomplete");
 	auto dialect = DialectFromFn(in.table_function.GetName().GetIdentifierName());
 	auto db = DatabaseManager::Get(ctx).GetDatabase(ctx, Identifier(in.inputs[0].GetValue<string>()));
 	if (!db || db->GetCatalog().GetCatalogType() != "odbc_catalog")
@@ -810,21 +1116,27 @@ static unique_ptr<FunctionData> BindCapabilities(ClientContext &ctx, TableFuncti
 	auto &catalog = db->GetCatalog().Cast<ODBCCatalog>();
 	if (catalog.GetDialect() != dialect)
 		throw BinderException("ODBC DDL catalog dialect mismatch");
-	auto d = make_uniq<CapData>(catalog, dialect);
+	auto d = make_uniq<MetaData>(catalog, dialect, describe);
 	d->schema = in.inputs[1].GetValue<string>();
 	if (!DDLIntent::Name(d->schema))
 		throw BinderException("ODBC DDL schema name is invalid");
+	if (describe) {
+		d->kind = in.inputs[2].GetValue<string>();
+		d->name = in.inputs[3].GetValue<string>();
+		if ((d->kind != "table" && d->kind != "index") || !DDLIntent::Name(d->name))
+			throw BinderException("ODBC DDL describe target is invalid");
+	}
 	names = {"sqlstate", "stage", "document"};
 	types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
 	return std::move(d);
 }
 
-static void ScanCapabilities(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
+static void ScanMetadata(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	auto &state = in.global_state->Cast<OneRowState>();
 	if (state.done)
 		return;
 	state.done = true;
-	auto &d = in.bind_data->Cast<CapData>();
+	auto &d = in.bind_data->Cast<MetaData>();
 	string product = ODBCDialectUtil::Name(d.dialect);
 	string sqlstate, stage = "source_identity", document;
 	shared_ptr<ODBCConnection> connection;
@@ -832,37 +1144,345 @@ static void ScanCapabilities(ClientContext &ctx, TableFunctionInput &in, DataChu
 	try {
 		if (ctx.IsInterrupted())
 			throw InterruptException();
-		connection = ODBCConnection::Open(ODBCTypeConfig(ctx), d.catalog.connection_string, 5);
+		connection = ODBCConnection::Open(ODBCTypeConfig(ctx, d.dialect), d.catalog.connection_string, 5);
 		auto dbc = connection->GetConn();
 		session = make_uniq<DDLSession>(ctx, dbc, product, 10);
-		string version, db_name;
-		if (!VerifyDialectIdentity(d.dialect, dbc, *session, version, db_name)) {
+		auto &s = *session;
+		ServerFacts facts;
+		if (!QueryDialectFacts(d.dialect, dbc, s, d.schema, facts)) {
 			sqlstate = "0A000";
 			throw IOException("ODBC DDL identity not certified");
 		}
 		stage = "source_metadata";
-		bool read_only = false;
 		SQLULEN mode = SQL_MODE_READ_WRITE;
 		if (SQL_SUCCEEDED(SQLGetConnectAttr(dbc, SQL_ATTR_ACCESS_MODE, &mode, sizeof(mode), nullptr)) &&
 		    mode == SQL_MODE_READ_ONLY)
-			read_only = true;
-		bool ns_present = false;
-		if (d.dialect == ODBCDialect::DAMENG) {
-			ns_present =
-			    session->Scalar("SELECT COUNT(*) FROM SYS.SYSOBJECTS WHERE TYPE$='SCH' AND NAME=?", {d.schema}) == "1";
-		} else if (d.dialect == ODBCDialect::DB2) {
-			ns_present =
-			    session->Scalar("SELECT VARCHAR(COUNT(*)) FROM SYSCAT.SCHEMATA WHERE SCHEMANAME=?", {d.schema}) == "1";
+			facts.read_only = true;
+		const bool ns_present = !facts.schema_id.empty();
+
+		if (!d.describe) {
+			document = string("{") + "\"contract_version\":1,\"product\":" + JSON(product) +
+			           ",\"source_version\":" + JSON(facts.version) + ",\"database\":" + JSON(facts.database_name) +
+			           ",\"database_identity\":" + JSON(facts.database_identity) +
+			           ",\"server_identity\":" + JSON(facts.server_identity) + ",\"schema\":" + JSON(d.schema) +
+			           ",\"namespace_identity\":" + JSON(facts.schema_id) +
+			           ",\"namespace_present\":" + (ns_present ? "true" : "false") +
+			           ",\"source_read_only\":" + (facts.read_only ? "true" : "false") +
+			           ",\"session_identity\":{\"user\":" + JSON(facts.session_user) +
+			           ",\"current_schema\":" + JSON(facts.current_schema) +
+			           "},\"visibility\":\"CATALOG_READ\",\"executor_available\":true" +
+			           ",\"identity_protection\":\"UNVERIFIED\"}";
 		} else {
-			ns_present =
-			    session->Scalar("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM SYS.SCHEMAS WHERE SCHEMA_NAME=?",
-			                    {d.schema}) == "1";
+			string presence = "ABSENT";
+			string object_identity, observed_kind, owning_table, table_identity;
+			bool has_reorg_flag = false;
+			bool reorg_pending = false;
+			string cols_json = "[]", indexes_json = "[]", constraints_json = "[]";
+			if (ns_present && d.dialect == ODBCDialect::DB2) {
+				if (d.kind == "table") {
+					auto objs = s.Query(
+					    "SELECT RTRIM(CHAR(t.TBSPACEID)),RTRIM(CHAR(t.TABLEID)),RTRIM(CHAR(t.CREATE_TIME)),t.TYPE,"
+					    "COALESCE(a.REORG_PENDING,'N') FROM SYSCAT.TABLES t "
+					    "LEFT JOIN SYSIBMADM.ADMINTABINFO a ON a.TABSCHEMA=t.TABSCHEMA AND a.TABNAME=t.TABNAME "
+					    "WHERE t.TABSCHEMA=? AND t.TABNAME=? AND t.TYPE IN ('T','V')",
+					    {d.schema, d.name});
+					if (objs.size() == 1) {
+						presence = "PRESENT";
+						object_identity = objs[0][0] + ":" + objs[0][1] + ":" + objs[0][2];
+						observed_kind = objs[0][3] == "V" ? "v" : "r";
+						if (observed_kind == "r") {
+							has_reorg_flag = true;
+							reorg_pending = Trimmed(objs[0][4]) == "Y";
+						}
+						auto col_rows = s.Query(
+						    "SELECT RTRIM(CHAR(c.COLNO + 1)),c.COLNAME,RTRIM(c.TYPENAME),"
+						    "RTRIM(CHAR(c.LENGTH)),COALESCE(RTRIM(CHAR(c.SCALE)),'0'),c.NULLS,"
+						    "CASE WHEN c.DEFAULT IS NOT NULL THEN '1' ELSE '0' END "
+						    "FROM SYSCAT.COLUMNS c WHERE c.TABSCHEMA=? AND c.TABNAME=? ORDER BY c.COLNO",
+						    {d.schema, d.name});
+						cols_json = "[";
+						for (idx_t idx = 0; idx < col_rows.size() && idx < 256; idx++) {
+							if (idx > 0)
+								cols_json += ",";
+							auto &r = col_rows[idx];
+							cols_json += "{\"ordinal\":" + r[0] + ",\"name\":" + JSON(r[1]) +
+							             ",\"type\":" + JSON(r[2]) + ",\"length\":" + (r[3].empty() ? "0" : r[3]) +
+							             ",\"precision\":null,\"scale\":" + (r[4].empty() ? "0" : r[4]) +
+							             ",\"nullable\":" + (r[5] == "Y" ? "true" : "false") +
+							             ",\"has_default\":" + (r[6] == "1" ? "true" : "false") + "}";
+						}
+						cols_json += "]";
+
+						auto idx_rows = s.Query(
+						    "SELECT i.INDNAME,RTRIM(i.INDEXTYPE),i.UNIQUERULE "
+						    "FROM SYSCAT.INDEXES i WHERE i.TABSCHEMA=? AND i.TABNAME=? ORDER BY i.INDNAME",
+						    {d.schema, d.name});
+						indexes_json = "[";
+						for (idx_t idx = 0; idx < idx_rows.size() && idx < 256; idx++) {
+							if (idx > 0)
+								indexes_json += ",";
+							auto &r = idx_rows[idx];
+							bool uniq = r[2] == "U" || r[2] == "P";
+							indexes_json += "{\"table\":" + JSON(d.name) + ",\"name\":" + JSON(r[0]) +
+							                ",\"type\":" + JSON(r[1]) + ",\"unique\":" + (uniq ? "true" : "false") +
+							                "}";
+						}
+						indexes_json += "]";
+
+						auto con_rows = s.Query(
+						    "SELECT c.CONSTNAME,c.TYPE,c.ENFORCED,c.CHECKEXISTINGDATA "
+						    "FROM SYSCAT.TABCONST c WHERE c.TABSCHEMA=? AND c.TABNAME=? "
+						    "AND c.TYPE IN ('P','U','F','K') ORDER BY c.CONSTNAME",
+						    {d.schema, d.name});
+						constraints_json = "[";
+						for (idx_t idx = 0; idx < con_rows.size() && idx < 256; idx++) {
+							if (idx > 0)
+								constraints_json += ",";
+							auto &r = con_rows[idx];
+							constraints_json += "{\"name\":" + JSON(r[0]) + ",\"type\":" + JSON(r[1]) +
+							                    ",\"enforced\":" + JSON(r[2]) +
+							                    ",\"check_existing_data\":" + JSON(r[3]) + "}";
+						}
+						constraints_json += "]";
+					}
+				} else if (d.kind == "index") {
+					auto idx_rows = s.Query(
+					    "SELECT RTRIM(CHAR(i.TBSPACEID)),RTRIM(CHAR(i.INDEX_OBJECTID)),RTRIM(CHAR(i.IID)),"
+					    "i.TABNAME,i.UNIQUERULE,RTRIM(CHAR(t.TBSPACEID)),RTRIM(CHAR(t.TABLEID)),"
+					    "RTRIM(CHAR(t.CREATE_TIME)) FROM SYSCAT.INDEXES i "
+					    "JOIN SYSCAT.TABLES t ON t.TABSCHEMA=i.TABSCHEMA AND t.TABNAME=i.TABNAME "
+					    "WHERE i.INDSCHEMA=? AND i.INDNAME=? AND i.TABSCHEMA=? ORDER BY i.TABNAME",
+					    {d.schema, d.name, d.schema});
+					indexes_json = "[";
+					for (idx_t idx = 0; idx < idx_rows.size() && idx < 256; idx++) {
+						if (idx > 0)
+							indexes_json += ",";
+						auto &r = idx_rows[idx];
+						bool uniq = r[4] == "U" || r[4] == "P";
+						indexes_json += "{\"table\":" + JSON(r[3]) + ",\"name\":" + JSON(d.name) +
+						                ",\"unique\":" + (uniq ? "true" : "false") + "}";
+					}
+					indexes_json += "]";
+					if (idx_rows.size() == 1) {
+						presence = "PRESENT";
+						object_identity = idx_rows[0][0] + ":" + idx_rows[0][1] + ":" + idx_rows[0][2];
+						owning_table = idx_rows[0][3];
+						table_identity = idx_rows[0][5] + ":" + idx_rows[0][6] + ":" + idx_rows[0][7];
+						observed_kind = "i";
+					} else if (idx_rows.size() > 1) {
+						presence = "UNKNOWN";
+					}
+				}
+			} else if (ns_present && d.dialect == ODBCDialect::DAMENG) {
+				if (d.kind == "table") {
+					auto objs = s.Query(
+					    "SELECT CAST(o.OBJECT_ID AS VARCHAR(32)),o.OBJECT_TYPE FROM ALL_OBJECTS o "
+					    "WHERE o.OWNER=? AND o.OBJECT_NAME=? AND o.OBJECT_TYPE IN ('TABLE','VIEW') "
+					    "AND o.SUBOBJECT_NAME IS NULL",
+					    {d.schema, d.name});
+					if (objs.size() == 1) {
+						presence = "PRESENT";
+						object_identity = objs[0][0];
+						observed_kind = objs[0][1] == "VIEW" ? "v" : "r";
+						auto col_rows = s.Query(
+						    "SELECT CAST(c.COLUMN_ID AS VARCHAR(20)),c.COLUMN_NAME,c.DATA_TYPE,"
+						    "COALESCE(CAST(c.DATA_LENGTH AS VARCHAR(20)),'0'),"
+						    "COALESCE(CAST(c.DATA_PRECISION AS VARCHAR(20)),''),"
+						    "COALESCE(CAST(c.DATA_SCALE AS VARCHAR(20)),''),c.NULLABLE,"
+						    "CASE WHEN COALESCE(c.DEFAULT_LENGTH,0)>0 THEN '1' ELSE '0' END "
+						    "FROM ALL_TAB_COLUMNS c WHERE c.OWNER=? AND c.TABLE_NAME=? ORDER BY c.COLUMN_ID",
+						    {d.schema, d.name});
+						cols_json = "[";
+						for (idx_t idx = 0; idx < col_rows.size() && idx < 256; idx++) {
+							if (idx > 0)
+								cols_json += ",";
+							auto &r = col_rows[idx];
+							cols_json += "{\"ordinal\":" + r[0] + ",\"name\":" + JSON(r[1]) +
+							             ",\"type\":" + JSON(r[2]) + ",\"length\":" + r[3] +
+							             ",\"precision\":" + (r[4].empty() ? "null" : r[4]) +
+							             ",\"scale\":" + (r[5].empty() ? "null" : r[5]) +
+							             ",\"nullable\":" + (r[6] == "Y" ? "true" : "false") +
+							             ",\"has_default\":" + (r[7] == "1" ? "true" : "false") + "}";
+						}
+						cols_json += "]";
+
+						auto idx_rows = s.Query(
+						    "SELECT i.INDEX_NAME,i.INDEX_TYPE,i.UNIQUENESS,i.STATUS FROM ALL_INDEXES i "
+						    "WHERE i.TABLE_OWNER=? AND i.TABLE_NAME=? ORDER BY i.INDEX_NAME",
+						    {d.schema, d.name});
+						indexes_json = "[";
+						for (idx_t idx = 0; idx < idx_rows.size() && idx < 256; idx++) {
+							if (idx > 0)
+								indexes_json += ",";
+							auto &r = idx_rows[idx];
+							indexes_json += "{\"table\":" + JSON(d.name) + ",\"name\":" + JSON(r[0]) +
+							                ",\"type\":" + JSON(r[1]) +
+							                ",\"unique\":" + (r[2] == "UNIQUE" ? "true" : "false") +
+							                ",\"status\":" + JSON(r[3]) + "}";
+						}
+						indexes_json += "]";
+
+						auto con_rows = s.Query(
+						    "SELECT c.CONSTRAINT_NAME,c.CONSTRAINT_TYPE,c.STATUS,c.VALIDATED "
+						    "FROM ALL_CONSTRAINTS c WHERE c.OWNER=? AND c.TABLE_NAME=? "
+						    "AND c.CONSTRAINT_TYPE IN ('P','U','R','C') ORDER BY c.CONSTRAINT_NAME",
+						    {d.schema, d.name});
+						constraints_json = "[";
+						for (idx_t idx = 0; idx < con_rows.size() && idx < 256; idx++) {
+							if (idx > 0)
+								constraints_json += ",";
+							auto &r = con_rows[idx];
+							constraints_json += "{\"name\":" + JSON(r[0]) + ",\"type\":" + JSON(r[1]) +
+							                    ",\"status\":" + JSON(r[2]) + ",\"validated\":" + JSON(r[3]) + "}";
+						}
+						constraints_json += "]";
+					}
+				} else if (d.kind == "index") {
+					auto idx_rows = s.Query(
+					    "SELECT CAST(o.OBJECT_ID AS VARCHAR(32)),i.TABLE_NAME,CAST(t.OBJECT_ID AS VARCHAR(32)),"
+					    "i.UNIQUENESS FROM ALL_INDEXES i "
+					    "JOIN ALL_OBJECTS o ON o.OWNER=i.OWNER AND o.OBJECT_NAME=i.INDEX_NAME AND o.OBJECT_TYPE='INDEX' "
+					    "JOIN ALL_OBJECTS t ON t.OWNER=i.TABLE_OWNER AND t.OBJECT_NAME=i.TABLE_NAME AND "
+					    "t.OBJECT_TYPE='TABLE' WHERE i.OWNER=? AND i.INDEX_NAME=? AND o.SUBOBJECT_NAME IS NULL "
+					    "AND t.SUBOBJECT_NAME IS NULL ORDER BY i.TABLE_NAME",
+					    {d.schema, d.name});
+					indexes_json = "[";
+					for (idx_t idx = 0; idx < idx_rows.size() && idx < 256; idx++) {
+						if (idx > 0)
+							indexes_json += ",";
+						auto &r = idx_rows[idx];
+						indexes_json += "{\"table\":" + JSON(r[1]) + ",\"name\":" + JSON(d.name) +
+						                ",\"unique\":" + (r[3] == "UNIQUE" ? "true" : "false") + "}";
+					}
+					indexes_json += "]";
+					if (idx_rows.size() == 1) {
+						presence = "PRESENT";
+						object_identity = idx_rows[0][0];
+						owning_table = idx_rows[0][1];
+						table_identity = idx_rows[0][2];
+						observed_kind = "i";
+					} else if (idx_rows.size() > 1) {
+						presence = "UNKNOWN";
+					}
+				}
+			} else if (ns_present && d.dialect == ODBCDialect::HANA) {
+				if (d.kind == "table") {
+					auto tbls = s.Query(
+					    "SELECT TO_VARCHAR(TABLE_OID),TABLE_TYPE,TO_VARCHAR(CREATE_TIME,'YYYY-MM-DD HH24:MI:SS.FF7') "
+					    "FROM SYS.TABLES WHERE SCHEMA_NAME=? AND TABLE_NAME=?",
+					    {d.schema, d.name});
+					if (tbls.size() == 1) {
+						presence = "PRESENT";
+						object_identity = tbls[0][0] + ":" + tbls[0][2];
+						observed_kind = "r";
+						auto col_rows = s.Query(
+						    "SELECT TO_VARCHAR(POSITION),COLUMN_NAME,DATA_TYPE_NAME,"
+						    "COALESCE(TO_VARCHAR(LENGTH),'0'),COALESCE(TO_VARCHAR(SCALE),'0'),IS_NULLABLE,"
+						    "CASE WHEN DEFAULT_VALUE IS NOT NULL THEN '1' ELSE '0' END "
+						    "FROM SYS.TABLE_COLUMNS WHERE SCHEMA_NAME=? AND TABLE_NAME=? ORDER BY POSITION",
+						    {d.schema, d.name});
+						cols_json = "[";
+						for (idx_t idx = 0; idx < col_rows.size() && idx < 256; idx++) {
+							if (idx > 0)
+								cols_json += ",";
+							auto &r = col_rows[idx];
+							cols_json += "{\"ordinal\":" + r[0] + ",\"name\":" + JSON(r[1]) +
+							             ",\"type\":" + JSON(r[2]) + ",\"length\":" + r[3] + ",\"scale\":" + r[4] +
+							             ",\"nullable\":" + (r[5] == "TRUE" ? "true" : "false") +
+							             ",\"has_default\":" + (r[6] == "1" ? "true" : "false") + "}";
+						}
+						cols_json += "]";
+
+						auto idx_rows = s.Query(
+						    "SELECT INDEX_NAME,INDEX_TYPE,COALESCE(CONSTRAINT,'') "
+						    "FROM SYS.INDEXES WHERE SCHEMA_NAME=? AND TABLE_NAME=? ORDER BY INDEX_NAME",
+						    {d.schema, d.name});
+						indexes_json = "[";
+						for (idx_t idx = 0; idx < idx_rows.size() && idx < 256; idx++) {
+							if (idx > 0)
+								indexes_json += ",";
+							auto &r = idx_rows[idx];
+							bool uniq = r[2] == "PRIMARY KEY" || r[2] == "UNIQUE" || r[2] == "NOT NULL UNIQUE" ||
+							            StringUtil::EndsWith(r[1], " UNIQUE");
+							indexes_json += "{\"table\":" + JSON(d.name) + ",\"name\":" + JSON(r[0]) +
+							                ",\"type\":" + JSON(r[1]) + ",\"unique\":" + (uniq ? "true" : "false") +
+							                "}";
+						}
+						indexes_json += "]";
+
+						auto con_rows = s.Query(
+						    "SELECT CONSTRAINT_NAME, CASE WHEN MAX(IS_PRIMARY_KEY)='TRUE' THEN 'P' "
+						    "WHEN MAX(IS_UNIQUE_KEY)='TRUE' THEN 'U' ELSE 'C' END AS KIND "
+						    "FROM SYS.CONSTRAINTS WHERE SCHEMA_NAME=? AND TABLE_NAME=? GROUP BY CONSTRAINT_NAME "
+						    "UNION ALL SELECT CONSTRAINT_NAME,'F' FROM SYS.REFERENTIAL_CONSTRAINTS "
+						    "WHERE SCHEMA_NAME=? AND TABLE_NAME=? ORDER BY 1",
+						    {d.schema, d.name, d.schema, d.name});
+						constraints_json = "[";
+						for (idx_t idx = 0; idx < con_rows.size() && idx < 256; idx++) {
+							if (idx > 0)
+								constraints_json += ",";
+							auto &r = con_rows[idx];
+							constraints_json += "{\"name\":" + JSON(r[0]) + ",\"type\":" + JSON(r[1]) + "}";
+						}
+						constraints_json += "]";
+					} else {
+						auto views =
+						    s.Query("SELECT TO_VARCHAR(VIEW_OID) FROM SYS.VIEWS WHERE SCHEMA_NAME=? AND VIEW_NAME=?",
+						            {d.schema, d.name});
+						if (views.size() == 1) {
+							presence = "PRESENT";
+							object_identity = views[0][0];
+							observed_kind = "v";
+						}
+					}
+				} else if (d.kind == "index") {
+					auto idx_rows = s.Query(
+					    "SELECT TO_VARCHAR(i.INDEX_OID),i.TABLE_NAME,TO_VARCHAR(t.TABLE_OID),"
+					    "TO_VARCHAR(t.CREATE_TIME,'YYYY-MM-DD HH24:MI:SS.FF7'),i.INDEX_TYPE,COALESCE(i.CONSTRAINT,'') "
+					    "FROM SYS.INDEXES i JOIN SYS.TABLES t ON t.SCHEMA_NAME=i.SCHEMA_NAME AND t.TABLE_NAME=i.TABLE_NAME "
+					    "WHERE i.SCHEMA_NAME=? AND i.INDEX_NAME=? ORDER BY i.TABLE_NAME",
+					    {d.schema, d.name});
+					indexes_json = "[";
+					for (idx_t idx = 0; idx < idx_rows.size() && idx < 256; idx++) {
+						if (idx > 0)
+							indexes_json += ",";
+						auto &r = idx_rows[idx];
+						bool uniq = r[5] == "PRIMARY KEY" || r[5] == "UNIQUE" || r[5] == "NOT NULL UNIQUE" ||
+						            StringUtil::EndsWith(r[4], " UNIQUE");
+						indexes_json += "{\"table\":" + JSON(r[1]) + ",\"name\":" + JSON(d.name) +
+						                ",\"unique\":" + (uniq ? "true" : "false") + "}";
+					}
+					indexes_json += "]";
+					if (idx_rows.size() == 1) {
+						presence = "PRESENT";
+						object_identity = idx_rows[0][0];
+						owning_table = idx_rows[0][1];
+						table_identity = idx_rows[0][2] + ":" + idx_rows[0][3];
+						observed_kind = "i";
+					} else if (idx_rows.size() > 1) {
+						presence = "UNKNOWN";
+					}
+				}
+			}
+			document = string("{") + "\"contract_version\":1,\"product\":" + JSON(product) +
+			           ",\"source_version\":" + JSON(facts.version) + ",\"database\":" + JSON(facts.database_name) +
+			           ",\"database_identity\":" + JSON(facts.database_identity) +
+			           ",\"server_identity\":" + JSON(facts.server_identity) + ",\"schema\":" + JSON(d.schema) +
+			           ",\"name\":" + JSON(d.name) + ",\"kind\":" + JSON(d.kind) +
+			           ",\"namespace_identity\":" + JSON(facts.schema_id) +
+			           ",\"namespace_present\":" + (ns_present ? "true" : "false") +
+			           ",\"presence\":" + JSON(presence) + ",\"object_identity\":" + JSON(object_identity);
+			if (!observed_kind.empty())
+				document += ",\"observed_kind\":" + JSON(observed_kind);
+			if (!owning_table.empty())
+				document += ",\"owning_table\":" + JSON(owning_table);
+			if (!table_identity.empty())
+				document += ",\"table_identity\":" + JSON(table_identity);
+			if (has_reorg_flag)
+				document += ",\"reorg_pending\":" + string(reorg_pending ? "true" : "false");
+			document += ",\"metadata_complete\":false,\"identity_protection\":\"UNVERIFIED\",\"columns\":" + cols_json +
+			            ",\"indexes\":" + indexes_json + ",\"constraints\":" + constraints_json + "}";
 		}
-		document = "{\"contract_version\":1,\"product\":" + JSON(product) + ",\"source_version\":" + JSON(version) +
-		           ",\"database\":" + JSON(db_name) + ",\"schema\":" + JSON(d.schema) +
-		           ",\"namespace_present\":" + (ns_present ? "true" : "false") +
-		           ",\"source_read_only\":" + (read_only ? "true" : "false") +
-		           ",\"visibility\":\"CATALOG_READ\",\"executor_available\":true}";
 		stage.clear();
 	} catch (...) {
 		if (sqlstate.empty()) {
@@ -914,8 +1534,10 @@ static void ScanDDL(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) 
 		return;
 	state.done = true;
 	auto &d = in.bind_data->Cast<DDLData>();
+	const auto &intent = d.intent;
 	string product = ODBCDialectUtil::Name(d.dialect);
 	string status = "CONFIRMED_NOT_EXECUTED", error, stage = "source_identity";
+	int64_t warning_count = 0;
 	GuardedODBCSourceError source;
 	shared_ptr<ODBCConnection> connection;
 	unique_ptr<DDLSession> session;
@@ -923,187 +1545,885 @@ static void ScanDDL(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) 
 	bool sent = false, commit_sent = false;
 	try {
 		if (ctx.IsInterrupted()) {
-			error = "57014";
-			throw InterruptException();
+			RejectGuard("57014", "source_identity", "operation cancelled");
 		}
-		connection = ODBCConnection::Open(ODBCTypeConfig(ctx), d.catalog.connection_string, 5);
+		connection = ODBCConnection::Open(ODBCTypeConfig(ctx, d.dialect), d.catalog.connection_string, 5);
 		auto dbc = connection->GetConn();
 		if (!SQL_SUCCEEDED(
 		        SQLSetConnectAttr(dbc, SQL_ATTR_ACCESS_MODE, reinterpret_cast<SQLPOINTER>(SQL_MODE_READ_WRITE), 0))) {
-			error = "25006";
-			throw IOException("ODBC DDL source is read-only");
+			RejectGuard("25006", "source_identity", "ODBC DDL source is read-only");
 		}
 		if (transactional) {
 			if (!SQL_SUCCEEDED(SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT,
 			                                     reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0))) {
-				error = "HY000";
-				throw IOException("DB2 DDL transaction setup failed");
+				RejectGuard("HY000", "source_identity", "DB2 DDL transaction setup failed");
 			}
 		} else {
 			if (!SQL_SUCCEEDED(
 			        SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_ON), 0))) {
-				error = "HY000";
-				throw IOException("ODBC DDL autocommit setup failed");
+				RejectGuard("HY000", "source_identity", "ODBC DDL autocommit setup failed");
 			}
 		}
-		session = make_uniq<DDLSession>(ctx, dbc, product, d.intent.action == "reindex" ? 290 : 60);
-		string version, db_name;
-		if (!VerifyDialectIdentity(d.dialect, dbc, *session, version, db_name)) {
-			error = "0A000";
-			throw IOException("ODBC DDL source identity not certified");
+		session = make_uniq<DDLSession>(ctx, dbc, product, intent.action == "reindex" ? 290 : 60);
+		auto &s = *session;
+		ServerFacts facts;
+		if (!QueryDialectFacts(d.dialect, dbc, s, intent.schema, facts)) {
+			RejectGuard("0A000", "source_identity", "ODBC DDL source identity not certified");
 		}
-		if (d.dialect == ODBCDialect::DB2)
-			session->TryExec("SET CURRENT LOCK TIMEOUT 5");
+		if (facts.read_only) {
+			RejectGuard("25006", "source_identity", "ODBC DDL source is read-only");
+		}
 
-		const auto target = Quote(d.intent.schema) + "." + Quote(d.intent.name);
-		bool idempotent_skip = false;
-		if (d.intent.conditional) {
-			auto count_query = [&](const string &sql, const vector<string> &params) -> bool {
-				auto r = session->Query(sql, params);
-				return r.size() == 1 && !r[0].empty() && r[0][0] != "0";
+		// Per-vendor session guards
+		if (d.dialect == ODBCDialect::DB2) {
+			s.Exec("SET CURRENT LOCK TIMEOUT 2");
+			s.Exec("COMMIT");
+		} else if (d.dialect == ODBCDialect::DAMENG) {
+			// Fail-fast on active lock contention and pin UTC session timezone for temporal DDL.
+			s.Exec("ALTER SESSION SET 'DDL_WAIT_TIME' = 2");
+			s.Exec(ODBC_DAMENG_SESSION_TEMPORAL_SQL);
+		} else {
+			s.TryExec("SET TRANSACTION LOCK WAIT TIMEOUT 5000");
+		}
+
+		stage = "source_definition";
+		const auto target = Quote(intent.schema) + "." + Quote(intent.name);
+		string native_sql = intent.sql;
+		bool source_noop = false;
+		bool no_op_commit = false;
+		bool is_db2_truncate = false;
+		vector<string> lock_tables;
+		auto add_lock_table = [&](const string &tbl) {
+			if (!tbl.empty() && std::find(lock_tables.begin(), lock_tables.end(), tbl) == lock_tables.end()) {
+				lock_tables.push_back(tbl);
+			}
+		};
+
+		auto count_query = [&](const string &sql, const vector<string> &params) -> bool {
+			auto r = s.Query(sql, params);
+			return r.size() == 1 && !r[0].empty() && Trimmed(r[0][0]) != "0";
+		};
+
+		if (d.dialect == ODBCDialect::DB2) {
+			auto db2_table_row = [&](const string &tbl) {
+				return s.Query("SELECT t.TYPE,t.STATUS,COALESCE(t.TABLEORG,''),COALESCE(a.REORG_PENDING,'N'),"
+				               "COALESCE(a.READ_ACCESS_ONLY,'N') FROM SYSCAT.TABLES t "
+				               "LEFT JOIN SYSIBMADM.ADMINTABINFO a ON a.TABSCHEMA=t.TABSCHEMA AND a.TABNAME=t.TABNAME "
+				               "WHERE t.TABSCHEMA=? AND t.TABNAME=?",
+				               {intent.schema, tbl});
 			};
-			auto table_present = [&]() -> bool {
-				if (d.dialect == ODBCDialect::DAMENG)
-					return count_query("SELECT COUNT(*) FROM ALL_TABLES WHERE OWNER=? AND TABLE_NAME=?",
-					                   {d.intent.schema, d.intent.name});
-				if (d.dialect == ODBCDialect::DB2)
-					return count_query("SELECT VARCHAR(COUNT(*)) FROM SYSCAT.TABLES WHERE TABSCHEMA=? AND TABNAME=?",
-					                   {d.intent.schema, d.intent.name});
+			auto check_db2_table = [&](const string &tbl) {
+				auto rows = db2_table_row(tbl);
+				if (rows.empty())
+					RejectGuard("42P01", "source_definition", "target table does not exist");
+				const auto &r = rows[0];
+				if (r[0] != "T")
+					RejectGuard("42809", "source_definition", "target object is not a base table");
+				if (Trimmed(r[3]) == "Y")
+					RejectGuard("0A000", "source_definition", "Db2 target table is in REORG PENDING state");
+				if (Trimmed(r[4]) == "Y")
+					RejectGuard("25006", "source_definition", "Db2 target table is read-access-only");
+				if (r[1] != "N" || Trimmed(r[2]) != "R")
+					RejectGuard("0A000", "source_definition", "Db2 target table state or organization is unsupported");
+			};
+			auto db2_col_info = [&](const string &tbl, const string &col) {
+				return s.Query("SELECT NULLS,RTRIM(TYPENAME),RTRIM(CHAR(LENGTH)),IDENTITY,COALESCE(RTRIM(GENERATED),''),"
+				               "CASE WHEN DEFAULT IS NOT NULL THEN '1' ELSE '0' END "
+				               "FROM SYSCAT.COLUMNS WHERE TABSCHEMA=? AND TABNAME=? AND COLNAME=?",
+				               {intent.schema, tbl, col});
+			};
+			auto db2_has_ref_fk = [&](const string &tbl, bool exclude_self) {
+				if (exclude_self) {
+					return count_query("SELECT RTRIM(CHAR(COUNT(*))) FROM SYSCAT.REFERENCES WHERE REFTABSCHEMA=? "
+					                   "AND REFTABNAME=? AND NOT (TABSCHEMA=? AND TABNAME=?)",
+					                   {intent.schema, tbl, intent.schema, tbl});
+				}
 				return count_query(
-				    "SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM SYS.TABLES WHERE SCHEMA_NAME=? AND TABLE_NAME=?",
-				    {d.intent.schema, d.intent.name});
+				    "SELECT RTRIM(CHAR(COUNT(*))) FROM SYSCAT.REFERENCES WHERE REFTABSCHEMA=? AND REFTABNAME=?",
+				    {intent.schema, tbl});
 			};
-			if (d.intent.action == "create_table" || d.intent.action == "create_table_as") {
-				idempotent_skip = table_present();
-			} else if (d.intent.action == "drop_table") {
-				idempotent_skip = !table_present();
-			} else if (d.intent.action == "create_schema" || d.intent.action == "drop_schema") {
-				bool present = false;
-				if (d.dialect == ODBCDialect::DAMENG)
-					present = count_query("SELECT COUNT(*) FROM SYS.SYSOBJECTS WHERE TYPE$='SCH' AND NAME=?",
-					                      {d.intent.name});
-				else if (d.dialect == ODBCDialect::DB2)
-					present = count_query("SELECT VARCHAR(COUNT(*)) FROM SYSCAT.SCHEMATA WHERE SCHEMANAME=?",
-					                      {d.intent.name});
-				else
-					present = count_query("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM SYS.SCHEMAS WHERE SCHEMA_NAME=?",
-					                      {d.intent.name});
-				idempotent_skip = (d.intent.action == "create_schema") ? present : !present;
-			} else if (d.intent.action == "add_column" || d.intent.action == "drop_column") {
-				if (table_present()) {
-					const auto &cname = d.intent.action == "add_column" ? d.intent.column_specs[0].first
-					                                                    : d.intent.column_name;
-					bool col_present = false;
-					if (d.dialect == ODBCDialect::DAMENG)
-						col_present = count_query(
-						    "SELECT COUNT(*) FROM ALL_TAB_COLUMNS WHERE OWNER=? AND TABLE_NAME=? AND COLUMN_NAME=?",
-						    {d.intent.schema, d.intent.name, cname});
-					else if (d.dialect == ODBCDialect::DB2)
-						col_present = count_query(
-						    "SELECT VARCHAR(COUNT(*)) FROM SYSCAT.COLUMNS WHERE TABSCHEMA=? AND TABNAME=? AND COLNAME=?",
-						    {d.intent.schema, d.intent.name, cname});
+			auto check_db2_col_deps = [&](const string &tbl, const string &col) {
+				if (count_query("SELECT RTRIM(CHAR(COUNT(*))) FROM SYSCAT.INDEXCOLUSE ic "
+				                "JOIN SYSCAT.INDEXES ix ON ix.INDSCHEMA=ic.INDSCHEMA AND ix.INDNAME=ic.INDNAME "
+				                "WHERE ix.TABSCHEMA=? AND ix.TABNAME=? AND ic.COLNAME=?",
+				                {intent.schema, tbl, col}))
+					RejectGuard("2BP01", "source_definition", "cannot modify column referenced by an index");
+				if (count_query("SELECT RTRIM(CHAR(COUNT(*))) FROM SYSCAT.KEYCOLUSE WHERE TABSCHEMA=? AND TABNAME=? "
+				                "AND COLNAME=?",
+				                {intent.schema, tbl, col}))
+					RejectGuard("2BP01", "source_definition", "cannot modify column referenced by a key constraint");
+				if (count_query("SELECT RTRIM(CHAR(COUNT(*))) FROM SYSCAT.COLCHECKS WHERE TABSCHEMA=? AND TABNAME=? "
+				                "AND COLNAME=?",
+				                {intent.schema, tbl, col}))
+					RejectGuard("2BP01", "source_definition", "cannot modify column referenced by a check constraint");
+				if (count_query("SELECT RTRIM(CHAR(COUNT(*))) FROM SYSCAT.TABDEP WHERE BSCHEMA=? AND BNAME=? "
+				                "AND BTYPE='T' AND DTYPE IN ('V','S')",
+				                {intent.schema, tbl}))
+					RejectGuard("2BP01", "source_definition", "cannot modify column of table referenced by a view");
+			};
+
+			if (intent.action == "drop_column") {
+				RejectGuard("0A000", "source_definition", "Db2 DROP COLUMN triggers REORG PENDING and is unsupported");
+			} else if (intent.action == "set_not_null" || intent.action == "drop_not_null") {
+				RejectGuard("0A000", "source_definition",
+				            "Db2 SET/DROP NOT NULL triggers REORG PENDING and is unsupported");
+			} else if (intent.action == "create_schema" || intent.action == "drop_schema") {
+				bool present = count_query("SELECT VARCHAR(COUNT(*)) FROM SYSCAT.SCHEMATA WHERE SCHEMANAME=?",
+				                           {intent.name});
+				if (intent.conditional && ((intent.action == "create_schema") ? present : !present))
+					source_noop = true;
+			} else if (intent.action == "create_table" || intent.action == "create_table_as") {
+				auto existing = db2_table_row(intent.name);
+				if (!existing.empty()) {
+					if (intent.conditional && existing[0][0] == "T")
+						source_noop = true;
 					else
-						col_present = count_query("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM SYS.TABLE_COLUMNS WHERE "
-						                          "SCHEMA_NAME=? AND TABLE_NAME=? AND COLUMN_NAME=?",
-						                          {d.intent.schema, d.intent.name, cname});
-					idempotent_skip = (d.intent.action == "add_column") ? col_present : !col_present;
+						RejectGuard("42P07", "source_definition", "target table already exists");
 				}
-			} else if (d.intent.action == "create_index" || d.intent.action == "create_unique_index") {
-				if (table_present()) {
-					if (d.dialect == ODBCDialect::DAMENG)
-						idempotent_skip = count_query(
-						    "SELECT COUNT(*) FROM ALL_INDEXES WHERE OWNER=? AND INDEX_NAME=?",
-						    {d.intent.schema, d.intent.index});
-					else if (d.dialect == ODBCDialect::DB2)
-						idempotent_skip = count_query(
-						    "SELECT VARCHAR(COUNT(*)) FROM SYSCAT.INDEXES WHERE INDSCHEMA=? AND INDNAME=?",
-						    {d.intent.schema, d.intent.index});
+			} else if (intent.action == "drop_table") {
+				if (db2_table_row(intent.name).empty()) {
+					if (intent.conditional)
+						source_noop = true;
 					else
-						idempotent_skip = count_query(
-						    "SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM SYS.INDEXES WHERE SCHEMA_NAME=? AND INDEX_NAME=?",
-						    {d.intent.schema, d.intent.index});
+						RejectGuard("42P01", "source_definition", "target table does not exist");
+				} else {
+					check_db2_table(intent.name);
+					if (db2_has_ref_fk(intent.name, true))
+						RejectGuard("2BP01", "source_definition", "cannot drop table with referencing foreign keys");
+					add_lock_table(intent.name);
 				}
-			} else if (d.intent.action == "drop_index") {
-				if (d.dialect == ODBCDialect::DAMENG)
-					idempotent_skip = !count_query("SELECT COUNT(*) FROM ALL_INDEXES WHERE OWNER=? AND INDEX_NAME=?",
-					                               {d.intent.schema, d.intent.name});
-				else if (d.dialect == ODBCDialect::DB2)
-					idempotent_skip = !count_query(
-					    "SELECT VARCHAR(COUNT(*)) FROM SYSCAT.INDEXES WHERE INDSCHEMA=? AND INDNAME=?",
-					    {d.intent.schema, d.intent.name});
-				else
-					idempotent_skip = !count_query(
-					    "SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM SYS.INDEXES WHERE SCHEMA_NAME=? AND INDEX_NAME=?",
-					    {d.intent.schema, d.intent.name});
-			} else if (d.intent.action == "drop_constraint") {
-				if (table_present()) {
-					if (d.dialect == ODBCDialect::DAMENG)
-						idempotent_skip = !count_query("SELECT COUNT(*) FROM ALL_CONSTRAINTS WHERE OWNER=? AND "
-						                               "TABLE_NAME=? AND CONSTRAINT_NAME=?",
-						                               {d.intent.schema, d.intent.name, d.intent.constraint_name});
-					else if (d.dialect == ODBCDialect::DB2)
-						idempotent_skip = !count_query("SELECT VARCHAR(COUNT(*)) FROM SYSCAT.TABCONST WHERE "
-						                               "TABSCHEMA=? AND TABNAME=? AND CONSTNAME=?",
-						                               {d.intent.schema, d.intent.name, d.intent.constraint_name});
+			} else if (intent.action == "rename_table") {
+				check_db2_table(intent.name);
+				if (!db2_table_row(intent.new_name).empty())
+					RejectGuard("42P07", "source_definition", "destination table already exists");
+				if (db2_has_ref_fk(intent.name, false))
+					RejectGuard("2BP01", "source_definition", "cannot rename table referenced by foreign keys");
+				add_lock_table(intent.name);
+			} else if (intent.action == "add_column") {
+				check_db2_table(intent.name);
+				const auto &c = intent.column_specs[0];
+				if (!db2_col_info(intent.name, c.name).empty()) {
+					if (intent.conditional)
+						source_noop = true;
 					else
-						idempotent_skip = !count_query("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM SYS.CONSTRAINTS "
-						                               "WHERE SCHEMA_NAME=? AND TABLE_NAME=? AND CONSTRAINT_NAME=?",
-						                               {d.intent.schema, d.intent.name, d.intent.constraint_name});
+						RejectGuard("42701", "source_definition", "column already exists");
+				} else {
+					if (c.not_null && (c.default_kind.empty() || c.default_kind == "null")) {
+						if (count_query("SELECT RTRIM(CHAR(COUNT(*))) FROM (SELECT 1 FROM " + target +
+						                    " FETCH FIRST 1 ROW ONLY) t",
+						                {}))
+							RejectGuard("23502", "source_definition",
+							            "cannot add NOT NULL column without default to non-empty table");
+						RejectGuard("0A000", "source_definition",
+						            "Db2 ADD COLUMN NOT NULL requires an explicit DEFAULT");
+					}
+					add_lock_table(intent.name);
 				}
+			} else if (intent.action == "alter_column_type") {
+				check_db2_table(intent.name);
+				auto crows = db2_col_info(intent.name, intent.column_name);
+				if (crows.empty())
+					RejectGuard("42703", "source_definition", "column does not exist");
+				const auto &r = crows[0];
+				if (r[3] == "Y" || !Trimmed(r[4]).empty())
+					RejectGuard("0A000", "source_definition", "cannot alter identity or generated column");
+				const string cur_type = StringUtil::Upper(Trimmed(r[1]));
+				const int cur_len = std::stoi(Trimmed(r[2]));
+				const auto &tc = intent.column_specs[0];
+				if (cur_type != "VARCHAR" || tc.type != "varchar" || tc.precision != 0 || tc.scale != 0 ||
+				    tc.length <= cur_len || tc.length > 32672) {
+					RejectGuard("0A000", "source_definition",
+					            "Db2 ALTER COLUMN TYPE only supports REORG-free VARCHAR length widening");
+				}
+				check_db2_col_deps(intent.name, intent.column_name);
+				native_sql = "ALTER TABLE " + target + " ALTER COLUMN " + Quote(intent.column_name) +
+				             " SET DATA TYPE VARCHAR(" + std::to_string(tc.length) + ")";
+				add_lock_table(intent.name);
+			} else if (intent.action == "rename_column") {
+				check_db2_table(intent.name);
+				if (db2_col_info(intent.name, intent.column_name).empty())
+					RejectGuard("42703", "source_definition", "column does not exist");
+				if (!db2_col_info(intent.name, intent.new_name).empty())
+					RejectGuard("42701", "source_definition", "destination column already exists");
+				add_lock_table(intent.name);
+			} else if (intent.action == "set_default" || intent.action == "drop_default") {
+				check_db2_table(intent.name);
+				auto crows = db2_col_info(intent.name, intent.column_name);
+				if (crows.empty())
+					RejectGuard("42703", "source_definition", "column does not exist");
+				if (crows[0][3] == "Y" || !Trimmed(crows[0][4]).empty())
+					RejectGuard("0A000", "source_definition", "cannot alter default on identity or generated column");
+				if (intent.action == "drop_default" && crows[0][5] == "0") {
+					no_op_commit = true;
+				} else {
+					add_lock_table(intent.name);
+				}
+			} else if (intent.action == "add_constraint") {
+				check_db2_table(intent.name);
+				if (intent.constraint_kind == "foreign_key") {
+					check_db2_table(intent.reference_table);
+					add_lock_table(intent.reference_table);
+				}
+				add_lock_table(intent.name);
+			} else if (intent.action == "drop_constraint") {
+				check_db2_table(intent.name);
+				auto crows = s.Query(
+				    "SELECT TYPE FROM SYSCAT.TABCONST WHERE TABSCHEMA=? AND TABNAME=? AND CONSTNAME=?",
+				    {intent.schema, intent.name, intent.constraint_name});
+				if (crows.empty()) {
+					if (intent.conditional)
+						source_noop = true;
+					else
+						RejectGuard("42704", "source_definition", "constraint does not exist");
+				} else {
+					if ((crows[0][0] == "P" || crows[0][0] == "U") &&
+					    count_query("SELECT RTRIM(CHAR(COUNT(*))) FROM SYSCAT.REFERENCES WHERE REFTABSCHEMA=? "
+					                "AND REFTABNAME=? AND REFKEYNAME=?",
+					                {intent.schema, intent.name, intent.constraint_name}))
+						RejectGuard("2BP01", "source_definition",
+						            "cannot drop constraint with referencing foreign keys");
+					add_lock_table(intent.name);
+				}
+			} else if (intent.action == "create_index" || intent.action == "create_unique_index") {
+				check_db2_table(intent.name);
+				auto idx_rows = s.Query("SELECT TABSCHEMA,TABNAME FROM SYSCAT.INDEXES WHERE INDSCHEMA=? AND INDNAME=?",
+				                        {intent.schema, intent.index});
+				if (!idx_rows.empty()) {
+					if (intent.conditional && idx_rows.size() == 1 && Trimmed(idx_rows[0][0]) == intent.schema &&
+					    idx_rows[0][1] == intent.name)
+						source_noop = true;
+					else
+						RejectGuard("42P07", "source_definition", "index name already exists in schema");
+				} else {
+					add_lock_table(intent.name);
+				}
+			} else if (intent.action == "drop_index") {
+				auto idx_rows = s.Query(
+				    "SELECT TABNAME,UNIQUERULE FROM SYSCAT.INDEXES WHERE INDSCHEMA=? AND INDNAME=? AND TABSCHEMA=?",
+				    {intent.schema, intent.name, intent.schema});
+				if (idx_rows.empty()) {
+					if (intent.conditional)
+						source_noop = true;
+					else
+						RejectGuard("42704", "source_definition", "index does not exist");
+				} else if (!intent.owner.empty() && idx_rows[0][0] != intent.owner) {
+					RejectGuard("42704", "source_definition", "index owner mismatch");
+				} else {
+					if (idx_rows[0][1] == "P" ||
+					    count_query("SELECT RTRIM(CHAR(COUNT(*))) FROM SYSCAT.CONSTDEP WHERE TABSCHEMA=? AND TABNAME=? "
+					                "AND BSCHEMA=? AND BNAME=? AND BTYPE='I'",
+					                {intent.schema, idx_rows[0][0], intent.schema, intent.name}))
+						RejectGuard("2BP01", "source_definition", "cannot drop constraint backing index directly");
+					check_db2_table(idx_rows[0][0]);
+					add_lock_table(idx_rows[0][0]);
+				}
+			} else if (intent.action == "rename_index") {
+				auto idx_rows = s.Query(
+				    "SELECT TABNAME FROM SYSCAT.INDEXES WHERE INDSCHEMA=? AND INDNAME=? AND TABSCHEMA=?",
+				    {intent.schema, intent.name, intent.schema});
+				if (idx_rows.empty())
+					RejectGuard("42704", "source_definition", "index does not exist");
+				if (!intent.owner.empty() && idx_rows[0][0] != intent.owner)
+					RejectGuard("42704", "source_definition", "index owner mismatch");
+				check_db2_table(idx_rows[0][0]);
+				add_lock_table(idx_rows[0][0]);
+			} else if (intent.action == "truncate") {
+				if (intent.identity_mode == "restart")
+					RejectGuard("0A000", "source_definition", "Db2 TRUNCATE RESTART IDENTITY is unsupported");
+				check_db2_table(intent.name);
+				if (db2_has_ref_fk(intent.name, false))
+					RejectGuard("2BP01", "source_definition", "cannot truncate table with referencing foreign keys");
+				if (count_query("SELECT RTRIM(CHAR(COUNT(*))) FROM SYSCAT.TRIGGERS WHERE TABSCHEMA=? AND TABNAME=? "
+				                "AND TRIGEVENT='D'",
+				                {intent.schema, intent.name}))
+					RejectGuard("0A000", "source_definition", "cannot truncate table with DELETE triggers");
+				is_db2_truncate = true;
+			}
+		} else if (d.dialect == ODBCDialect::DAMENG) {
+			auto dm_table_exists = [&](const string &tbl) {
+				return count_query("SELECT COUNT(*) FROM ALL_TABLES WHERE OWNER=? AND TABLE_NAME=?",
+				                   {intent.schema, tbl});
+			};
+			auto dm_object_exists = [&](const string &obj) {
+				return count_query(
+				    "SELECT COUNT(*) FROM ALL_OBJECTS WHERE OWNER=? AND OBJECT_NAME=? AND SUBOBJECT_NAME IS NULL",
+				    {intent.schema, obj});
+			};
+			auto dm_col_nullable = [&](const string &tbl, const string &col) {
+				auto rows = s.Query(
+				    "SELECT COALESCE(MAX(NULLABLE),'') FROM ALL_TAB_COLUMNS WHERE OWNER=? AND TABLE_NAME=? AND COLUMN_NAME=?",
+				    {intent.schema, tbl, col});
+				return rows.size() == 1 && !rows[0].empty() ? Trimmed(rows[0][0]) : string();
+			};
+			auto check_dm_col_deps = [&](const string &tbl, const string &col, const string &nullable) {
+				auto tc_flags = s.Query(
+				    "SELECT COALESCE(VIRTUAL_COLUMN,'NO'),COALESCE(HIDDEN_COLUMN,'NO') "
+				    "FROM ALL_TAB_COLS WHERE OWNER=? AND TABLE_NAME=? AND COLUMN_NAME=?",
+				    {intent.schema, tbl, col});
+				if (tc_flags.size() == 1 && (tc_flags[0][0] == "YES" || tc_flags[0][1] == "YES"))
+					RejectGuard("0A000", "source_definition", "cannot modify or drop virtual or hidden column");
+				if (count_query("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM SYS.SYSCOLUMNS sc "
+				                "JOIN SYS.SYSOBJECTS tab ON sc.ID=tab.ID "
+				                "JOIN SYS.SYSOBJECTS sch ON tab.SCHID=sch.ID "
+				                "WHERE sch.TYPE$='SCH' AND sch.NAME=? AND tab.TYPE$='SCHOBJ' AND tab.SUBTYPE$='UTAB' "
+				                "AND tab.NAME=? AND sc.NAME=? AND BITAND(COALESCE(sc.INFO2,0),1)=1",
+				                {intent.schema, tbl, col}))
+					RejectGuard("0A000", "source_definition", "cannot modify or drop identity column");
+				if (count_query("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM ALL_INDEXES idx "
+				                "JOIN ALL_IND_COLUMNS ic ON ic.INDEX_OWNER=idx.OWNER AND ic.INDEX_NAME=idx.INDEX_NAME "
+				                "WHERE idx.TABLE_OWNER=? AND idx.TABLE_NAME=? AND ic.COLUMN_NAME=?",
+				                {intent.schema, tbl, col}))
+					RejectGuard("2BP01", "source_definition", "cannot modify or drop column referenced by an index");
+				if (count_query("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM ALL_CONSTRAINTS con "
+				                "JOIN ALL_CONS_COLUMNS cc ON cc.OWNER=con.OWNER AND cc.CONSTRAINT_NAME=con.CONSTRAINT_NAME "
+				                "AND cc.TABLE_NAME=con.TABLE_NAME WHERE con.OWNER=? AND con.TABLE_NAME=? "
+				                "AND cc.COLUMN_NAME=? AND con.CONSTRAINT_TYPE IN ('P','U','R')",
+				                {intent.schema, tbl, col}))
+					RejectGuard("2BP01", "source_definition",
+					            "cannot modify or drop column referenced by a constraint");
+				auto chk_rows = s.Query(
+				    "SELECT con.CONSTRAINT_NAME,COALESCE(con.GENERATED,''),"
+				    "COALESCE(CAST(con.SEARCH_CONDITION AS VARCHAR(4000)),'') FROM ALL_CONSTRAINTS con "
+				    "JOIN ALL_CONS_COLUMNS cc ON cc.OWNER=con.OWNER AND cc.CONSTRAINT_NAME=con.CONSTRAINT_NAME "
+				    "AND cc.TABLE_NAME=con.TABLE_NAME WHERE con.OWNER=? AND con.TABLE_NAME=? "
+				    "AND cc.COLUMN_NAME=? AND con.CONSTRAINT_TYPE='C'",
+				    {intent.schema, tbl, col});
+				for (const auto &r : chk_rows) {
+					if (r[1] != "GENERATED NAME" || nullable != "N" || !IsDamengSystemNotNullCheck(col, r[2]))
+						RejectGuard("2BP01", "source_definition",
+						            "cannot modify or drop column referenced by a check constraint");
+				}
+				if (count_query("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM ALL_DEPENDENCIES WHERE REFERENCED_OWNER=? "
+				                "AND REFERENCED_NAME=? AND REFERENCED_TYPE='TABLE' AND TYPE IN ('VIEW','MATERIALIZED VIEW')",
+				                {intent.schema, tbl}))
+					RejectGuard("2BP01", "source_definition",
+					            "cannot modify or drop column of table referenced by a view");
+			};
+
+			if (intent.action == "create_schema" || intent.action == "drop_schema") {
+				bool present =
+				    count_query("SELECT COUNT(*) FROM SYS.SYSOBJECTS WHERE TYPE$='SCH' AND NAME=?", {intent.name});
+				if (intent.conditional && ((intent.action == "create_schema") ? present : !present))
+					source_noop = true;
+			} else if (intent.action == "create_table" || intent.action == "create_table_as") {
+				if (dm_table_exists(intent.name)) {
+					if (intent.conditional)
+						source_noop = true;
+					else
+						RejectGuard("42P07", "source_definition", "target object already exists");
+				} else if (dm_object_exists(intent.name)) {
+					RejectGuard("42P07", "source_definition", "target object already exists");
+				}
+			} else if (intent.action == "drop_table") {
+				if (!dm_table_exists(intent.name)) {
+					if (intent.conditional && !dm_object_exists(intent.name))
+						source_noop = true;
+					else
+						RejectGuard("42P01", "source_definition", "target table does not exist");
+				} else if (count_query(
+				               "SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM ALL_CONSTRAINTS pk "
+				               "JOIN ALL_CONSTRAINTS fk ON fk.R_OWNER=pk.OWNER AND fk.R_CONSTRAINT_NAME=pk.CONSTRAINT_NAME "
+				               "WHERE pk.OWNER=? AND pk.TABLE_NAME=? AND fk.CONSTRAINT_TYPE='R' "
+				               "AND NOT (fk.OWNER=pk.OWNER AND fk.TABLE_NAME=pk.TABLE_NAME)",
+				               {intent.schema, intent.name})) {
+					RejectGuard("2BP01", "source_definition", "cannot drop table with referencing foreign keys");
+				}
+			} else if (intent.action == "add_column") {
+				if (!dm_table_exists(intent.name))
+					RejectGuard("42P01", "source_definition", "target table does not exist");
+				const auto &c = intent.column_specs[0];
+				if (!dm_col_nullable(intent.name, c.name).empty()) {
+					if (intent.conditional)
+						source_noop = true;
+					else
+						RejectGuard("42701", "source_definition", "column already exists");
+				} else if (c.not_null && (c.default_kind.empty() || c.default_kind == "null")) {
+					if (count_query("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM (SELECT 1 FROM " + target + " LIMIT 1)",
+					                {}))
+						RejectGuard("23502", "source_definition",
+						            "cannot add NOT NULL column without default to non-empty table");
+				}
+			} else if (intent.action == "drop_column") {
+				if (!dm_table_exists(intent.name))
+					RejectGuard("42P01", "source_definition", "target table does not exist");
+				auto nullable = dm_col_nullable(intent.name, intent.column_name);
+				if (nullable.empty()) {
+					if (intent.conditional)
+						source_noop = true;
+					else
+						RejectGuard("42703", "source_definition", "column does not exist");
+				} else {
+					if (std::stoi(Trimmed(s.Scalar("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM ALL_TAB_COLUMNS "
+					                               "WHERE OWNER=? AND TABLE_NAME=?",
+					                               {intent.schema, intent.name}))) <= 1)
+						RejectGuard("42P16", "source_definition", "cannot drop the only column of a table");
+					check_dm_col_deps(intent.name, intent.column_name, nullable);
+				}
+			} else if (intent.action == "alter_column_type") {
+				if (!dm_table_exists(intent.name))
+					RejectGuard("42P01", "source_definition", "target table does not exist");
+				auto col_rows = s.Query(
+				    "SELECT DATA_TYPE,COALESCE(CAST(DATA_LENGTH AS VARCHAR(20)),'0'),"
+				    "COALESCE(CAST(CHAR_LENGTH AS VARCHAR(20)),'0'),"
+				    "COALESCE(CAST(DATA_PRECISION AS VARCHAR(20)),''),"
+				    "COALESCE(CAST(DATA_SCALE AS VARCHAR(20)),''),NULLABLE "
+				    "FROM ALL_TAB_COLS WHERE OWNER=? AND TABLE_NAME=? AND COLUMN_NAME=? "
+				    "AND COALESCE(HIDDEN_COLUMN,'NO')='NO'",
+				    {intent.schema, intent.name, intent.column_name});
+				if (col_rows.size() != 1)
+					RejectGuard("42703", "source_definition", "column does not exist");
+				const auto &r = col_rows[0];
+				check_dm_col_deps(intent.name, intent.column_name, r[5]);
+				const string dtype = StringUtil::Upper(Trimmed(r[0]));
+				const int data_len = std::stoi(Trimmed(r[1]));
+				const int char_len = std::stoi(Trimmed(r[2]));
+				const string prec_str = Trimmed(r[3]);
+				const string scale_str = Trimmed(r[4]);
+				const auto &tc = intent.column_specs[0];
+				string new_type;
+
+				if (dtype == "SMALLINT") {
+					if (tc.type == "integer" && tc.length == 0 && tc.precision == 0 && tc.scale == 0)
+						new_type = "INT";
+					else if (tc.type == "bigint" && tc.length == 0 && tc.precision == 0 && tc.scale == 0)
+						new_type = "BIGINT";
+				} else if (dtype == "INT" || dtype == "INTEGER") {
+					if (tc.type == "bigint" && tc.length == 0 && tc.precision == 0 && tc.scale == 0)
+						new_type = "BIGINT";
+				} else if (dtype == "REAL") {
+					if (tc.type == "double" && tc.length == 0 && tc.precision == 0 && tc.scale == 0)
+						new_type = "DOUBLE";
+				} else if (dtype == "DECIMAL" || dtype == "DEC" || dtype == "NUMERIC" || dtype == "NUMBER") {
+					if (!prec_str.empty() && !scale_str.empty()) {
+						int p1 = std::stoi(prec_str);
+						int s1 = std::stoi(scale_str);
+						if (p1 > 0 && tc.type == "numeric" && tc.length == 0 && s1 == tc.scale && tc.precision > p1 &&
+						    tc.precision <= 38)
+							new_type =
+							    "DECIMAL(" + std::to_string(tc.precision) + "," + std::to_string(tc.scale) + ")";
+					}
+				} else if (dtype == "VARCHAR" || dtype == "VARCHAR2") {
+					int cur_len = char_len > 0 ? char_len : data_len;
+					if (tc.type == "varchar" && tc.precision == 0 && tc.scale == 0 && tc.length > cur_len &&
+					    tc.length <= 8188)
+						new_type = "VARCHAR(" + std::to_string(tc.length) + ")";
+				} else if ((dtype == "TIME" || StringUtil::StartsWith(dtype, "TIME(")) &&
+				           !StringUtil::Contains(dtype, "STAMP") && !StringUtil::Contains(dtype, "ZONE")) {
+					int p1 = ExtractDamengParenPrecision(dtype, scale_str);
+					if (tc.type == "time" && tc.length == 0 && tc.scale == 0 && tc.precision > p1 && tc.precision <= 6)
+						new_type = "TIME(" + std::to_string(tc.precision) + ")";
+				} else if (!StringUtil::Contains(dtype, "LOCAL TIME ZONE") &&
+				           StringUtil::Contains(dtype, "WITH TIME ZONE") &&
+				           (StringUtil::StartsWith(dtype, "TIMESTAMP") || StringUtil::StartsWith(dtype, "DATETIME"))) {
+					int p1 = ExtractDamengParenPrecision(dtype, scale_str);
+					if (tc.type == "timestamptz" && tc.length == 0 && tc.scale == 0 && tc.precision > p1 &&
+					    tc.precision <= 6)
+						new_type = "TIMESTAMP(" + std::to_string(tc.precision) + ") WITH TIME ZONE";
+				} else if (!StringUtil::Contains(dtype, "ZONE") &&
+				           (dtype == "TIMESTAMP" || dtype == "DATETIME" ||
+				            StringUtil::StartsWith(dtype, "TIMESTAMP(") ||
+				            StringUtil::StartsWith(dtype, "DATETIME("))) {
+					int p1 = ExtractDamengParenPrecision(dtype, scale_str);
+					if (tc.type == "timestamp" && tc.length == 0 && tc.scale == 0 && tc.precision > p1 &&
+					    tc.precision <= 6)
+						new_type = "TIMESTAMP(" + std::to_string(tc.precision) + ")";
+				}
+				if (new_type.empty())
+					RejectGuard("0A000", "source_definition", "only lossless type widening is supported");
+				native_sql = "ALTER TABLE " + target + " MODIFY " + Quote(intent.column_name) + " " + new_type;
+			} else if (intent.action == "set_not_null" || intent.action == "drop_not_null") {
+				if (!dm_table_exists(intent.name))
+					RejectGuard("42P01", "source_definition", "target table does not exist");
+				auto nullable = dm_col_nullable(intent.name, intent.column_name);
+				if (nullable.empty())
+					RejectGuard("42703", "source_definition", "column does not exist");
+				if (intent.action == "set_not_null") {
+					if (nullable == "N")
+						no_op_commit = true;
+				} else {
+					if (count_query("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM ALL_CONSTRAINTS con "
+					                "JOIN ALL_CONS_COLUMNS cc ON cc.OWNER=con.OWNER AND cc.CONSTRAINT_NAME=con.CONSTRAINT_NAME "
+					                "WHERE con.OWNER=? AND con.TABLE_NAME=? AND cc.COLUMN_NAME=? AND con.CONSTRAINT_TYPE='P'",
+					                {intent.schema, intent.name, intent.column_name}))
+						RejectGuard("42831", "source_definition", "cannot drop NOT NULL on primary key column");
+					if (nullable == "Y")
+						no_op_commit = true;
+				}
+			} else if (intent.action == "create_index" || intent.action == "create_unique_index") {
+				if (!dm_table_exists(intent.name))
+					RejectGuard("42P01", "source_definition", "target table does not exist");
+				auto idx_rows = s.Query(
+				    "SELECT TABLE_OWNER,TABLE_NAME FROM ALL_INDEXES WHERE OWNER=? AND INDEX_NAME=?",
+				    {intent.schema, intent.index});
+				if (!idx_rows.empty()) {
+					if (intent.conditional && idx_rows.size() == 1 && idx_rows[0][0] == intent.schema &&
+					    idx_rows[0][1] == intent.name)
+						source_noop = true;
+					else
+						RejectGuard("42P07", "source_definition", "index name already exists in schema");
+				}
+			} else if (intent.action == "drop_index") {
+				auto idx_rows = s.Query("SELECT TABLE_NAME FROM ALL_INDEXES WHERE OWNER=? AND INDEX_NAME=?",
+				                        {intent.schema, intent.name});
+				if (idx_rows.empty()) {
+					if (intent.conditional)
+						source_noop = true;
+					else
+						RejectGuard("42704", "source_definition", "index does not exist");
+				} else if (!intent.owner.empty() && idx_rows[0][0] != intent.owner) {
+					RejectGuard("42704", "source_definition", "index owner mismatch");
+				} else if (count_query(
+				               "SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM ALL_CONSTRAINTS WHERE OWNER=? "
+				               "AND INDEX_NAME=? AND CONSTRAINT_TYPE IN ('P','U')",
+				               {intent.schema, intent.name})) {
+					RejectGuard("2BP01", "source_definition", "cannot drop constraint backing index directly");
+				}
+			} else if (intent.action == "drop_constraint") {
+				if (!dm_table_exists(intent.name))
+					RejectGuard("42P01", "source_definition", "target table does not exist");
+				if (!count_query("SELECT COUNT(*) FROM ALL_CONSTRAINTS WHERE OWNER=? AND TABLE_NAME=? AND CONSTRAINT_NAME=?",
+				                 {intent.schema, intent.name, intent.constraint_name})) {
+					if (intent.conditional)
+						source_noop = true;
+					else
+						RejectGuard("42704", "source_definition", "constraint does not exist");
+				}
+			} else if (intent.action == "truncate") {
+				if (intent.identity_mode == "restart")
+					RejectGuard("0A000", "source_definition", "Dameng TRUNCATE RESTART IDENTITY is unsupported");
+				if (!dm_table_exists(intent.name))
+					RejectGuard("42P01", "source_definition", "target table does not exist");
+				if (count_query(
+				        "SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM ALL_CONSTRAINTS pk "
+				        "JOIN ALL_CONSTRAINTS fk ON fk.R_OWNER=pk.OWNER AND fk.R_CONSTRAINT_NAME=pk.CONSTRAINT_NAME "
+				        "WHERE pk.OWNER=? AND pk.TABLE_NAME=? AND fk.CONSTRAINT_TYPE='R'",
+				        {intent.schema, intent.name}))
+					RejectGuard("2BP01", "source_definition", "cannot truncate table with referencing foreign keys");
+			}
+		} else {
+			// SAP HANA
+			auto hana_table_row = [&](const string &tbl) {
+				return s.Query(
+				    "SELECT TABLE_TYPE,IS_TEMPORARY,IS_USER_DEFINED_TYPE FROM SYS.TABLES WHERE SCHEMA_NAME=? AND TABLE_NAME=?",
+				    {intent.schema, tbl});
+			};
+			auto hana_view_exists = [&](const string &obj) {
+				return count_query("SELECT TO_VARCHAR(COUNT(*)) FROM SYS.VIEWS WHERE SCHEMA_NAME=? AND VIEW_NAME=?",
+				                   {intent.schema, obj});
+			};
+			auto check_hana_base_table = [&](const string &tbl) {
+				auto rows = hana_table_row(tbl);
+				if (rows.empty()) {
+					if (hana_view_exists(tbl))
+						RejectGuard("42809", "source_definition", "target object is a view, not a table");
+					RejectGuard("42P01", "source_definition", "target table does not exist");
+				}
+				const auto &r = rows[0];
+				if ((r[0] != "COLUMN" && r[0] != "ROW") || r[1] != "FALSE" || r[2] != "FALSE")
+					RejectGuard("0A000", "source_definition", "unsupported HANA table kind");
+				return r[0];
+			};
+			auto hana_col_row = [&](const string &tbl, const string &col) {
+				return s.Query("SELECT DATA_TYPE_NAME,TO_VARCHAR(LENGTH),COALESCE(TO_VARCHAR(SCALE),'-1'),"
+				               "IS_NULLABLE,CASE WHEN DEFAULT_VALUE IS NOT NULL THEN '1' ELSE '0' END,"
+				               "COALESCE(GENERATION_TYPE,''),COALESCE(GENERATED_ALWAYS_AS,''),COALESCE(DEFAULT_VALUE,'') "
+				               "FROM SYS.TABLE_COLUMNS WHERE SCHEMA_NAME=? AND TABLE_NAME=? AND COLUMN_NAME=?",
+				               {intent.schema, tbl, col});
+			};
+			auto check_hana_col_deps = [&](const string &tbl, const string &col, const vector<string> &cm) {
+				auto gen_upper = StringUtil::Upper(Trimmed(cm[5]));
+				if ((!gen_upper.empty() && gen_upper != "NONE") || !Trimmed(cm[6]).empty())
+					RejectGuard("0A000", "source_definition", "cannot modify or drop identity or generated column");
+				if (count_query("SELECT TO_VARCHAR(COUNT(*)) FROM SYS.CONSTRAINTS WHERE SCHEMA_NAME=? "
+				                "AND TABLE_NAME=? AND COLUMN_NAME=?",
+				                {intent.schema, tbl, col}))
+					RejectGuard("2BP01", "source_definition",
+					            "cannot modify or drop column referenced by a constraint");
+				auto tbl_checks = s.Query(
+				    "SELECT COALESCE(CHECK_CONDITION,'') FROM SYS.CONSTRAINTS WHERE SCHEMA_NAME=? AND TABLE_NAME=? "
+				    "AND IS_PRIMARY_KEY='FALSE' AND IS_UNIQUE_KEY='FALSE' AND COLUMN_NAME IS NULL",
+				    {intent.schema, tbl});
+				for (const auto &chk : tbl_checks) {
+					if (HanaCheckExprMentionsColumn(chk[0], col))
+						RejectGuard("2BP01", "source_definition",
+						            "cannot modify or drop column referenced by a check constraint");
+				}
+				if (count_query("SELECT TO_VARCHAR(COUNT(*)) FROM SYS.REFERENTIAL_CONSTRAINTS WHERE (SCHEMA_NAME=? "
+				                "AND TABLE_NAME=? AND COLUMN_NAME=?) OR (REFERENCED_SCHEMA_NAME=? "
+				                "AND REFERENCED_TABLE_NAME=? AND REFERENCED_COLUMN_NAME=?)",
+				                {intent.schema, tbl, col, intent.schema, tbl, col}))
+					RejectGuard("2BP01", "source_definition",
+					            "cannot modify or drop column referenced by a foreign key constraint");
+				if (count_query("SELECT TO_VARCHAR(COUNT(*)) FROM SYS.INDEX_COLUMNS WHERE SCHEMA_NAME=? "
+				                "AND TABLE_NAME=? AND COLUMN_NAME=?",
+				                {intent.schema, tbl, col}))
+					RejectGuard("2BP01", "source_definition", "cannot modify or drop column referenced by an index");
+				if (count_query("SELECT TO_VARCHAR(COUNT(*)) FROM SYS.OBJECT_DEPENDENCIES WHERE BASE_SCHEMA_NAME=? "
+				                "AND BASE_OBJECT_NAME=? AND BASE_OBJECT_TYPE='TABLE' "
+				                "AND DEPENDENT_OBJECT_TYPE IN ('VIEW','CALCULATION_VIEW')",
+				                {intent.schema, tbl}))
+					RejectGuard("2BP01", "source_definition",
+					            "cannot modify or drop column of table referenced by a view");
+			};
+
+			if (intent.action == "create_schema" || intent.action == "drop_schema") {
+				bool present =
+				    count_query("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM SYS.SCHEMAS WHERE SCHEMA_NAME=?",
+				                {intent.name});
+				if (intent.conditional && ((intent.action == "create_schema") ? present : !present))
+					source_noop = true;
+			} else if (intent.action == "create_table" || intent.action == "create_table_as") {
+				if (!hana_table_row(intent.name).empty()) {
+					if (intent.conditional)
+						source_noop = true;
+					else
+						RejectGuard("42P07", "source_definition", "target table already exists");
+				} else if (hana_view_exists(intent.name)) {
+					RejectGuard("42P07", "source_definition", "target object already exists");
+				}
+			} else if (intent.action == "drop_table") {
+				if (hana_table_row(intent.name).empty()) {
+					if (intent.conditional && !hana_view_exists(intent.name))
+						source_noop = true;
+					else
+						RejectGuard("42P01", "source_definition", "target table does not exist");
+				} else {
+					check_hana_base_table(intent.name);
+					if (count_query("SELECT TO_VARCHAR(COUNT(*)) FROM SYS.REFERENTIAL_CONSTRAINTS WHERE "
+					                "REFERENCED_SCHEMA_NAME=? AND REFERENCED_TABLE_NAME=? "
+					                "AND NOT (SCHEMA_NAME=? AND TABLE_NAME=?)",
+					                {intent.schema, intent.name, intent.schema, intent.name}))
+						RejectGuard("2BP01", "source_definition", "cannot drop table with referencing foreign keys");
+				}
+			} else if (intent.action == "add_column") {
+				check_hana_base_table(intent.name);
+				const auto &c = intent.column_specs[0];
+				if (!hana_col_row(intent.name, c.name).empty()) {
+					if (intent.conditional)
+						source_noop = true;
+					else
+						RejectGuard("42701", "source_definition", "column already exists");
+				} else if (c.not_null && (c.default_kind.empty() || c.default_kind == "null")) {
+					if (count_query("SELECT TO_VARCHAR(COUNT(*)) FROM (SELECT 1 FROM " + target + " LIMIT 1)", {}))
+						RejectGuard("23502", "source_definition",
+						            "cannot add NOT NULL column without default to non-empty table");
+				}
+			} else if (intent.action == "drop_column") {
+				check_hana_base_table(intent.name);
+				auto cr = hana_col_row(intent.name, intent.column_name);
+				if (cr.empty()) {
+					if (intent.conditional)
+						source_noop = true;
+					else
+						RejectGuard("42703", "source_definition", "column does not exist");
+				} else {
+					if (std::stoi(Trimmed(s.Scalar("SELECT TO_VARCHAR(COUNT(*)) FROM SYS.TABLE_COLUMNS "
+					                               "WHERE SCHEMA_NAME=? AND TABLE_NAME=?",
+					                               {intent.schema, intent.name}))) <= 1)
+						RejectGuard("42P16", "source_definition", "cannot drop the only column of a table");
+					check_hana_col_deps(intent.name, intent.column_name, cr[0]);
+				}
+			} else if (intent.action == "alter_column_type") {
+				const string ttype = check_hana_base_table(intent.name);
+				if (ttype != "COLUMN")
+					RejectGuard("0A000", "source_definition", "HANA ALTER COLUMN TYPE requires COLUMN table");
+				auto cr = hana_col_row(intent.name, intent.column_name);
+				if (cr.empty())
+					RejectGuard("42703", "source_definition", "column does not exist");
+				const auto &c = cr[0];
+				check_hana_col_deps(intent.name, intent.column_name, c);
+				const string dtype = StringUtil::Upper(Trimmed(c[0]));
+				const int cur_len = std::stoi(Trimmed(c[1]));
+				const string scale_str = Trimmed(c[2]);
+				const auto &tc = intent.column_specs[0];
+				string new_type;
+
+				if (dtype == "SMALLINT") {
+					if (tc.type == "integer" && tc.length == 0 && tc.precision == 0 && tc.scale == 0)
+						new_type = "INTEGER";
+					else if (tc.type == "bigint" && tc.length == 0 && tc.precision == 0 && tc.scale == 0)
+						new_type = "BIGINT";
+				} else if (dtype == "INTEGER") {
+					if (tc.type == "bigint" && tc.length == 0 && tc.precision == 0 && tc.scale == 0)
+						new_type = "BIGINT";
+				} else if (dtype == "REAL") {
+					if (tc.type == "double" && tc.length == 0 && tc.precision == 0 && tc.scale == 0)
+						new_type = "DOUBLE";
+				} else if (dtype == "DECIMAL" && scale_str != "-1") {
+					int s1 = std::stoi(scale_str);
+					if (tc.type == "numeric" && tc.length == 0 && s1 == tc.scale && tc.precision > cur_len &&
+					    tc.precision <= 38)
+						new_type = "DECIMAL(" + std::to_string(tc.precision) + "," + std::to_string(tc.scale) + ")";
+				} else if (dtype == "NVARCHAR") {
+					if (tc.type == "varchar" && tc.precision == 0 && tc.scale == 0 && tc.length > cur_len &&
+					    tc.length <= 5000)
+						new_type = "NVARCHAR(" + std::to_string(tc.length) + ")";
+				}
+				if (new_type.empty())
+					RejectGuard("0A000", "source_definition", "only lossless type widening is supported");
+				const string null_kw = c[3] == "FALSE" ? "NOT NULL" : "NULL";
+				string alter_col_clause = Quote(intent.column_name) + " " + new_type + " " + null_kw;
+				if (c[4] == "1") {
+					if (dtype == "NVARCHAR" || dtype == "VARCHAR" || dtype == "CHAR" || dtype == "NCHAR") {
+						alter_col_clause += " DEFAULT " + Literal(c[7]);
+					} else {
+						string def_trim = Trimmed(c[7]);
+						bool ok = (dtype == "SMALLINT" || dtype == "INTEGER") ? SimpleIntLiteral(def_trim)
+						                                                      : IsSignedDecimalLiteral(def_trim);
+						if (!ok)
+							RejectGuard("0A000", "source_definition",
+							            "cannot preserve non-literal default during HANA alter column type");
+						alter_col_clause += " DEFAULT " + def_trim;
+					}
+				}
+				native_sql = "ALTER TABLE " + target + " ALTER (" + alter_col_clause + ")";
+			} else if (intent.action == "set_default" || intent.action == "drop_default" ||
+			           intent.action == "set_not_null" || intent.action == "drop_not_null") {
+				check_hana_base_table(intent.name);
+				auto cr = hana_col_row(intent.name, intent.column_name);
+				if (cr.empty())
+					RejectGuard("42703", "source_definition", "HANA DDL column unavailable");
+				const auto &c = cr[0];
+				auto gen_upper = StringUtil::Upper(Trimmed(c[5]));
+				if ((!gen_upper.empty() && gen_upper != "NONE") || !Trimmed(c[6]).empty())
+					RejectGuard("0A000", "source_definition", "cannot alter identity or generated column");
+				auto col_type = FormatHanaColumnType(c[0], c[1], c[2]);
+				if (intent.action == "set_not_null") {
+					if (c[3] == "FALSE")
+						no_op_commit = true;
+					else
+						native_sql =
+						    "ALTER TABLE " + target + " ALTER (" + Quote(intent.column_name) + " " + col_type + " NOT NULL)";
+				} else if (intent.action == "drop_not_null") {
+					if (count_query("SELECT TO_VARCHAR(COUNT(*)) FROM SYS.CONSTRAINTS WHERE SCHEMA_NAME=? "
+					                "AND TABLE_NAME=? AND COLUMN_NAME=? AND IS_PRIMARY_KEY='TRUE'",
+					                {intent.schema, intent.name, intent.column_name}))
+						RejectGuard("42831", "source_definition", "cannot drop NOT NULL on primary key column");
+					if (c[3] == "TRUE")
+						no_op_commit = true;
+					else
+						native_sql =
+						    "ALTER TABLE " + target + " ALTER (" + Quote(intent.column_name) + " " + col_type + " NULL)";
+				} else if (intent.action == "drop_default") {
+					native_sql = "ALTER TABLE " + target + " ALTER (" + Quote(intent.column_name) + " " + col_type +
+					             " DEFAULT NULL)";
+				} else {
+					string lit = DefaultLiteralSQL(d.dialect, intent.default_kind, intent.default_value);
+					native_sql = "ALTER TABLE " + target + " ALTER (" + Quote(intent.column_name) + " " + col_type +
+					             " DEFAULT " + lit + ")";
+				}
+			} else if (intent.action == "add_constraint") {
+				const string ttype = check_hana_base_table(intent.name);
+				if (intent.constraint_kind == "foreign_key") {
+					if (ttype != "COLUMN")
+						RejectGuard("0A000", "source_definition", "HANA foreign keys require COLUMN tables");
+					if (check_hana_base_table(intent.reference_table) != "COLUMN")
+						RejectGuard("0A000", "source_definition",
+						            "HANA foreign key referenced table must be COLUMN table");
+				}
+			} else if (intent.action == "drop_constraint") {
+				check_hana_base_table(intent.name);
+				if (!count_query("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM SYS.CONSTRAINTS "
+				                 "WHERE SCHEMA_NAME=? AND TABLE_NAME=? AND CONSTRAINT_NAME=?",
+				                 {intent.schema, intent.name, intent.constraint_name}) &&
+				    !count_query("SELECT CAST(COUNT(*) AS VARCHAR(20)) FROM SYS.REFERENTIAL_CONSTRAINTS "
+				                 "WHERE SCHEMA_NAME=? AND TABLE_NAME=? AND CONSTRAINT_NAME=?",
+				                 {intent.schema, intent.name, intent.constraint_name})) {
+					if (intent.conditional)
+						source_noop = true;
+					else
+						RejectGuard("42704", "source_definition", "constraint does not exist");
+				}
+			} else if (intent.action == "create_index" || intent.action == "create_unique_index") {
+				check_hana_base_table(intent.name);
+				auto idx_rows = s.Query("SELECT TABLE_NAME FROM SYS.INDEXES WHERE SCHEMA_NAME=? AND INDEX_NAME=?",
+				                        {intent.schema, intent.index});
+				if (!idx_rows.empty()) {
+					if (intent.conditional && idx_rows.size() == 1 && idx_rows[0][0] == intent.name)
+						source_noop = true;
+					else
+						RejectGuard("42P07", "source_definition", "index name already exists in schema");
+				} else {
+					for (const auto &k : intent.keys) {
+						auto cr = hana_col_row(intent.name, k);
+						if (cr.empty())
+							RejectGuard("42703", "source_definition", "index column does not exist");
+						auto dt = StringUtil::Upper(Trimmed(cr[0][0]));
+						if (dt == "CLOB" || dt == "NCLOB" || dt == "BLOB" || dt == "TEXT" || dt == "BINTEXT")
+							RejectGuard("0A000", "source_definition", "cannot index LOB column on HANA");
+					}
+				}
+			} else if (intent.action == "drop_index") {
+				auto idx_rows = s.Query(
+				    "SELECT TABLE_NAME,COALESCE(CONSTRAINT,'') FROM SYS.INDEXES WHERE SCHEMA_NAME=? AND INDEX_NAME=?",
+				    {intent.schema, intent.name});
+				if (idx_rows.empty()) {
+					if (intent.conditional)
+						source_noop = true;
+					else
+						RejectGuard("42704", "source_definition", "index does not exist");
+				} else if (!intent.owner.empty() && idx_rows[0][0] != intent.owner) {
+					RejectGuard("42704", "source_definition", "index owner mismatch");
+				} else if (!Trimmed(idx_rows[0][1]).empty()) {
+					RejectGuard("2BP01", "source_definition", "cannot drop constraint backing index directly");
+				}
+			} else if (intent.action == "truncate") {
+				if (intent.identity_mode == "restart")
+					RejectGuard("0A000", "source_definition", "HANA TRUNCATE RESTART IDENTITY is unsupported");
+				check_hana_base_table(intent.name);
 			}
 		}
 
-		string native_sql = d.intent.sql;
-		if (!idempotent_skip && d.dialect == ODBCDialect::HANA &&
-		    (d.intent.action == "set_default" || d.intent.action == "drop_default" ||
-		     d.intent.action == "set_not_null" || d.intent.action == "drop_not_null")) {
-			auto rows = session->Query(
-			    "SELECT DATA_TYPE_NAME,CAST(LENGTH AS VARCHAR(20)),COALESCE(CAST(SCALE AS VARCHAR(20)),'0') "
-			    "FROM SYS.TABLE_COLUMNS WHERE SCHEMA_NAME=? AND TABLE_NAME=? AND COLUMN_NAME=?",
-			    {d.intent.schema, d.intent.name, d.intent.column_name});
-			if (rows.size() != 1) {
-				error = "42703";
-				throw IOException("HANA DDL column unavailable");
-			}
-			auto col_type = FormatHanaColumnType(rows[0][0], rows[0][1], rows[0][2]);
-			if (d.intent.action == "set_not_null" || d.intent.action == "drop_not_null") {
-				native_sql = "ALTER TABLE " + target + " ALTER (" + Quote(d.intent.column_name) + " " + col_type +
-				             (d.intent.action == "set_not_null" ? " NOT NULL)" : " NULL)");
-			} else if (d.intent.action == "drop_default") {
-				native_sql =
-				    "ALTER TABLE " + target + " ALTER (" + Quote(d.intent.column_name) + " " + col_type + " DEFAULT NULL)";
-			} else {
-				string lit = DefaultLiteralSQL(d.dialect, d.intent.default_kind, d.intent.default_value);
-				native_sql = "ALTER TABLE " + target + " ALTER (" + Quote(d.intent.column_name) + " " + col_type +
-				             " DEFAULT " + lit + ")";
-			}
-		}
-
-		if (idempotent_skip) {
+		if (source_noop) {
 			if (transactional)
-				session->Exec("COMMIT");
+				s.Exec("COMMIT");
 			status = "COMMITTED";
+			warning_count = 0;
+			stage = "source_noop";
+		} else if (no_op_commit) {
+			if (transactional)
+				s.Exec("COMMIT");
+			status = "COMMITTED";
+			warning_count = 0;
 			stage.clear();
 		} else {
-			stage = "source_execute";
-			if (ctx.IsInterrupted()) {
-				error = "57014";
-				throw InterruptException();
+			if (is_db2_truncate) {
+				// Db2 requires TRUNCATE TABLE ... IMMEDIATE to be the first statement in its UOW.
+				s.Exec("COMMIT");
+			} else if (transactional && !lock_tables.empty()) {
+				std::sort(lock_tables.begin(), lock_tables.end());
+				stage = "source_lock";
+				for (const auto &tbl : lock_tables) {
+					if (ctx.IsInterrupted())
+						RejectGuard("57014", "source_lock", "operation cancelled");
+					s.Exec("LOCK TABLE " + Quote(intent.schema) + "." + Quote(tbl) + " IN EXCLUSIVE MODE");
+				}
 			}
+
+			stage = "source_execute";
+			if (ctx.IsInterrupted())
+				RejectGuard("57014", "source_execute", "operation cancelled");
+			s.last_warning_count = 0;
 			sent = true;
-			session->Exec(native_sql);
-			if (d.dialect == ODBCDialect::DB2 && d.intent.action == "create_table_as") {
-				session->Exec("INSERT INTO " + target + " " + d.intent.query_sql);
+			s.Exec(native_sql);
+			if (d.dialect == ODBCDialect::DB2 && intent.action == "create_table_as") {
+				s.Exec("INSERT INTO " + target + " " + intent.query_sql);
 			}
 			if (transactional) {
 				stage = "source_commit";
 				commit_sent = true;
 				status = "UNKNOWN";
-				session->Exec("COMMIT");
+				s.Exec("COMMIT");
 			}
 			status = "COMMITTED";
-			stage.clear();
+			warning_count = s.last_warning_count;
+			stage = warning_count > 0 ? "source_warning" : "";
 		}
+	} catch (const DDLGuardReject &rej) {
+		error = rej.sqlstate;
+		stage = rej.stage;
+		if (transactional && session)
+			session->TryExec("ROLLBACK");
 	} catch (...) {
 		if (session) {
 			source = session->source;
@@ -1131,11 +2451,11 @@ static void ScanDDL(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) 
 		session.reset();
 		connection->Close();
 	}
-	out.SetValue(0, 0, Value(d.intent.operation));
+	out.SetValue(0, 0, Value(intent.operation));
 	out.SetValue(1, 0, Value(status));
 	out.SetValue(2, 0, Value(error));
 	out.SetValue(3, 0, Value(stage));
-	out.SetValue(4, 0, Value::BIGINT(0));
+	out.SetValue(4, 0, Value::BIGINT(warning_count));
 	if (d.diagnostics)
 		out.SetValue(5, 0, Value(source.JSON()));
 	out.SetChildCardinality(1);
@@ -1146,8 +2466,12 @@ static void ScanDDL(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) 
 void RegisterODBCGuardedDDL(ExtensionLoader &loader) {
 	for (auto *name : {"dameng", "db2", "hana"}) {
 		loader.RegisterFunction(TableFunction(Identifier(string(name) + "_ddl_capabilities"),
-		                                      {LogicalType::VARCHAR, LogicalType::VARCHAR}, ScanCapabilities,
-		                                      BindCapabilities, InitOne));
+		                                      {LogicalType::VARCHAR, LogicalType::VARCHAR}, ScanMetadata, BindMetadata,
+		                                      InitOne));
+		loader.RegisterFunction(TableFunction(
+		    Identifier(string(name) + "_ddl_describe"),
+		    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, ScanMetadata,
+		    BindMetadata, InitOne));
 		TableFunction ddl(Identifier(string(name) + "_guarded_ddl"),
 		                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 		                   LogicalType::ANY},

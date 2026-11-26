@@ -1,42 +1,76 @@
 #include "odbc_types.hpp"
+#include "odbc_temporal_utils.hpp"
 
 namespace duckdb {
 
-static bool GetBoolOption(ClientContext &context, const string &name) {
+static bool GetBoolOption(ClientContext &context, const string &name, bool default_value = false) {
 	Value value;
-	return context.TryGetCurrentSetting(Identifier(name), value) && BooleanValue::Get(value);
+	if (context.TryGetCurrentSetting(Identifier(name), value) && !value.IsNull()) {
+		return BooleanValue::Get(value);
+	}
+	return default_value;
 }
 
-ODBCTypeConfig::ODBCTypeConfig() {
+static bool GetBoolOption(DatabaseInstance &db, const string &name, bool default_value = false) {
+	Value value;
+	if (db.TryGetCurrentSetting(Identifier(name), value) && !value.IsNull()) {
+		return BooleanValue::Get(value);
+	}
+	return default_value;
 }
+
+ODBCTypeConfig::ODBCTypeConfig() = default;
 
 ODBCTypeConfig::ODBCTypeConfig(ClientContext &context)
     : bit1_as_boolean(GetBoolOption(context, "odbc_catalog_bit1_as_boolean")),
       tinyint1_as_boolean(GetBoolOption(context, "odbc_catalog_tinyint1_as_boolean")),
-      time_as_time(GetBoolOption(context, "odbc_catalog_time_as_time")) {
+      time_as_time(GetBoolOption(context, "odbc_catalog_time_as_time", true)) {
 }
 
-LogicalType ODBCTypes::TypeToLogicalType(const ODBCTypeConfig &type_config, const ODBCTypeData &type_info) {
-	auto type_name = StringUtil::Lower(type_info.type_name);
-	StringUtil::Trim(type_name);
+ODBCTypeConfig::ODBCTypeConfig(ClientContext &context, ODBCDialect dialect_p) : ODBCTypeConfig(context) {
+	has_dialect = true;
+	dialect = dialect_p;
+}
+
+ODBCTypeConfig::ODBCTypeConfig(DatabaseInstance &db, ODBCDialect dialect_p)
+    : bit1_as_boolean(GetBoolOption(db, "odbc_catalog_bit1_as_boolean")),
+      tinyint1_as_boolean(GetBoolOption(db, "odbc_catalog_tinyint1_as_boolean")),
+      time_as_time(GetBoolOption(db, "odbc_catalog_time_as_time", true)), has_dialect(true), dialect(dialect_p) {
+}
+
+static bool TryTypeToLogicalType(const ODBCTypeConfig &type_config, const ODBCTypeData &type_info,
+                                 LogicalType &out_type) {
+	auto type_name = NormalizeODBCTypeName(type_info.type_name);
+	if (type_name.empty()) {
+		return false;
+	}
 
 	if (type_name == "bit" || type_name == "boolean") {
-		return LogicalType::BOOLEAN;
+		out_type = LogicalType::BOOLEAN;
+		return true;
 	}
 	if (type_name == "tinyint") {
-		return LogicalType::UTINYINT;
+		if (type_config.has_dialect && type_config.dialect == ODBCDialect::DAMENG) {
+			out_type = LogicalType::TINYINT;
+			return true;
+		}
+		out_type = LogicalType::UTINYINT;
+		return true;
 	}
 	if (type_name == "smallint") {
-		return LogicalType::SMALLINT;
+		out_type = LogicalType::SMALLINT;
+		return true;
 	}
 	if (type_name == "int" || type_name == "integer") {
-		return LogicalType::INTEGER;
+		out_type = LogicalType::INTEGER;
+		return true;
 	}
 	if (type_name == "bigint") {
-		return LogicalType::BIGINT;
+		out_type = LogicalType::BIGINT;
+		return true;
 	}
-	if (type_name == "decimal" || type_name == "numeric" || type_name == "smalldecimal" || type_name == "decfloat" ||
-	    type_name == "money" || type_name == "smallmoney") {
+	if (type_name == "decimal" || type_name == "numeric" || type_name == "number" || type_name == "dec" ||
+	    type_name == "smalldecimal" || type_name == "decfloat" || type_name == "money" || type_name == "smallmoney") {
 		auto precision = type_info.precision;
 		auto scale = type_info.scale;
 		if (type_name == "money") {
@@ -46,43 +80,73 @@ LogicalType ODBCTypes::TypeToLogicalType(const ODBCTypeConfig &type_config, cons
 			precision = 10;
 			scale = 4;
 		}
-		if (type_name == "decfloat") {
-			return LogicalType::VARCHAR_COLLATION("odbc_exact_numeric");
+		if (type_name == "decfloat" || type_name == "smalldecimal") {
+			out_type = LogicalType::VARCHAR_COLLATION("odbc_exact_numeric");
+			return true;
 		}
 		if (precision > 0 && precision <= 38 && scale >= 0 && scale <= precision) {
-			return LogicalType::DECIMAL(NumericCast<uint8_t>(precision), NumericCast<uint8_t>(scale));
+			out_type = LogicalType::DECIMAL(NumericCast<uint8_t>(precision), NumericCast<uint8_t>(scale));
+			return true;
 		}
-		return LogicalType::VARCHAR_COLLATION("odbc_exact_numeric");
+		out_type = LogicalType::VARCHAR_COLLATION("odbc_exact_numeric");
+		return true;
 	}
 	if (type_name == "real") {
-		return LogicalType::FLOAT;
+		out_type = LogicalType::FLOAT;
+		return true;
 	}
 	if (type_name == "float" || type_name == "double" || type_name == "double precision") {
-		return LogicalType::DOUBLE;
+		out_type = LogicalType::DOUBLE;
+		return true;
 	}
 	if (type_name == "date") {
-		return LogicalType::DATE;
+		out_type = LogicalType::DATE;
+		return true;
 	}
 	if (type_name == "time") {
-		return type_config.time_as_time ? LogicalType::TIME : LogicalType::VARCHAR;
+		out_type = type_config.time_as_time ? LogicalType::TIME : LogicalType::VARCHAR;
+		return true;
 	}
-	if (type_name == "datetimeoffset") {
-		return LogicalType::VARCHAR;
+	if (IsODBCTimeWithTimeZoneTypeName(type_name)) {
+		out_type = LogicalType::VARCHAR;
+		return true;
+	}
+	if (IsODBCLocalTimeZoneTypeName(type_name)) {
+		out_type = LogicalType::TIMESTAMP_TZ;
+		return true;
+	}
+	if (((StringUtil::Contains(type_name, "timestamp") || StringUtil::Contains(type_name, "datetime")) &&
+	     StringUtil::Contains(type_name, "with time zone")) ||
+	    type_name == "timestamptz" || type_name == "datetimeoffset") {
+		out_type = LogicalType::TIMESTAMP_TZ;
+		return true;
 	}
 	if (type_name == "timestamp" || type_name == "datetime" || type_name == "datetime2" ||
-	    type_name == "smalldatetime" || type_name == "seconddate") {
-		return LogicalType::TIMESTAMP;
+	    type_name == "smalldatetime" || type_name == "seconddate" || type_name == "longdate") {
+		out_type = LogicalType::TIMESTAMP;
+		return true;
 	}
 	if (type_name == "rowversion" || type_name == "binary" || type_name == "varbinary" || type_name == "image" ||
 	    type_name == "longvarbinary" || type_name == "blob") {
-		return LogicalType::BLOB;
+		out_type = LogicalType::BLOB;
+		return true;
 	}
-	if (type_name == "char" || type_name == "varchar" || type_name == "text" || type_name == "nchar" ||
-	    type_name == "nvarchar" || type_name == "ntext" || type_name == "xml" || type_name == "uniqueidentifier" ||
-	    type_name == "sql_variant" || type_name == "clob" || type_name == "nclob" || type_name == "dbclob" ||
-	    type_name == "graphic" || type_name == "vargraphic" || type_name == "long vargraphic" ||
-	    type_name == "alphanum" || type_name == "shorttext") {
-		return LogicalType::VARCHAR;
+	if (type_name == "char" || type_name == "character" || type_name == "varchar" || type_name == "varchar2" ||
+	    type_name == "nvarchar2" || type_name == "text" || type_name == "nchar" || type_name == "nvarchar" ||
+	    type_name == "ntext" || type_name == "xml" || type_name == "uniqueidentifier" || type_name == "sql_variant" ||
+	    type_name == "clob" || type_name == "nclob" || type_name == "dbclob" || type_name == "graphic" ||
+	    type_name == "vargraphic" || type_name == "long vargraphic" || type_name == "alphanum" ||
+	    type_name == "shorttext") {
+		out_type = LogicalType::VARCHAR;
+		return true;
+	}
+	return false;
+}
+
+LogicalType ODBCTypes::TypeToLogicalType(const ODBCTypeConfig &type_config, const ODBCTypeData &type_info) {
+	LogicalType out_type;
+	if (TryTypeToLogicalType(type_config, type_info, out_type)) {
+		return out_type;
 	}
 	return LogicalType::VARCHAR;
 }
@@ -94,8 +158,9 @@ LogicalType ODBCTypes::FieldToLogicalType(const ODBCTypeConfig &type_config, SQL
 	type_info.column_type = type_info.type_name;
 	type_info.precision = NumericCast<int64_t>(column_size);
 	type_info.scale = decimal_digits;
-	if (!type_info.type_name.empty()) {
-		return TypeToLogicalType(type_config, type_info);
+	LogicalType out_type;
+	if (!type_info.type_name.empty() && TryTypeToLogicalType(type_config, type_info, out_type)) {
+		return out_type;
 	}
 
 	switch (data_type) {

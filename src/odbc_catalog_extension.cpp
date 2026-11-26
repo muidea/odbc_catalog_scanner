@@ -127,6 +127,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// The ODBC driver manager handles initialization automatically
 	ODBCClearCacheFunction clear_cache_func;
 	loader.RegisterFunction(clear_cache_func);
+	ODBCClearCacheScopedFunction clear_cache_scoped_func;
+	loader.RegisterFunction(clear_cache_scoped_func);
 
 	ODBCMetadataFunction metadata_function;
 	loader.RegisterFunction(metadata_function);
@@ -161,7 +163,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), ODBCClearCacheFunction::ClearCacheOnSetting);
 	config.AddExtensionOption("odbc_catalog_time_as_time",
 	                          "Whether or not to convert ODBC catalog TIME columns to DuckDB TIME",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), ODBCClearCacheFunction::ClearCacheOnSetting);
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), ODBCClearCacheFunction::ClearCacheOnSetting);
 	config.AddExtensionOption("odbc_catalog_connection_limit", "Maximum number of connections per ODBC catalog catalog",
 	                          LogicalType::UBIGINT, Value::UBIGINT(ODBCConnectionPool::DEFAULT_MAX_CONNECTIONS),
 	                          SetODBCConnectionLimit);

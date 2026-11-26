@@ -31,6 +31,14 @@ inline string ODBCVendorMetadataBatchSQL(ODBCDialect dialect, const string &cate
 	const auto table = ODBCVendorTableList(tables);
 	if (dialect == ODBCDialect::DB2) {
 		const auto scope = " WHERE c.TABSCHEMA=" + schema + " AND c.TABNAME IN " + table;
+		if (category == "tableDetails") {
+			return "SELECT RTRIM(t.TABSCHEMA),t.TABNAME,COALESCE(t.TABLEORG,''),COALESCE(t.STATUS,''),"
+			       "COALESCE(a.REORG_PENDING,''),COALESCE(CAST(a.NUM_REORG_REC_ALTERS AS VARCHAR(20)),'') "
+			       "FROM SYSCAT.TABLES t LEFT JOIN SYSIBMADM.ADMINTABINFO a "
+			       "ON a.TABSCHEMA=t.TABSCHEMA AND a.TABNAME=t.TABNAME "
+			       "WHERE t.TABSCHEMA=" +
+			       schema + " AND t.TABNAME IN " + table + " ORDER BY t.TABNAME";
+		}
 		if (category == "columnDetails") {
 			return "SELECT RTRIM(c.TABSCHEMA),c.TABNAME,c.COLNAME,c.IDENTITY,c.GENERATED,COALESCE(c.TEXT,''),"
 			       "COALESCE(c.DEFAULT,'') FROM SYSCAT.COLUMNS c" +
@@ -47,9 +55,9 @@ inline string ODBCVendorMetadataBatchSQL(ODBCDialect dialect, const string &cate
 			    "AND bi.TABNAME=c.TABNAME AND bi.CONSTNAME=c.CONSTNAME";
 			return "SELECT RTRIM(c.TABSCHEMA),c.TABNAME,c.CONSTNAME,c.TYPE,COALESCE(CAST(k.COLSEQ AS VARCHAR(20)),''),"
 			       "COALESCE(k.COLNAME,''),COALESCE(ch.TEXT,''),c.ENFORCED,c.CHECKEXISTINGDATA,"
-			       "CASE WHEN bi.MATCHES=1 THEN bi.INDEX_NAME ELSE '' END,'','',"
-			       "CASE WHEN bi.MATCHES=1 THEN bi.INDEX_SCHEMA ELSE '' END,"
-			       "COALESCE(CAST(bi.MATCHES AS VARCHAR(20)),'0') "
+			       "CASE WHEN c.TYPE IN ('P','U') AND bi.MATCHES=1 THEN bi.INDEX_NAME ELSE '' END,'','',"
+			       "CASE WHEN c.TYPE IN ('P','U') AND bi.MATCHES=1 THEN bi.INDEX_SCHEMA ELSE '' END,"
+			       "CASE WHEN c.TYPE IN ('P','U') THEN COALESCE(CAST(bi.MATCHES AS VARCHAR(20)),'0') ELSE '0' END "
 			       "FROM SYSCAT.TABCONST c LEFT JOIN SYSCAT.KEYCOLUSE k ON k.TABSCHEMA=c.TABSCHEMA "
 			       "AND k.TABNAME=c.TABNAME AND k.CONSTNAME=c.CONSTNAME LEFT JOIN SYSCAT.CHECKS ch "
 			       "ON ch.TABSCHEMA=c.TABSCHEMA AND ch.TABNAME=c.TABNAME AND ch.CONSTNAME=c.CONSTNAME" +
@@ -68,6 +76,25 @@ inline string ODBCVendorMetadataBatchSQL(ODBCDialect dialect, const string &cate
 		}
 	}
 	if (dialect == ODBCDialect::DAMENG) {
+		if (category == "tableDetails") {
+			return "SELECT OWNER,TABLE_NAME,'TABLE',COALESCE(STATUS,''),'','' FROM ALL_TABLES WHERE OWNER=" + schema +
+			       " AND TABLE_NAME IN " + table + " ORDER BY TABLE_NAME";
+		}
+		if (category == "columnDetails") {
+			return "SELECT c.OWNER,c.TABLE_NAME,c.COLUMN_NAME,"
+			       "CASE WHEN BITAND(COALESCE(sc.INFO2,0),1)=1 THEN 'by_default' ELSE '' END,"
+			       "CASE WHEN c.VIRTUAL_COLUMN='YES' THEN 'virtual' ELSE '' END,"
+			       "CASE WHEN c.VIRTUAL_COLUMN='YES' THEN COALESCE(c.DATA_DEFAULT,'') ELSE '' END,"
+			       "CASE WHEN c.VIRTUAL_COLUMN='YES' THEN '' ELSE COALESCE(c.DATA_DEFAULT,'') END "
+			       "FROM ALL_TAB_COLS c "
+			       "LEFT JOIN SYS.SYSOBJECTS sch ON sch.TYPE$='SCH' AND sch.NAME=c.OWNER "
+			       "LEFT JOIN SYS.SYSOBJECTS tab ON tab.SCHID=sch.ID AND tab.TYPE$='SCHOBJ' AND tab.SUBTYPE$='UTAB' "
+			       "AND tab.NAME=c.TABLE_NAME "
+			       "LEFT JOIN SYS.SYSCOLUMNS sc ON sc.ID=tab.ID AND sc.NAME=c.COLUMN_NAME "
+			       "WHERE c.OWNER=" +
+			       schema + " AND c.TABLE_NAME IN " + table +
+			       " AND COALESCE(c.HIDDEN_COLUMN,'NO')='NO' ORDER BY c.TABLE_NAME,c.COLUMN_ID";
+		}
 		if (category == "columnProperties") {
 			return "SELECT OWNER,TABLE_NAME,COLUMN_NAME,CAST(COLUMN_ID AS VARCHAR(20)),CAST(COLUMN_ID AS VARCHAR(20)),"
 			       "CASE WHEN NULLABLE='Y' THEN 'true' WHEN NULLABLE='N' THEN 'false' ELSE '' "
@@ -78,8 +105,10 @@ inline string ODBCVendorMetadataBatchSQL(ODBCDialect dialect, const string &cate
 		if (category == "constraintDetails") {
 			return "SELECT c.OWNER,c.TABLE_NAME,c.CONSTRAINT_NAME,c.CONSTRAINT_TYPE,"
 			       "COALESCE(CAST(k.POSITION AS VARCHAR(20)),''),COALESCE(k.COLUMN_NAME,''),"
-			       "c.SEARCH_CONDITION,c.STATUS,c.VALIDATED,COALESCE(c.INDEX_NAME,''),c.DEFERRABLE,c.DEFERRED,c.OWNER,"
-			       "CASE WHEN c.INDEX_NAME IS NULL THEN '0' ELSE '1' END "
+			       "c.SEARCH_CONDITION,c.STATUS,c.VALIDATED,"
+			       "CASE WHEN c.CONSTRAINT_TYPE IN ('P','U') THEN COALESCE(c.INDEX_NAME,'') ELSE '' END,"
+			       "c.DEFERRABLE,c.DEFERRED,c.OWNER,"
+			       "CASE WHEN c.CONSTRAINT_TYPE IN ('P','U') AND c.INDEX_NAME IS NOT NULL THEN '1' ELSE '0' END "
 			       "FROM ALL_CONSTRAINTS c LEFT JOIN ALL_CONS_COLUMNS k ON k.OWNER=c.OWNER "
 			       "AND k.CONSTRAINT_NAME=c.CONSTRAINT_NAME WHERE c.OWNER=" +
 			       schema + " AND c.TABLE_NAME IN " + table +
@@ -101,16 +130,36 @@ inline string ODBCVendorMetadataBatchSQL(ODBCDialect dialect, const string &cate
 		}
 	}
 	if (dialect == ODBCDialect::HANA) {
+		if (category == "tableDetails") {
+			return "SELECT SCHEMA_NAME,TABLE_NAME,COALESCE(TABLE_TYPE,''),"
+			       "CASE WHEN IS_COLUMN_TABLE='TRUE' THEN 'COLUMN' ELSE 'ROW' END,'','' "
+			       "FROM SYS.TABLES WHERE SCHEMA_NAME=" +
+			       schema + " AND TABLE_NAME IN " + table + " ORDER BY TABLE_NAME";
+		}
 		if (category == "columnDetails") {
-			return "SELECT SCHEMA_NAME,TABLE_NAME,COLUMN_NAME,GENERATION_TYPE,'',GENERATED_ALWAYS_AS,DEFAULT_VALUE "
+			return "SELECT SCHEMA_NAME,TABLE_NAME,COLUMN_NAME,GEN_TYPE,EXTRA_COL,GENERATED_ALWAYS_AS,DEF_VAL FROM ("
+			       "SELECT SCHEMA_NAME,TABLE_NAME,COLUMN_NAME,GENERATION_TYPE AS GEN_TYPE,'' AS EXTRA_COL,"
+			       "GENERATED_ALWAYS_AS,"
+			       "CASE WHEN DEFAULT_VALUE IS NULL THEN NULL "
+			       "WHEN DATA_TYPE_NAME IN ('VARCHAR','NVARCHAR','CHAR','NCHAR','CLOB','NCLOB') "
+			       "THEN '''' || REPLACE(DEFAULT_VALUE, '''', '''''') || '''' "
+			       "ELSE DEFAULT_VALUE END AS DEF_VAL,POSITION "
 			       "FROM SYS.TABLE_COLUMNS WHERE SCHEMA_NAME=" +
-			       schema + " AND TABLE_NAME IN " + table + " ORDER BY TABLE_NAME,POSITION";
+			       schema + " AND TABLE_NAME IN " + table +
+			       " UNION ALL "
+			       "SELECT SCHEMA_NAME,VIEW_NAME AS TABLE_NAME,COLUMN_NAME,"
+			       "COALESCE(GENERATION_TYPE,'') AS GEN_TYPE,'' AS EXTRA_COL,GENERATED_ALWAYS_AS,"
+			       "NULL AS DEF_VAL,POSITION "
+			       "FROM SYS.VIEW_COLUMNS WHERE SCHEMA_NAME=" +
+			       schema + " AND VIEW_NAME IN " + table +
+			       ") ORDER BY TABLE_NAME,POSITION";
 		}
 		if (category == "constraintDetails") {
 			return "SELECT c.SCHEMA_NAME,c.TABLE_NAME,c.CONSTRAINT_NAME,CASE WHEN c.IS_PRIMARY_KEY='TRUE' THEN 'P' "
 			       "WHEN c.IS_UNIQUE_KEY='TRUE' THEN 'U' ELSE 'C' END,c.POSITION,c.COLUMN_NAME,c.CHECK_CONDITION,'','',"
 			       "CASE WHEN c.IS_PRIMARY_KEY='TRUE' AND bi.MATCHES=1 THEN bi.INDEX_NAME ELSE '' END,'','',"
-			       "c.SCHEMA_NAME,COALESCE(CAST(bi.MATCHES AS VARCHAR(20)),'0') FROM SYS.CONSTRAINTS c "
+			       "c.SCHEMA_NAME,CASE WHEN c.IS_PRIMARY_KEY='TRUE' THEN COALESCE(CAST(bi.MATCHES AS VARCHAR(20)),'0') "
+			       "ELSE '0' END FROM SYS.CONSTRAINTS c "
 			       "LEFT JOIN (SELECT SCHEMA_NAME,TABLE_NAME,COUNT(*) AS MATCHES,MIN(INDEX_NAME) AS INDEX_NAME "
 			       "FROM SYS.INDEXES i WHERE i.CONSTRAINT='PRIMARY KEY' AND SCHEMA_NAME=" +
 			       schema + " AND TABLE_NAME IN " + table +
@@ -118,18 +167,39 @@ inline string ODBCVendorMetadataBatchSQL(ODBCDialect dialect, const string &cate
 			       "ON bi.SCHEMA_NAME=c.SCHEMA_NAME AND bi.TABLE_NAME=c.TABLE_NAME WHERE c.SCHEMA_NAME=" +
 			       schema + " AND c.TABLE_NAME IN " + table +
 			       " UNION ALL SELECT SCHEMA_NAME,TABLE_NAME,CONSTRAINT_NAME,'F',"
-			       "POSITION,COLUMN_NAME,'',IS_ENFORCED,IS_VALIDATED,'','','',SCHEMA_NAME,'0' "
+			       "POSITION,COLUMN_NAME,'',IS_ENFORCED,IS_VALIDATED,'','',"
+			       "CASE WHEN CHECK_TIME='IMMEDIATE' THEN 'IMMEDIATE' WHEN CHECK_TIME='DEFERRED' THEN 'DEFERRED' ELSE '' END,"
+			       "SCHEMA_NAME,'0' "
 			       "FROM SYS.REFERENTIAL_CONSTRAINTS WHERE SCHEMA_NAME=" +
 			       schema + " AND TABLE_NAME IN " + table + " ORDER BY 2,3,5";
 		}
 		if (category == "indexDetails") {
 			return "SELECT i.SCHEMA_NAME,i.TABLE_NAME,i.INDEX_NAME,CAST(k.POSITION AS VARCHAR(20)),"
 			       "k.COLUMN_NAME,'','false',k.ASCENDING_ORDER,'unknown','','',i.INDEX_TYPE,"
-			       "CASE WHEN i.CONSTRAINT IN ('PRIMARY KEY','UNIQUE') THEN 'true' ELSE 'false' END,"
+			       "CASE WHEN i.CONSTRAINT IN ('PRIMARY KEY','UNIQUE','NOT NULL UNIQUE') OR i.INDEX_TYPE LIKE '% UNIQUE' THEN 'true' ELSE 'false' END,"
 			       "CASE WHEN i.CONSTRAINT='PRIMARY KEY' THEN 'true' ELSE 'false' END,'',i.SCHEMA_NAME "
 			       "FROM SYS.INDEXES i JOIN SYS.INDEX_COLUMNS k ON k.SCHEMA_NAME=i.SCHEMA_NAME "
 			       "AND k.TABLE_NAME=i.TABLE_NAME AND k.INDEX_NAME=i.INDEX_NAME WHERE i.SCHEMA_NAME=" +
 			       schema + " AND i.TABLE_NAME IN " + table + " ORDER BY i.TABLE_NAME,i.INDEX_NAME,k.POSITION";
+		}
+		if (category == "constraints") {
+			return "SELECT sub.SCHEMA_NAME,sub.TABLE_NAME,sub.CONSTRAINT_NAME,sub.CONSTRAINT_NAME,sub.KIND,"
+			       "TO_VARCHAR(sub.POS),sub.COLUMN_NAME,sub.REF_SCHEMA,sub.REF_TABLE,sub.REF_COL,"
+			       "sub.UPD_RULE,sub.DEL_RULE,'' FROM ("
+			       "SELECT SCHEMA_NAME,TABLE_NAME,CONSTRAINT_NAME,'P' AS KIND,POSITION AS POS,COLUMN_NAME,"
+			       "'' AS REF_SCHEMA,'' AS REF_TABLE,'' AS REF_COL,'' AS UPD_RULE,'' AS DEL_RULE "
+			       "FROM SYS.CONSTRAINTS WHERE SCHEMA_NAME=" +
+			       schema + " AND TABLE_NAME IN " + table + " AND IS_PRIMARY_KEY='TRUE' "
+			       "UNION ALL "
+			       "SELECT SCHEMA_NAME,TABLE_NAME,CONSTRAINT_NAME,'F' AS KIND,POSITION AS POS,COLUMN_NAME,"
+			       "REFERENCED_SCHEMA_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME,"
+			       "CASE UPPER(COALESCE(UPDATE_RULE,'')) WHEN 'CASCADE' THEN 'cascade' WHEN 'RESTRICT' THEN 'restrict' "
+			       "WHEN 'SET NULL' THEN 'set_null' WHEN 'SET DEFAULT' THEN 'set_default' ELSE 'no_action' END,"
+			       "CASE UPPER(COALESCE(DELETE_RULE,'')) WHEN 'CASCADE' THEN 'cascade' WHEN 'RESTRICT' THEN 'restrict' "
+			       "WHEN 'SET NULL' THEN 'set_null' WHEN 'SET DEFAULT' THEN 'set_default' ELSE 'no_action' END "
+			       "FROM SYS.REFERENTIAL_CONSTRAINTS WHERE SCHEMA_NAME=" +
+			       schema + " AND TABLE_NAME IN " + table +
+			       ") sub ORDER BY sub.TABLE_NAME,sub.CONSTRAINT_NAME,sub.POS";
 		}
 	}
 	throw NotImplementedException("ODBC vendor metadata category is unavailable");

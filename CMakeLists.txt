@@ -59,6 +59,10 @@ if(ODBC_CATALOG_BUILD_RESOURCE_TESTS)
                    test/odbc_result_resource_test.cpp src/odbc_result.cpp src/odbc_types.cpp)
     target_include_directories(odbc_result_resource_test PRIVATE src/include)
     target_link_libraries(odbc_result_resource_test duckdb ${ODBC_LIBRARY})
+    add_executable(odbc_result_temporal_test
+                   test/odbc_result_temporal_test.cpp src/odbc_result.cpp src/odbc_types.cpp)
+    target_include_directories(odbc_result_temporal_test PRIVATE src/include)
+    target_link_libraries(odbc_result_temporal_test duckdb ${ODBC_LIBRARY})
 endif()
 
 option(SCANNER_BUILD_CAPABILITY_TESTS "Build scanner capability contract tests" OFF)
@@ -71,4 +75,10 @@ if(SCANNER_BUILD_CAPABILITY_TESTS)
     target_include_directories(odbc_exact_numeric_test PRIVATE src/include)
     target_link_libraries(odbc_exact_numeric_test duckdb)
     add_test(NAME odbc_exact_numeric COMMAND odbc_exact_numeric_test)
+    add_executable(odbc_temporal_test
+                   test/odbc_temporal_test.cpp src/odbc_types.cpp src/odbc_utils.cpp src/odbc_filter_pushdown.cpp
+                   src/odbc_parameter.cpp)
+    target_include_directories(odbc_temporal_test PRIVATE src/include)
+    target_link_libraries(odbc_temporal_test duckdb ${ODBC_LIBRARY})
+    add_test(NAME odbc_temporal COMMAND odbc_temporal_test)
 endif()

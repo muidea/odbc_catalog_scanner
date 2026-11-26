@@ -9,6 +9,7 @@
 #include "duckdb/storage/table_storage_info.hpp"
 
 #include "odbc_parameter.hpp"
+#include "odbc_temporal_utils.hpp"
 #include "odbc_types.hpp"
 #include "encoding_utils.hpp"
 namespace duckdb {
@@ -77,7 +78,19 @@ shared_ptr<ODBCConnection> ODBCConnection::Open(ODBCTypeConfig type_config, cons
 	handles.connection = ODBCUtils::Connect(connection_string, handles.environment, login_timeout);
 	auto owned_connection = make_shared_ptr<OwnedODBCConnection>();
 	owned_connection->connection = handles.Release(owned_connection->environment);
-	return make_shared_ptr<ODBCConnection>(std::move(owned_connection), connection_string, std::move(type_config));
+	auto conn = make_shared_ptr<ODBCConnection>(std::move(owned_connection), connection_string, std::move(type_config));
+	conn->ResetSessionTemporalSettings();
+	return conn;
+}
+
+void ODBCConnection::ResetSessionTemporalSettings() {
+	if (!type_config.has_dialect) {
+		return;
+	}
+	const char *sql = ODBCSessionTemporalInitSQL(type_config.dialect);
+	if (sql && sql[0] != '\0') {
+		Execute(sql);
+	}
 }
 
 idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming) {
@@ -100,7 +113,7 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 		}
 
 		retcode = SQLExecDirectWithFallback(statement.get(), query);
-		if (!SQL_SUCCEEDED(retcode)) {
+		if (!SQL_SUCCEEDED(retcode) && retcode != SQL_NO_DATA) {
 			ThrowQueryODBCError(SQL_HANDLE_STMT, statement.get(), GetConn(), "source_execute", query);
 		}
 
@@ -113,6 +126,9 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 
 	if (params.empty()) {
 		retcode = SQLExecDirectWithFallback(stmt, query);
+		if (retcode == SQL_NO_DATA) {
+			return 0;
+		}
 	} else {
 		retcode = SQLPrepareWithFallback(stmt, query);
 	}
@@ -161,6 +177,9 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	}
 
 	retcode = SQLExecute(stmt);
+	if (retcode == SQL_NO_DATA) {
+		return 0;
+	}
 	if (!SQL_SUCCEEDED(retcode)) {
 		ThrowQueryODBCError(SQL_HANDLE_STMT, stmt, GetConn(), "source_execute", query);
 	}
@@ -189,7 +208,8 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 
 unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector<Value> params,
                                                      ODBCResultStreaming streaming,
-                                                     ODBCConnectorInterface con_interface) {
+                                                     ODBCConnectorInterface con_interface,
+                                                     vector<LogicalType> expected_types) {
 
 	// 检查连接是否繁忙
 	bool expected = false;
@@ -245,7 +265,7 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 
 		auto self = shared_from_this();
 		return make_uniq<ODBCResult>(query, std::move(statement), type_config, affected_rows, num_cols, std::move(self),
-		                             streaming);
+		                             streaming, std::move(expected_types));
 	} catch (...) {
 		// Failed construction leaves busy cleanup here, not in ODBCResult, so
 		// another query cannot acquire busy between two releases.
@@ -254,12 +274,15 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 	}
 }
 
-unique_ptr<ODBCResult> ODBCConnection::Query(const string &query, ODBCResultStreaming streaming) {
-	return Query(query, vector<Value>(), streaming);
+unique_ptr<ODBCResult> ODBCConnection::Query(const string &query, ODBCResultStreaming streaming,
+                                             vector<LogicalType> expected_types) {
+	return Query(query, vector<Value>(), streaming, std::move(expected_types));
 }
 
-unique_ptr<ODBCResult> ODBCConnection::Query(const string &query, vector<Value> params, ODBCResultStreaming streaming) {
-	return QueryInternal(query, params, streaming, ODBCConnectorInterface::PREPARED_STATEMENT);
+unique_ptr<ODBCResult> ODBCConnection::Query(const string &query, vector<Value> params, ODBCResultStreaming streaming,
+                                             vector<LogicalType> expected_types) {
+	return QueryInternal(query, params, streaming, ODBCConnectorInterface::PREPARED_STATEMENT,
+	                     std::move(expected_types));
 }
 
 void ODBCConnection::Execute(const string &query) {
