@@ -9,6 +9,7 @@
 
 #include "duckdb.hpp"
 #include "guarded_odbc_source_error.hpp"
+#include "odbc_temporal_utils.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -1194,6 +1195,7 @@ static void DDLExecScan(ClientContext &ctx, TableFunctionInput &in, DataChunk &o
 
 		// Fail-fast on active lock contention instead of waiting indefinitely on table locks.
 		s.Exec("ALTER SESSION SET 'DDL_WAIT_TIME' = 2");
+		s.Exec(ODBC_DAMENG_SESSION_TEMPORAL_SQL);
 
 		stage = "source_definition";
 		s.current_stage = "source_definition";

@@ -29,6 +29,7 @@ struct ODBCField {
 	// a value never invalidates the address owned by the ODBC driver.
 	vector<char> value_buffer;
 	bool column_bound = true;
+	bool is_local_tz = false;
 	SQLLEN bind_length = 0;
 	bool bind_is_null = false;
 	bool bind_error = false;

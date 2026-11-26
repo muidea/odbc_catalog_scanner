@@ -41,6 +41,7 @@ unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODB
 	auto result = transaction.Query(GetTableInfoQuery(schema.name, table_name));
 	struct ParsedODBCColumn {
 		string name;
+		string type_name;
 		LogicalType type;
 	};
 	vector<ParsedODBCColumn> columns;
@@ -52,7 +53,7 @@ unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODB
 		if (field.duckdb_type.id() == LogicalTypeId::DECIMAL) {
 			has_decimal = true;
 		}
-		columns.push_back({field.name, field.duckdb_type});
+		columns.push_back({field.name, field.type_name, field.duckdb_type});
 	}
 	result.reset();
 	if (has_decimal && schema.ParentCatalog().Cast<ODBCCatalog>().GetDialect() == ODBCDialect::HANA) {
@@ -84,6 +85,7 @@ unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODB
 	for (auto &col : columns) {
 		table_info->create_info->columns.AddColumn(ColumnDefinition(col.name, std::move(col.type)));
 		table_info->remote_column_names.push_back(col.name);
+		table_info->remote_type_names.push_back(col.type_name);
 	}
 	if (table_info->remote_column_names.empty()) {
 		throw IOException("ODBC table metadata contains no readable columns");

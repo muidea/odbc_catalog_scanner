@@ -8,6 +8,7 @@
 #include "duckdb.hpp"
 #include "guarded_odbc_source_error.hpp"
 #include "odbc_guarded_row_count.hpp"
+#include "odbc_temporal_utils.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -819,7 +820,8 @@ static string Metadata(Session &s, const Data &d, string &stage, std::unordered_
 		    IsValidUint(c[4])) {
 			result += ",\"precision\":" + c[11] + ",\"scale\":" + c[4];
 		} else if ((dtype == "TIME" || dtype == "DATETIME" || dtype == "TIMESTAMP" ||
-		            dtype == "TIMESTAMP WITH TIME ZONE" || dtype == "DATETIME WITH TIME ZONE") &&
+		            dtype == "TIMESTAMP WITH TIME ZONE" || dtype == "DATETIME WITH TIME ZONE" ||
+		            dtype == "TIMESTAMP WITH LOCAL TIME ZONE" || dtype == "DATETIME WITH LOCAL TIME ZONE") &&
 		           IsValidUint(c[4])) {
 			result += ",\"scale\":" + c[4];
 		} else if (dtype == "BLOB" && IsValidUint(c[4]) && c[4] != "0") {
@@ -871,6 +873,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		Writable(dbc);
 		session = make_uniq<Session>(ctx, dbc);
 		auto &s = *session;
+		s.Exec(ODBC_DAMENG_SESSION_TEMPORAL_SQL);
 		stage = "source_metadata";
 		s.Exec("LOCK TABLE " + Identifier(d.schema) + "." + Identifier(d.table) + " IN EXCLUSIVE MODE");
 		std::unordered_set<string> column_names;

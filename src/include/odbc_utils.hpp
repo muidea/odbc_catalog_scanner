@@ -48,6 +48,7 @@ public:
 	static string WriteLiteral(const string &identifier);
 	static string EscapeQuotes(const string &text, char quote);
 	static string WriteQuoted(const string &text, char quote);
+	static bool TryTransformConstant(const Value &val, ODBCDialect dialect, const string &remote_type_name, string &out);
 	static string TransformConstant(const Value &val);
 	static string TransformConstant(const Value &val, ODBCDialect dialect);
 };

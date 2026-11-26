@@ -15,7 +15,10 @@ namespace duckdb {
 
 struct ODBCParameter {
 	Value value;
+	SQLSMALLINT c_type = SQL_C_DEFAULT;
 	SQLSMALLINT buffer_type = SQL_UNKNOWN_TYPE;
+	SQLULEN column_size = 0;
+	SQLSMALLINT decimal_digits = 0;
 	bool is_unsigned = false;
 
 	vector<char> bind_buffer;
