@@ -5,10 +5,11 @@
 
 namespace duckdb {
 
-string ODBCFilterPushdown::CreateExpression(string &column_name, vector<unique_ptr<TableFilter>> &filters, string op) {
+string ODBCFilterPushdown::CreateExpression(string &column_name, vector<unique_ptr<TableFilter>> &filters, string op,
+                                            ODBCDialect dialect) {
 	vector<string> filter_entries;
 	for (auto &filter : filters) {
-		auto new_filter = TransformFilter(column_name, *filter);
+		auto new_filter = TransformFilter(column_name, *filter, dialect);
 		if (new_filter.empty()) {
 			continue;
 		}
@@ -39,7 +40,7 @@ string ODBCFilterPushdown::TransformComparison(ExpressionType type) {
 	}
 }
 
-string ODBCFilterPushdown::TransformFilter(string &column_name, TableFilter &filter) {
+string ODBCFilterPushdown::TransformFilter(string &column_name, TableFilter &filter, ODBCDialect dialect) {
 	switch (filter.filter_type) {
 	case TableFilterType::IS_NULL:
 		return column_name + " IS NULL";
@@ -47,21 +48,21 @@ string ODBCFilterPushdown::TransformFilter(string &column_name, TableFilter &fil
 		return column_name + " IS NOT NULL";
 	case TableFilterType::CONJUNCTION_AND: {
 		auto &conjunction_filter = filter.Cast<ConjunctionAndFilter>();
-		return CreateExpression(column_name, conjunction_filter.child_filters, "AND");
+		return CreateExpression(column_name, conjunction_filter.child_filters, "AND", dialect);
 	}
 	case TableFilterType::CONJUNCTION_OR: {
 		auto &conjunction_filter = filter.Cast<ConjunctionOrFilter>();
-		return CreateExpression(column_name, conjunction_filter.child_filters, "OR");
+		return CreateExpression(column_name, conjunction_filter.child_filters, "OR", dialect);
 	}
 	case TableFilterType::CONSTANT_COMPARISON: {
 		auto &constant_filter = filter.Cast<ConstantFilter>();
-		auto constant_string = ODBCUtils::TransformConstant(constant_filter.constant);
+		auto constant_string = ODBCUtils::TransformConstant(constant_filter.constant, dialect);
 		auto operator_string = TransformComparison(constant_filter.comparison_type);
 		return StringUtil::Format("%s %s %s", column_name, operator_string, constant_string);
 	}
 	case TableFilterType::OPTIONAL_FILTER: {
 		auto &optional_filter = filter.Cast<OptionalFilter>();
-		return TransformFilter(column_name, *optional_filter.child_filter);
+		return TransformFilter(column_name, *optional_filter.child_filter, dialect);
 	}
 	case TableFilterType::DYNAMIC_FILTER: {
 		return string();
@@ -73,7 +74,7 @@ string ODBCFilterPushdown::TransformFilter(string &column_name, TableFilter &fil
 			if (!in_list.empty()) {
 				in_list += ", ";
 			}
-			in_list += ODBCUtils::TransformConstant(val);
+			in_list += ODBCUtils::TransformConstant(val, dialect);
 		}
 		return column_name + " IN (" + in_list + ")";
 	}
@@ -83,7 +84,7 @@ string ODBCFilterPushdown::TransformFilter(string &column_name, TableFilter &fil
 }
 
 string ODBCFilterPushdown::TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
-                                            const vector<string> &names) {
+                                            const vector<string> &names, ODBCDialect dialect) {
 	if (!filters || filters->filters.empty()) {
 		// no filters
 		return string();
@@ -92,7 +93,7 @@ string ODBCFilterPushdown::TransformFilters(const vector<column_t> &column_ids, 
 	for (auto &entry : filters->filters) {
 		auto column_name = ODBCUtils::WriteIdentifier(names[column_ids[entry.first]]);
 		auto &filter = *entry.second;
-		auto new_filter = TransformFilter(column_name, filter);
+		auto new_filter = TransformFilter(column_name, filter, dialect);
 		if (new_filter.empty()) {
 			continue;
 		}

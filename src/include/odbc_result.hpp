@@ -49,7 +49,8 @@ class ODBCResult {
 public:
 	ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBCTypeConfig type_config_p, idx_t affected_rows_p,
 	           SQLSMALLINT num_cols_p, shared_ptr<ODBCConnection> connection_p,
-	           ODBCResultStreaming streaming_p = ODBCResultStreaming::FORCE_MATERIALIZATION);
+	           ODBCResultStreaming streaming_p = ODBCResultStreaming::FORCE_MATERIALIZATION,
+	           vector<LogicalType> expected_types_p = {});
 	~ODBCResult();
 
 	string GetString(idx_t col);

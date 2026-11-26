@@ -29,7 +29,7 @@ ODBCCatalog::ODBCCatalog(AttachedDatabase &db_p, string connection_string_p, str
 	if (db_instance.TryGetCurrentSetting("odbc_catalog_pool_wait_timeout_millis", wait_timeout)) {
 		connection_pool.SetWaitTimeout(UBigIntValue::Get(wait_timeout));
 	}
-	ODBCTypeConfig type_config;
+	ODBCTypeConfig type_config(db_p.GetDatabase(), dialect);
 	ODBCConnection::Open(type_config, connection_string);
 }
 

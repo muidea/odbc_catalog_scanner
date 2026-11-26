@@ -112,17 +112,27 @@ void SetODBCSecretParameters(CreateSecretFunction &function) {
 
 namespace duckdb {
 void RegisterDb2GuardedCRUD(ExtensionLoader &loader);
+void RegisterDb2GuardedDDL(ExtensionLoader &loader);
 void RegisterDamengGuardedCRUD(ExtensionLoader &loader);
+void RegisterDamengGuardedDDL(ExtensionLoader &loader);
+void RegisterHanaGuardedCRUD(ExtensionLoader &loader);
+void RegisterHanaGuardedDDL(ExtensionLoader &loader);
 } // namespace duckdb
 
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterODBCExactNumericCollation(loader, "odbc_exact_numeric");
 	RegisterDb2GuardedCRUD(loader);
+	RegisterDb2GuardedDDL(loader);
 	RegisterDamengGuardedCRUD(loader);
+	RegisterDamengGuardedDDL(loader);
+	RegisterHanaGuardedCRUD(loader);
+	RegisterHanaGuardedDDL(loader);
 	// ODBC doesn't require explicit library initialization like MySQL
 	// The ODBC driver manager handles initialization automatically
 	ODBCClearCacheFunction clear_cache_func;
 	loader.RegisterFunction(clear_cache_func);
+	ODBCClearCacheScopedFunction clear_cache_scoped_func;
+	loader.RegisterFunction(clear_cache_scoped_func);
 
 	ODBCMetadataFunction metadata_function;
 	loader.RegisterFunction(metadata_function);
@@ -163,7 +173,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), ODBCClearCacheFunction::ClearCacheOnSetting);
 	config.AddExtensionOption("odbc_catalog_time_as_time",
 	                          "Whether or not to convert ODBC catalog TIME columns to DuckDB TIME",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), ODBCClearCacheFunction::ClearCacheOnSetting);
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), ODBCClearCacheFunction::ClearCacheOnSetting);
 	config.AddExtensionOption("odbc_catalog_connection_limit", "Maximum number of connections per ODBC catalog catalog",
 	                          LogicalType::UBIGINT, Value::UBIGINT(ODBCConnectionPool::DEFAULT_MAX_CONNECTIONS),
 	                          SetODBCConnectionLimit);

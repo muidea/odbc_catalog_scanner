@@ -189,7 +189,8 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 
 unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector<Value> params,
                                                      ODBCResultStreaming streaming,
-                                                     ODBCConnectorInterface con_interface) {
+                                                     ODBCConnectorInterface con_interface,
+                                                     vector<LogicalType> expected_types) {
 
 	// 检查连接是否繁忙
 	bool expected = false;
@@ -245,7 +246,7 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 
 		auto self = shared_from_this();
 		return make_uniq<ODBCResult>(query, std::move(statement), type_config, affected_rows, num_cols, std::move(self),
-		                             streaming);
+		                             streaming, std::move(expected_types));
 	} catch (...) {
 		// Failed construction leaves busy cleanup here, not in ODBCResult, so
 		// another query cannot acquire busy between two releases.
@@ -254,12 +255,15 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 	}
 }
 
-unique_ptr<ODBCResult> ODBCConnection::Query(const string &query, ODBCResultStreaming streaming) {
-	return Query(query, vector<Value>(), streaming);
+unique_ptr<ODBCResult> ODBCConnection::Query(const string &query, ODBCResultStreaming streaming,
+                                             vector<LogicalType> expected_types) {
+	return Query(query, vector<Value>(), streaming, std::move(expected_types));
 }
 
-unique_ptr<ODBCResult> ODBCConnection::Query(const string &query, vector<Value> params, ODBCResultStreaming streaming) {
-	return QueryInternal(query, params, streaming, ODBCConnectorInterface::PREPARED_STATEMENT);
+unique_ptr<ODBCResult> ODBCConnection::Query(const string &query, vector<Value> params, ODBCResultStreaming streaming,
+                                             vector<LogicalType> expected_types) {
+	return QueryInternal(query, params, streaming, ODBCConnectorInterface::PREPARED_STATEMENT,
+	                     std::move(expected_types));
 }
 
 void ODBCConnection::Execute(const string &query) {

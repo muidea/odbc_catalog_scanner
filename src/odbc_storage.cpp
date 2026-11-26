@@ -48,8 +48,9 @@ static unique_ptr<Catalog> ODBCAttach(optional_ptr<StorageExtensionInfo> storage
 	}
 
 	auto dialect = ODBCDialectUtil::Parse(dialect_name);
-	if (guarded_crud_admin && dialect != ODBCDialect::DB2 && dialect != ODBCDialect::DAMENG) {
-		throw BinderException("guarded CRUD administration is only supported for Db2 and Dameng");
+	if (guarded_crud_admin && dialect != ODBCDialect::DB2 && dialect != ODBCDialect::DAMENG &&
+	    dialect != ODBCDialect::HANA) {
+		throw BinderException("guarded CRUD administration is only supported for Db2, Dameng, and HANA");
 	}
 	auto connection_string = ODBCCatalog::GetConnectionString(context, secret_name, dialect);
 	return make_uniq<ODBCCatalog>(db, std::move(connection_string), string(), std::move(schema_name), dialect,

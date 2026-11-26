@@ -11,18 +11,20 @@
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "odbc_types.hpp"
 
 namespace duckdb {
 
 class ODBCFilterPushdown {
 public:
 	static string TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
-	                               const vector<string> &names);
+	                               const vector<string> &names, ODBCDialect dialect = ODBCDialect::DB2);
 
 private:
-	static string TransformFilter(string &column_name, TableFilter &filter);
+	static string TransformFilter(string &column_name, TableFilter &filter, ODBCDialect dialect);
 	static string TransformComparison(ExpressionType type);
-	static string CreateExpression(string &column_name, vector<unique_ptr<TableFilter>> &filters, string op);
+	static string CreateExpression(string &column_name, vector<unique_ptr<TableFilter>> &filters, string op,
+	                               ODBCDialect dialect);
 };
 
 } // namespace duckdb

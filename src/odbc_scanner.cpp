@@ -44,6 +44,8 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 	// generate the SELECT statement
 	string select;
 	select += "SELECT ";
+	vector<LogicalType> expected_types;
+	expected_types.reserve(input.column_ids.size());
 
 	for (idx_t c = 0; c < input.column_ids.size(); c++) {
 		if (c > 0) {
@@ -54,6 +56,7 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 			// count(*). A bare NULL has driver-specific metadata (Db2 reports it
 			// as a large character value), so use a portable typed value instead.
 			select += "CAST(0 AS BIGINT)";
+			expected_types.push_back(LogicalType::BIGINT);
 		} else {
 			auto column_id = input.column_ids[c];
 			string col_name;
@@ -63,6 +66,9 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 				auto &col = bind_data.table.GetColumn(LogicalIndex(column_id));
 				col_name = col.GetName();
 			}
+			expected_types.push_back(column_id < bind_data.types.size()
+			                             ? bind_data.types[column_id]
+			                             : bind_data.table.GetColumn(LogicalIndex(column_id)).GetType());
 			select += ODBCUtils::WriteIdentifier(col_name);
 		}
 	}
@@ -71,7 +77,8 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 	select += ".";
 	select += ODBCUtils::WriteIdentifier(bind_data.table.name);
 	auto &filter_names = bind_data.remote_names.empty() ? bind_data.names : bind_data.remote_names;
-	string filter_string = ODBCFilterPushdown::TransformFilters(input.column_ids, input.filters, filter_names);
+	auto dialect = bind_data.table.catalog.Cast<ODBCCatalog>().GetDialect();
+	string filter_string = ODBCFilterPushdown::TransformFilters(input.column_ids, input.filters, filter_names, dialect);
 	if (!filter_string.empty()) {
 		select += " WHERE " + filter_string;
 	}
@@ -80,7 +87,7 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 	auto &transaction = ODBCTransaction::Get(context, bind_data.table.catalog);
 	auto &con = transaction.GetConnection();
 
-	auto query_result = con.Query(select, bind_data.streaming);
+	auto query_result = con.Query(select, bind_data.streaming, std::move(expected_types));
 
 	// 检查查询结果是否为空
 	if (!query_result) {

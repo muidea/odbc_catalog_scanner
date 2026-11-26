@@ -64,8 +64,10 @@ public:
 	                                       uint32_t login_timeout = 0);
 	void Execute(const string &query);
 	void Execute(const string &query, vector<Value> params);
-	unique_ptr<ODBCResult> Query(const string &query, ODBCResultStreaming streaming);
-	unique_ptr<ODBCResult> Query(const string &query, vector<Value> params, ODBCResultStreaming streaming);
+	unique_ptr<ODBCResult> Query(const string &query, ODBCResultStreaming streaming,
+	                             vector<LogicalType> expected_types = {});
+	unique_ptr<ODBCResult> Query(const string &query, vector<Value> params, ODBCResultStreaming streaming,
+	                             vector<LogicalType> expected_types = {});
 
 	bool IsOpen();
 	void Close();
@@ -92,7 +94,8 @@ public:
 
 private:
 	unique_ptr<ODBCResult> QueryInternal(const string &query, vector<Value> params, ODBCResultStreaming streaming,
-	                                     ODBCConnectorInterface con_interface);
+	                                     ODBCConnectorInterface con_interface,
+	                                     vector<LogicalType> expected_types = {});
 	idx_t ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming);
 
 	std::recursive_mutex query_lock;

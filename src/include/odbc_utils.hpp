@@ -49,6 +49,7 @@ public:
 	static string EscapeQuotes(const string &text, char quote);
 	static string WriteQuoted(const string &text, char quote);
 	static string TransformConstant(const Value &val);
+	static string TransformConstant(const Value &val, ODBCDialect dialect);
 };
 
 using ODBCStatementPtr = duckdb::unique_ptr<void, void (*)(SQLHSTMT)>;

@@ -57,7 +57,7 @@ ODBCPoolConnection ODBCConnectionPool::GetConnectionInternal() {
 
 	// no cached connections left but there is space to open a new one - open it
 	try {
-		ODBCTypeConfig type_config;
+		ODBCTypeConfig type_config(odbc_catalog.GetDatabase(), odbc_catalog.GetDialect());
 		return ODBCPoolConnection(this, ODBCConnection::Open(type_config, odbc_catalog.connection_string));
 	} catch (...) {
 		active_connections--;
